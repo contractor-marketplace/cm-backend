@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly verification recompute
+
+[Timer]
+# A badge is a claim about the world, and the world moves between imports.
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

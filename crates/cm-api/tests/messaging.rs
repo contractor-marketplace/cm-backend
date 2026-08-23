@@ -1,0 +1,553 @@
+//! Direct messaging: the gate, the ordering, and the safety controls.
+
+mod common;
+
+use common::{contractor_id, force_claim, router, seed_directory, user_id, Client};
+use http::StatusCode;
+use serde_json::json;
+use sqlx::PgPool;
+
+/// A claimed contractor that has opted in to messages, and its owner's client.
+async fn claimed_and_open(pool: &PgPool, router: &axum::Router) -> (uuid::Uuid, Client) {
+    let id = contractor_id(pool, "1047382").await;
+
+    let mut owner = Client::new(router.clone());
+    owner.register("owner@example.test").await;
+    force_claim(pool, id, user_id(pool, "owner@example.test").await).await;
+
+    let opened = owner
+        .send(
+            http::Method::PATCH,
+            &format!("/v1/contractors/{id}"),
+            Some(json!({ "accepts_dm": true })),
+        )
+        .await;
+    assert_eq!(opened.status, StatusCode::OK, "{:?}", opened.json);
+
+    (id, owner)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_homeowner_can_message_a_claimed_contractor_that_opted_in(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, mut owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router);
+    homeowner.register("homeowner@example.test").await;
+
+    let started = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    assert_eq!(started.status, StatusCode::CREATED, "{:?}", started.json);
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+
+    let sent = homeowner
+        .post(
+            &format!("/v1/conversations/{conversation}/messages"),
+            json!({ "body": "Do you do garage conversions?" }),
+        )
+        .await;
+    assert_eq!(sent.status, StatusCode::CREATED, "{:?}", sent.json);
+    assert_eq!(sent.json["seq"], 1);
+
+    // The contractor sees it, and can reply.
+    let inbox = owner.get("/v1/conversations").await;
+    assert_eq!(inbox.json.as_array().expect("array").len(), 1);
+    assert_eq!(inbox.json[0]["unread"], 1);
+
+    let polled = owner
+        .get(&format!(
+            "/v1/conversations/{conversation}/messages?after_seq=0"
+        ))
+        .await;
+    assert_eq!(polled.json["messages"].as_array().expect("array").len(), 1);
+    assert_eq!(
+        polled.json["messages"][0]["body"],
+        "Do you do garage conversions?"
+    );
+    assert_eq!(polled.json["next_seq"], 1);
+    assert!(polled.json["poll_after_secs"].is_number());
+
+    let replied = owner
+        .post(
+            &format!("/v1/conversations/{conversation}/messages"),
+            json!({ "body": "Yes — ADUs are most of what we do." }),
+        )
+        .await;
+    assert_eq!(
+        replied.json["seq"], 2,
+        "the sequence continues across senders"
+    );
+
+    // Reading catches the inbox up.
+    owner
+        .post(
+            &format!("/v1/conversations/{conversation}/read"),
+            json!({ "up_to_seq": 2 }),
+        )
+        .await;
+    let inbox = owner.get("/v1/conversations").await;
+    assert_eq!(inbox.json[0]["unread"], 0);
+}
+
+/// The gate: unclaimed listings and opted-out contractors are not messageable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn messaging_is_refused_unless_the_listing_is_claimed_and_open(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("homeowner@example.test").await;
+
+    // Unclaimed: nobody is behind it.
+    let unclaimed = contractor_id(&pool, "983311").await;
+    let refused = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": unclaimed }))
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+    // Claimed but not opted in.
+    let claimed = contractor_id(&pool, "1047382").await;
+    let owner = cm_core::new_id();
+    let mut conn = pool.acquire().await.expect("connection");
+    cm_db::repo::users::insert(&mut conn, owner, "owner@example.test", "Owner")
+        .await
+        .expect("user");
+    drop(conn);
+    force_claim(&pool, claimed, owner).await;
+
+    let refused = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": claimed }))
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+    // A listing that does not exist is a 404.
+    let missing = homeowner
+        .post(
+            "/v1/conversations",
+            json!({ "contractor_id": uuid::Uuid::now_v7() }),
+        )
+        .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+/// Two simultaneous "start a chat" requests must produce one conversation.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_starts_return_the_same_conversation(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, _owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("homeowner@example.test").await;
+    let session = homeowner.session_cookie().expect("session").to_owned();
+    let csrf = homeowner.csrf_token().expect("csrf").to_owned();
+
+    let start = || {
+        let mut client = Client::new(router.clone());
+        client.set_session(&session);
+        client.set_csrf(&csrf);
+        tokio::spawn(async move {
+            client
+                .post("/v1/conversations", json!({ "contractor_id": contractor }))
+                .await
+        })
+    };
+
+    let (first, second) = tokio::join!(start(), start());
+    let first = first.expect("join");
+    let second = second.expect("join");
+
+    assert_eq!(first.status, StatusCode::CREATED);
+    assert_eq!(second.status, StatusCode::CREATED);
+    assert_eq!(
+        first.json["id"], second.json["id"],
+        "one conversation per pair, whatever the interleaving"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 1);
+}
+
+/// The polling contract: every message is seen exactly once, in order.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_sends_produce_a_gapless_sequence_a_poller_sees_once(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, _owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("homeowner@example.test").await;
+    let started = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+    let session = homeowner.session_cookie().expect("session").to_owned();
+    let csrf = homeowner.csrf_token().expect("csrf").to_owned();
+
+    const SENDS: usize = 24;
+    let mut tasks = Vec::new();
+    for n in 0..SENDS {
+        let mut client = Client::new(router.clone());
+        client.set_session(&session);
+        client.set_csrf(&csrf);
+        let path = format!("/v1/conversations/{conversation}/messages");
+        tasks.push(tokio::spawn(async move {
+            client
+                .post(&path, json!({ "body": format!("message {n}") }))
+                .await
+                .status
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.expect("join"), StatusCode::CREATED);
+    }
+
+    // Walk the conversation the way a polling client would.
+    let mut seen: Vec<i64> = Vec::new();
+    let mut cursor = 0i64;
+    loop {
+        let page = homeowner
+            .get(&format!(
+                "/v1/conversations/{conversation}/messages?after_seq={cursor}&limit=5"
+            ))
+            .await;
+        let messages = page.json["messages"].as_array().expect("array");
+        if messages.is_empty() {
+            break;
+        }
+        for message in messages {
+            seen.push(message["seq"].as_i64().expect("seq"));
+        }
+        cursor = page.json["next_seq"].as_i64().expect("next_seq");
+    }
+
+    assert_eq!(
+        seen,
+        (1..=SENDS as i64).collect::<Vec<i64>>(),
+        "the sequence must be gapless, ordered, and free of duplicates"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_participant_cannot_see_or_join_a_conversation(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, _owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("homeowner@example.test").await;
+    let started = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+
+    let mut outsider = Client::new(router);
+    outsider.register("outsider@example.test").await;
+
+    // 404, not 403: an outsider must not learn the conversation exists.
+    assert_eq!(
+        outsider
+            .get(&format!("/v1/conversations/{conversation}/messages"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        outsider
+            .post(
+                &format!("/v1/conversations/{conversation}/messages"),
+                json!({ "body": "let me in" })
+            )
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        outsider
+            .get("/v1/conversations")
+            .await
+            .json
+            .as_array()
+            .expect("array")
+            .len(),
+        0
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_block_stops_messages_in_both_directions_but_keeps_the_history(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, mut owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("homeowner@example.test").await;
+    let started = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+    homeowner
+        .post(
+            &format!("/v1/conversations/{conversation}/messages"),
+            json!({ "body": "first message" }),
+        )
+        .await;
+
+    // The contractor blocks the homeowner.
+    let homeowner_id = user_id(&pool, "homeowner@example.test").await;
+    let blocked = owner
+        .send(
+            http::Method::PUT,
+            &format!("/v1/blocks/{homeowner_id}"),
+            Some(json!({ "reason": "spam" })),
+        )
+        .await;
+    assert_eq!(blocked.status, StatusCode::NO_CONTENT);
+
+    // Neither side can send now.
+    assert_eq!(
+        homeowner
+            .post(
+                &format!("/v1/conversations/{conversation}/messages"),
+                json!({ "body": "hello?" })
+            )
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        owner
+            .post(
+                &format!("/v1/conversations/{conversation}/messages"),
+                json!({ "body": "go away" })
+            )
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // But the history survives — a report depends on it.
+    let history = owner
+        .get(&format!("/v1/conversations/{conversation}/messages"))
+        .await;
+    assert_eq!(history.json["messages"].as_array().expect("array").len(), 1);
+
+    // A new conversation cannot be started either, and the refusal is the same
+    // one an opted-out contractor gives: being told you are blocked is an
+    // invitation to work around it.
+    let mut second = Client::new(router.clone());
+    second.set_session(homeowner.session_cookie().expect("session"));
+    second.set_csrf(homeowner.csrf_token().expect("csrf"));
+    assert_eq!(
+        second
+            .post("/v1/conversations", json!({ "contractor_id": contractor }))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Unblocking restores it.
+    assert_eq!(
+        owner
+            .send(
+                http::Method::DELETE,
+                &format!("/v1/blocks/{homeowner_id}"),
+                None
+            )
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        homeowner
+            .post(
+                &format!("/v1/conversations/{conversation}/messages"),
+                json!({ "body": "thanks" })
+            )
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_report_reaches_moderation_without_notifying_the_reported(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, mut owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("homeowner@example.test").await;
+    let started = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+    let sent = owner
+        .post(
+            &format!("/v1/conversations/{conversation}/messages"),
+            json!({ "body": "pay me off-platform" }),
+        )
+        .await;
+    let message_id = sent.json["id"].as_str().expect("id").to_owned();
+
+    let reported = homeowner
+        .post(
+            "/v1/reports",
+            json!({
+                "conversation_id": conversation,
+                "message_id": message_id,
+                "reason": "off_platform_payment",
+                "detail": "asked for a bank transfer"
+            }),
+        )
+        .await;
+    assert_eq!(reported.status, StatusCode::CREATED, "{:?}", reported.json);
+    assert_eq!(reported.json["status"], "open");
+
+    // Reporting the same message twice is a conflict.
+    let again = homeowner
+        .post(
+            "/v1/reports",
+            json!({
+                "conversation_id": conversation,
+                "message_id": message_id,
+                "reason": "spam"
+            }),
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+
+    // An unknown reason is refused with the list of valid ones.
+    let bad = homeowner
+        .post(
+            "/v1/reports",
+            json!({ "conversation_id": conversation, "reason": "vibes" }),
+        )
+        .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    assert!(bad.json["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("harassment"));
+
+    // Moderators see it; ordinary accounts do not.
+    assert_eq!(
+        owner.get("/v1/admin/reports").await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    let mut admin = Client::new(router);
+    admin.register("admin@example.test").await;
+    let admin_id = user_id(&pool, "admin@example.test").await;
+    let mut conn = pool.acquire().await.expect("connection");
+    cm_db::repo::users::grant_role(
+        &mut conn,
+        admin_id,
+        cm_db::repo::users::Role::Moderator,
+        None,
+    )
+    .await
+    .expect("grant");
+    drop(conn);
+
+    let queue = admin.get("/v1/admin/reports").await;
+    assert_eq!(queue.status, StatusCode::OK);
+    assert_eq!(queue.json.as_array().expect("array").len(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn conversation_creation_is_rate_limited_per_account(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    // Ten claimed, opted-in contractors would be needed to exhaust the limit
+    // honestly; instead the limit is exercised against one, since the bucket is
+    // per account rather than per target.
+    let (contractor, _owner) = claimed_and_open(&pool, &router).await;
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("homeowner@example.test").await;
+
+    // The first call creates it; the rest find the same one, and every call
+    // still counts.
+    for _ in 0..10 {
+        let response = homeowner
+            .post("/v1/conversations", json!({ "contractor_id": contractor }))
+            .await;
+        assert_eq!(response.status, StatusCode::CREATED);
+    }
+
+    let limited = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+
+    // Windows are aligned to the epoch, so a burst that straddles a boundary
+    // legitimately gets a fresh allowance. Asserting unconditionally would make
+    // this test fail once every few hundred runs for a correct reason.
+    let windows: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT window_start) FROM rate_limit_counters WHERE count > 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count windows");
+
+    if windows <= 1 {
+        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers.get(http::header::RETRY_AFTER).is_some());
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_empty_or_oversized_message_is_refused(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, _owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router);
+    homeowner.register("homeowner@example.test").await;
+    let started = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+    let path = format!("/v1/conversations/{conversation}/messages");
+
+    for body in ["", "   ", &"x".repeat(4001)] {
+        let response = homeowner.post(&path, json!({ "body": body })).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "a {}-character body should be refused",
+            body.len()
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn messaging_endpoints_require_a_session_and_a_csrf_token(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, _owner) = claimed_and_open(&pool, &router).await;
+
+    let anonymous = Client::new(router.clone())
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+
+    let mut signed_in = Client::new(router.clone());
+    signed_in.register("homeowner@example.test").await;
+    let session = signed_in.session_cookie().expect("session").to_owned();
+
+    let mut without_csrf = Client::new(router).without_csrf();
+    without_csrf.set_session(&session);
+    assert_eq!(
+        without_csrf
+            .post("/v1/conversations", json!({ "contractor_id": contractor }))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+}

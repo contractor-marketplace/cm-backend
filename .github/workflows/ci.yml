@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: cmdev
+          POSTGRES_PASSWORD: cmdev
+          POSTGRES_DB: cm_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cmdev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://cmdev:cmdev@127.0.0.1:5432/cm_dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deterministic by construction: the version is read from
+      # rust-toolchain.toml, which is also what selects the toolchain for every
+      # later step, so CI and a local checkout can never install different
+      # compilers. The final check fails the job if they somehow disagree.
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          pinned="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml)"
+          test -n "$pinned" || { echo "rust-toolchain.toml does not pin a channel"; exit 1; }
+          echo "pinned toolchain: $pinned"
+          rustup toolchain install "$pinned" --profile minimal --component rustfmt --component clippy
+          rustc --version
+          cargo --version
+          rustc --version | grep -Fq "$pinned" \
+            || { echo "active rustc is not the pinned $pinned"; exit 1; }
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Proves the build needs no database: if a compile-time-checked query
+      # ever lands without its metadata, this step fails rather than CI
+      # silently depending on the service container above.
+      - name: Build without a database
+        run: cargo build --workspace --all-targets
+        env:
+          DATABASE_URL: ""
+
+      - name: Test
+        run: cargo test --workspace

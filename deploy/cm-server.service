@@ -1,0 +1,39 @@
+[Unit]
+Description=Contractor marketplace API
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=exec
+User=cm
+Group=cm
+# Mode 0600, owned by root, readable by the service user. Contains
+# DATABASE_URL and CM_HASH_PEPPER.
+EnvironmentFile=/etc/cm-backend/env
+ExecStart=/usr/local/bin/cm-server serve
+Restart=on-failure
+RestartSec=5s
+# The service refuses to start against a schema older than the binary, so a
+# restart loop here means "run cm-server migrate", and the log says so.
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# Each Argon2 hash holds ~19 MiB; CM_ARGON2_MAX_CONCURRENCY bounds how many run
+# at once. Keep this comfortably above that ceiling plus the pool.
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

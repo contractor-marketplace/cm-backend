@@ -1,0 +1,15 @@
+[Unit]
+Description=Delete expired sessions, finished geocode jobs and elapsed rate-limit windows
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=cm
+Group=cm
+EnvironmentFile=/etc/cm-backend/env
+# The audit log is deliberately not pruned. Add --audit-days only with a
+# retention decision behind it.
+ExecStart=/usr/local/bin/cm-server prune --grace-days 30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true

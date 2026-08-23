@@ -1,0 +1,28 @@
+[Unit]
+Description=Contractor marketplace geocoding worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=exec
+User=cm
+Group=cm
+EnvironmentFile=/etc/cm-backend/env
+ExecStart=/usr/local/bin/cm-server geocode-worker
+Restart=on-failure
+RestartSec=30s
+# The worker finishes its current pass before exiting, and any job it had
+# claimed is returned to the queue by the next pass's stall sweep — so a hard
+# kill costs a delay, never a lost job.
+TimeoutStopSec=60
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

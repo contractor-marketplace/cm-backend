@@ -1,0 +1,39 @@
+# Caddy fronts both the front end and the API on ONE hostname.
+#
+# This is not a preference. Session cookies carry the `__Host-` prefix, which
+# browsers only accept when the cookie is host-only — no Domain attribute. A
+# cookie set for app.example.com therefore cannot be read by api.example.com.
+# Putting the API on a path of the same host is what lets the strongest cookie
+# scoping work, and it removes CORS from the design entirely.
+
+app.example.com {
+	encode zstd gzip
+
+	# Everything under /api goes to the Rust service. The path prefix is
+	# stripped, so the service sees /v1/... and knows nothing about the proxy.
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8080 {
+			# The service believes X-Forwarded-For only from a loopback peer,
+			# which is exactly this hop. Caddy appends the real client, so the
+			# last entry is the one a client cannot forge.
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/app.log
+		format json
+	}
+}
