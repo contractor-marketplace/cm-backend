@@ -70,10 +70,21 @@ concurrency to trade login throughput for memory.
 
 ## Risks worth carrying into the first week
 
-**Publishing unclaimed listings is a product decision, not a technical one.**
-Tens of thousands of businesses will appear here without signing up, many of
-them sole traders whose CSLB address is their home. The centroid rule and the
-takedown path are in place; whether to publish at all is yours.
+**Unclaimed listings are published. Decided 2026-08-24.** Tens of thousands of
+businesses appear here without having signed up, many of them sole traders whose
+CSLB address of record is their home. The decision is to publish the aggregated
+directory.
+
+That decision needed no code change. Centroid-only publication for anything
+unclaimed is what the schema already enforces, and search reads the same
+protected point. It was the other answer — claimed listings only — that would
+have added a condition to the search predicate, and it is not being taken.
+
+What remains open is **takedown**. Removal is an operator action today: there is
+no self-service endpoint, no named owner and no target response time. Requests
+to be delisted arrive regardless of the decision above, and right now they have
+nowhere to land. Name an owner and write the procedure into `runbook.md` before
+the first real import goes live.
 
 **The badge is only as fresh as the last import.** Statuses change between
 downloads. The detail endpoint returns `license_data_as_of` so a client can say
