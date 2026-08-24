@@ -75,6 +75,12 @@ const FIELD_ALIASES: &[(&str, &[&str])] = &[
     (
         "classifications",
         &[
+            // The real Master List (verified 2026-08-24) names this column
+            // "Classifications(s)" — CSLB's own typo. normalise_header strips
+            // the parentheses, leaving a doubled s. Without this alias the
+            // column is silently dropped: it is not in REQUIRED, so the import
+            // succeeds and every contractor lands with no trades at all.
+            "classificationss",
             "classifications",
             "classification",
             "class",
@@ -129,6 +135,21 @@ fn normalise_header(header: &str) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Normalise a CSLB classification code for matching against the trade table.
+///
+/// CSLB is not consistent with itself. The Master List downloaded 2026-08-24
+/// carries `C10`, `C36` and `C33` unhyphenated on most rows, and `C-7`, `C-8`,
+/// `C-6` hyphenated on others — in the same column of the same file. Comparing
+/// the raw strings matched only `B`, which left 6,942 electricians, 4,823
+/// plumbers, 2,989 painters, 1,698 landscapers and 1,226 roofers with no trade
+/// at all, and therefore invisible to every trade filter in the directory.
+fn normalise_classification(code: &str) -> String {
+    code.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
         .collect()
 }
 
@@ -192,7 +213,12 @@ fn map_status(raw: &str) -> LicenseStatus {
     // negative and specific cases are therefore tested before the positive one.
     if upper.contains("INACTIVE") {
         LicenseStatus::Inactive
-    } else if upper.contains("SUSPEND") {
+    } else if upper.contains("SUSP") {
+        // "SUSP", not "SUSPEND". CSLB abbreviates: the real Master List
+        // (verified 2026-08-24) carries "CONTR BOND SUSP", "WORK COMP SUSP",
+        // "LIAB INS SUSP" and twenty more like them, and not one contains
+        // "SUSPEND". Even "SOS SUSPENSION" does not — it reads SUSPEN-S-ION.
+        // Matching the long form sent 13,512 suspended licences to Unknown.
         LicenseStatus::Suspended
     } else if upper.contains("EXPIR") {
         LicenseStatus::Expired
@@ -400,7 +426,7 @@ pub async fn run(pool: &PgPool, options: &ImportOptions) -> Result<RunCounts, Ap
             trade
                 .cslb_classification
                 .as_ref()
-                .map(|c| (c.to_ascii_uppercase(), trade.id))
+                .map(|c| (normalise_classification(c), trade.id))
         })
         .collect();
 
@@ -589,7 +615,11 @@ async fn flush(
         let trade_ids: Vec<uuid::Uuid> = record
             .classifications
             .iter()
-            .filter_map(|classification| trade_by_classification.get(classification).copied())
+            .filter_map(|classification| {
+                trade_by_classification
+                    .get(&normalise_classification(classification))
+                    .copied()
+            })
             .collect();
         contractors::replace_cslb_trades(&mut tx, upserted.id, &trade_ids).await?;
 
@@ -666,6 +696,84 @@ mod tests {
         assert_eq!(map_status("Inactive - suspended"), LicenseStatus::Inactive);
         assert_eq!(map_status("EXPIRED - INACTIVE"), LicenseStatus::Inactive);
         assert_eq!(map_status("SUSPENDED"), LicenseStatus::Suspended);
+    }
+
+    /// The real vocabulary, taken from the Master List downloaded 2026-08-24.
+    ///
+    /// These are the values that actually occur, and none of them spells
+    /// "SUSPEND" in full. This test exists because the previous one asserted
+    /// only on the long form and therefore passed while 13,512 real licences —
+    /// 7,972 of them with a suspended contractor bond — were being mapped to
+    /// Unknown.
+    #[test]
+    fn the_real_cslb_suspension_vocabulary_maps_to_suspended() {
+        for raw in [
+            "CONTR BOND SUSP",
+            "WORK COMP SUSP",
+            "LIAB INS SUSP",
+            "SUSP - NO QUALIFIER",
+            "FAMILY SUP SUSP",
+            "SOS SUSPENSION",
+            "JUDGEMENT SUSP",
+            "OUT LIAB SUSP",
+            "BOND PAY SUSP",
+            "EMP/WK BND SUSP",
+            "JDG ENTITY SUSP",
+            "QUAL BOND SUSP",
+            "BND PAY EN SUSP",
+            "O/L ENTITY SUSP",
+        ] {
+            assert_eq!(
+                map_status(raw),
+                LicenseStatus::Suspended,
+                "{raw} must not be Unknown: the badge is derived from this value"
+            );
+        }
+
+        // The one status that means the licence is good.
+        assert_eq!(map_status("CLEAR"), LicenseStatus::Active);
+    }
+
+    /// CSLB writes the same classification both ways in one file, so matching
+    /// has to be insensitive to the hyphen. The seeded trades use "C-10"; the
+    /// real Master List overwhelmingly says "C10".
+    #[test]
+    fn classification_codes_match_regardless_of_hyphenation() {
+        // Every spelling of the same code collapses to one key.
+        for spelling in ["C-10", "C10", "c 10", " c-10 "] {
+            assert_eq!(
+                normalise_classification(spelling),
+                "C10",
+                "{spelling} must match the seeded C-10 trade"
+            );
+        }
+
+        // Distinct codes must NOT collide: C-1 and C1 are the same trade, but
+        // C-10 and C1 are different ones, and stripping must not merge them.
+        assert_ne!(
+            normalise_classification("C-10"),
+            normalise_classification("C-1")
+        );
+        assert_eq!(normalise_classification("B"), "B");
+        assert_eq!(normalise_classification("A"), "A");
+    }
+
+    /// CSLB's own header carries a typo, and stripping punctuation doubles the
+    /// s. Classifications is not a REQUIRED column, so getting this wrong does
+    /// not fail the import — it just leaves every contractor with no trades.
+    #[test]
+    fn the_real_classifications_header_is_recognised() {
+        let headers = csv::StringRecord::from(vec![
+            "LicenseNo",
+            "BusinessName",
+            "PrimaryStatus",
+            "Classifications(s)",
+        ]);
+        let map = ColumnMap::build(&headers).expect("required columns are present");
+        assert!(
+            map.columns.contains_key("classifications"),
+            "Classifications(s) must map, or every contractor imports with no trades"
+        );
     }
 
     #[test]
