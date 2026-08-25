@@ -12,7 +12,7 @@ use cm_auth::ratelimit;
 use cm_core::{new_id, AppError, Secret};
 use cm_db::repo::audit::{self, ActorKind, AuditEvent};
 use cm_db::repo::jobs::{
-    self, Cursor, Filters, JobStatus, JobTimeline, NewJob, Near, OwnerJob, DEFAULT_PAGE, MAX_PAGE,
+    self, Cursor, Filters, JobStatus, JobTimeline, Near, NewJob, OwnerJob, DEFAULT_PAGE, MAX_PAGE,
 };
 use cm_db::repo::reference;
 use cm_db::PgPool;
@@ -85,7 +85,8 @@ pub async fn post(
             ));
         }
     }
-    if input.budget_min_cents.is_some_and(|c| c < 0) || input.budget_max_cents.is_some_and(|c| c < 0)
+    if input.budget_min_cents.is_some_and(|c| c < 0)
+        || input.budget_max_cents.is_some_and(|c| c < 0)
     {
         return Err(AppError::invalid("A budget cannot be negative."));
     }
@@ -267,7 +268,12 @@ pub fn parse(raw: &RawQuery, trade_ids: Vec<Uuid>) -> Result<JobQuery, AppError>
         _ => ignored.push("lat/lon/radius_m".to_owned()),
     }
 
-    let limit = match raw.limit.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+    let limit = match raw
+        .limit
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
         Some(value) => value
             .parse::<i64>()
             .map_err(|_| AppError::invalid("limit must be a number"))?
@@ -299,7 +305,11 @@ fn parse_f64(value: Option<&str>) -> Option<f64> {
 /// Opaque on purpose: a client that can read the sort key starts constructing
 /// cursors, and then the encoding is a contract.
 pub fn encode_cursor(cursor: &Cursor) -> String {
-    URL_SAFE_NO_PAD.encode(format!("{}\u{0}{}", cursor.id, cursor.created_at.to_rfc3339()))
+    URL_SAFE_NO_PAD.encode(format!(
+        "{}\u{0}{}",
+        cursor.id,
+        cursor.created_at.to_rfc3339()
+    ))
 }
 
 pub fn decode_cursor(value: &str) -> Result<Cursor, AppError> {
