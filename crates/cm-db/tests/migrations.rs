@@ -371,6 +371,86 @@ async fn a_homeowner_account_cannot_be_recorded_as_a_claimant(pool: PgPool) {
     );
 }
 
+/// Job status and timeline vocabularies must match their Rust enums, for the
+/// same reason account_type does: two hand-written lists that drift apart
+/// surface as a 500 rather than a compile error.
+///
+/// Restricted to single-column CHECKs. `jobs.status` appears in two of them —
+/// its own vocabulary, and `jobs_closed_iff_not_open`, which spans status and
+/// closed_at — and without the restriction this test picks whichever the
+/// catalogue returns first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn job_vocabularies_match_the_rust_enums(pool: PgPool) {
+    for (column, from_rust) in [
+        (
+            "status",
+            cm_db::repo::jobs::JobStatus::ALL
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "timeline",
+            cm_db::repo::jobs::JobTimeline::ALL
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(c.oid) \
+             FROM pg_constraint c \
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) \
+             WHERE c.contype = 'c' AND c.conrelid = 'jobs'::regclass AND a.attname = $1 \
+               AND array_length(c.conkey, 1) = 1",
+        )
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|_| panic!("no CHECK constraint on jobs.{column}"));
+
+        let mut literals = literals_in(&definition);
+        literals.sort_unstable();
+        let mut expected = from_rust;
+        expected.sort_unstable();
+
+        assert_eq!(literals, expected, "jobs.{column} was: {definition}");
+    }
+}
+
+/// Posting work is the homeowner's side, and the database says so as well as
+/// the handler — a code path that skips the check cannot record a contractor
+/// account as the poster.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_contractor_account_cannot_be_recorded_as_a_job_poster(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("connection");
+
+    let contractor = cm_core::new_id();
+    cm_db::repo::users::insert(
+        &mut conn,
+        contractor,
+        "contractor@example.test",
+        "Contractor",
+        cm_db::repo::users::AccountType::Contractor,
+    )
+    .await
+    .expect("insert contractor");
+
+    let refused = sqlx::query(
+        "INSERT INTO jobs (id, posted_by_user_id, title, description) \
+         VALUES ($1, $2, 'A job', 'Some detail')",
+    )
+    .bind(cm_core::new_id())
+    .bind(contractor)
+    .execute(&mut *conn)
+    .await;
+
+    assert!(
+        refused.is_err(),
+        "the database must refuse a contractor account as a job poster"
+    );
+}
+
 /// The CHECK constraints actually reject bad rows, not merely exist.
 #[sqlx::test(migrations = "../../migrations")]
 async fn constraints_reject_invalid_rows(pool: PgPool) {

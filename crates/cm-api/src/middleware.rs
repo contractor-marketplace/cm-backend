@@ -54,6 +54,46 @@ pub async fn require_session(
     Ok(next.run(request).await)
 }
 
+/// A session if one is presented, and no opinion if not.
+///
+/// This exists for one shape of route: public, readable by anyone, but showing
+/// more to a caller we can identify. The jobs board is the case — a signed-out
+/// visitor sees a redacted listing, and a contractor sees the detail.
+///
+/// It deliberately does NOT check CSRF, which would be a hole on any route that
+/// changes state. It is safe here only because it is attached exclusively to
+/// read-only routes, and that "exclusively" is enforced rather than trusted:
+/// `every_public_route_is_read_only` in the router tests fails the build if a
+/// mutating method is ever registered on the public router.
+///
+/// It never rejects. A stale or forged cookie resolves to `None` and the caller
+/// simply gets the anonymous view, because a public route answering 401 would
+/// be a worse bug than showing someone slightly less than they were owed.
+pub async fn attach_optional_session(
+    State(state): State<AppState>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let resolved = match request
+        .headers()
+        .get(http::header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| cookie::read(header, cookie::SESSION_COOKIE))
+    {
+        Some(token) => state.auth.authenticate(&state.pool, token).await.ok(),
+        None => None,
+    };
+
+    request.extensions_mut().insert(OptionalSession(resolved));
+    next.run(request).await
+}
+
+/// Wrapper so the extension type is distinct from `Authenticated`: a route that
+/// wants a guaranteed caller must not accidentally satisfy itself with a
+/// maybe-caller.
+#[derive(Debug, Clone)]
+pub struct OptionalSession(pub Option<cm_auth::Authenticated>);
+
 /// Build the transport context once, at the edge, and put it in the request.
 ///
 /// Handlers read it with the `Context` extractor rather than assembling it

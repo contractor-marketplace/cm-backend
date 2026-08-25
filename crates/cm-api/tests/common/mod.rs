@@ -450,3 +450,48 @@ pub async fn user_id(pool: &PgPool, email: &str) -> uuid::Uuid {
         .await
         .expect("user")
 }
+
+/// Insert jobs straight through the repository, bypassing the HTTP path.
+///
+/// Posting is rate-limited to ten a day per account, which is right for a real
+/// homeowner and wrong for a test whose subject is pagination. Same reasoning as
+/// `force_claim`: a test about one thing should not have to satisfy the rules of
+/// another.
+///
+/// Returns the ids in insertion order.
+pub async fn seed_jobs(
+    pool: &PgPool,
+    poster: uuid::Uuid,
+    count: usize,
+    postal_code: &str,
+) -> Vec<uuid::Uuid> {
+    let mut conn = pool.acquire().await.expect("connection");
+    let region = cm_db::repo::reference::find_zcta(&mut conn, postal_code)
+        .await
+        .expect("zcta");
+
+    let mut ids = Vec::with_capacity(count);
+    for n in 0..count {
+        let id = cm_core::new_id();
+        cm_db::repo::jobs::insert(
+            &mut conn,
+            cm_db::repo::jobs::NewJob {
+                id,
+                posted_by_user_id: poster,
+                title: &format!("Job number {n}"),
+                description: "Seeded for a test that is not about posting.",
+                trade_id: None,
+                budget_min_cents: None,
+                budget_max_cents: None,
+                timeline: None,
+                postal_code: Some(postal_code),
+                region_id: region.as_ref().map(|r| r.id),
+                centroid: region.as_ref().map(|r| (r.lon, r.lat)),
+            },
+        )
+        .await
+        .expect("seed a job");
+        ids.push(id);
+    }
+    ids
+}

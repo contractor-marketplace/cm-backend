@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod claims;
 pub mod contractors;
+pub mod jobs;
 pub mod me;
 pub mod messaging;
 pub mod profiles;

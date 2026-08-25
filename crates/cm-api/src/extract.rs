@@ -28,6 +28,34 @@ impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
     }
 }
 
+/// The caller, if there is one.
+///
+/// For public routes that show more to someone we can identify. Only ever
+/// populated by `attach_optional_session`, which is attached exclusively to
+/// read-only routes — see the note on that function for why that matters.
+///
+/// A route wanting a guaranteed caller must use `CurrentUser`. The two read
+/// different extension types on purpose, so this one cannot silently stand in
+/// for real authentication.
+#[derive(Debug, Clone)]
+pub struct OptionalUser(pub Option<Authenticated>);
+
+impl<S: Send + Sync> FromRequestParts<S> for OptionalUser {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // A missing extension means the layer is not installed, which for this
+        // extractor is indistinguishable from "nobody is signed in" and is
+        // treated the same way: no caller, no error.
+        Ok(Self(
+            parts
+                .extensions
+                .get::<crate::middleware::OptionalSession>()
+                .and_then(|session| session.0.clone()),
+        ))
+    }
+}
+
 /// What the transport knows about this request: client address, user agent,
 /// request id.
 ///

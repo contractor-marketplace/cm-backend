@@ -8,6 +8,7 @@ pub mod claims;
 pub mod geocode_worker;
 pub mod geocoder;
 pub mod import;
+pub mod jobs;
 pub mod location;
 pub mod maintenance;
 pub mod messaging;

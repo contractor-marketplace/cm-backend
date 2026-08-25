@@ -4,6 +4,7 @@ pub mod audit;
 pub mod claims;
 pub mod contractors;
 pub mod geocode;
+pub mod jobs;
 pub mod licenses;
 pub mod maintenance;
 pub mod messaging;

@@ -77,7 +77,7 @@ async fn version_answers_without_touching_the_database() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["environment"], "development");
-    assert_eq!(body["migration_version"], 16);
+    assert_eq!(body["migration_version"], 17);
     assert!(body["git_sha"].is_string());
 }
 
@@ -88,8 +88,8 @@ async fn readyz_is_ready_once_the_schema_matches(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "body was {body}");
     assert_eq!(body["status"], "ready");
     assert_eq!(body["checks"]["database"]["status"], "ok");
-    assert_eq!(body["checks"]["migrations"]["applied"], 16);
-    assert_eq!(body["checks"]["migrations"]["embedded"], 16);
+    assert_eq!(body["checks"]["migrations"]["applied"], 17);
+    assert_eq!(body["checks"]["migrations"]["embedded"], 17);
 }
 
 #[sqlx::test(migrations = false)]
@@ -182,5 +182,48 @@ async fn no_cross_origin_headers_are_sent() {
             headers.get(header).is_none(),
             "{header} must not be sent: the API is same-origin by design"
         );
+    }
+}
+
+/// The optional-session layer resolves a caller WITHOUT checking CSRF, which is
+/// safe only for as long as nothing behind it changes state.
+///
+/// That cannot be asserted by reading the router from outside, so the property
+/// is checked instead: on every path the layer is attached to, a mutating
+/// request with no session must be refused. A route that answered 2xx here
+/// would be a state change reachable without a CSRF token.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_mutation_is_reachable_through_the_optional_session_layer(pool: PgPool) {
+    let paths = [
+        "/v1/contractors",
+        "/v1/contractors/map",
+        "/v1/contractors/00000000-0000-0000-0000-000000000000",
+        "/v1/trades",
+        "/v1/regions",
+        "/v1/jobs",
+        "/v1/jobs/00000000-0000-0000-0000-000000000000",
+    ];
+
+    for path in paths {
+        for method in [http::Method::POST, http::Method::PUT, http::Method::DELETE] {
+            let response = router(pool.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert!(
+                response.status().is_client_error(),
+                "{method} {path} answered {} — a state change behind the \
+                 optional-session layer would bypass CSRF entirely",
+                response.status()
+            );
+        }
     }
 }
