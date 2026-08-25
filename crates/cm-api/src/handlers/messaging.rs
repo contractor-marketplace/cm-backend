@@ -22,6 +22,14 @@ pub async fn start(
     CurrentUser(caller): CurrentUser,
     ValidJson(body): ValidJson<StartRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), AppError> {
+    // Starting a conversation is how a homeowner hires. A contractor account
+    // replies inside a conversation a homeowner opened, and never opens one —
+    // an account is one side of the marketplace or the other, never both.
+    if !caller.user.account_type.may_hire() {
+        // Only a homeowner account can start a conversation.
+        return Err(AppError::Forbidden);
+    }
+
     let conversation = cm_domain::messaging::start_with_contractor(
         &state.pool,
         state.auth.pepper(),

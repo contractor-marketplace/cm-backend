@@ -191,9 +191,15 @@ async fn a_claimed_listing_that_opts_in_publishes_its_exact_point(pool: PgPool) 
 
     let user_id = cm_core::new_id();
     let mut conn = pool.acquire().await.expect("connection");
-    cm_db::repo::users::insert(&mut conn, user_id, "owner@example.test", "Owner")
-        .await
-        .expect("user");
+    cm_db::repo::users::insert(
+        &mut conn,
+        user_id,
+        "owner@example.test",
+        "Owner",
+        cm_db::repo::users::AccountType::Contractor,
+    )
+    .await
+    .expect("user");
     contractors::attach_claimant(&mut conn, contractor_id, user_id)
         .await
         .expect("claim");

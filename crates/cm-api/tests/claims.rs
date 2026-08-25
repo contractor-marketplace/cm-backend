@@ -22,7 +22,7 @@ async fn an_approved_claim_grants_ownership_and_the_badge(pool: PgPool) {
     let router = router(pool.clone());
 
     let mut claimant = Client::new(router.clone());
-    claimant.register("marisol@example.test").await;
+    claimant.register_contractor("marisol@example.test").await;
 
     let opened = claimant
         .post(
@@ -78,7 +78,7 @@ async fn an_expired_licence_is_never_verified(pool: PgPool) {
     let router = router(pool.clone());
 
     let mut claimant = Client::new(router.clone());
-    claimant.register("roofer@example.test").await;
+    claimant.register_contractor("roofer@example.test").await;
     let opened = claimant
         .post(
             &format!("/v1/contractors/{id}/claims"),
@@ -114,9 +114,15 @@ async fn a_licence_going_inactive_removes_the_badge(pool: PgPool) {
 
     let owner = cm_core::new_id();
     let mut conn = pool.acquire().await.expect("connection");
-    cm_db::repo::users::insert(&mut conn, owner, "owner@example.test", "Owner")
-        .await
-        .expect("user");
+    cm_db::repo::users::insert(
+        &mut conn,
+        owner,
+        "owner@example.test",
+        "Owner",
+        cm_db::repo::users::AccountType::Contractor,
+    )
+    .await
+    .expect("user");
     drop(conn);
     common::force_claim(&pool, id, owner).await;
 
@@ -151,9 +157,9 @@ async fn two_simultaneous_approvals_produce_exactly_one_owner(pool: PgPool) {
 
     // Two people claim the same listing.
     let mut first = Client::new(router.clone());
-    first.register("first@example.test").await;
+    first.register_contractor("first@example.test").await;
     let mut second = Client::new(router.clone());
-    second.register("second@example.test").await;
+    second.register_contractor("second@example.test").await;
 
     let a = first
         .post(
@@ -234,8 +240,26 @@ async fn a_claim_needs_a_session_and_moderation_needs_a_role(pool: PgPool) {
         .await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 
+    // A homeowner account cannot claim a listing at all: the two sides of the
+    // marketplace are mutually exclusive, and this is the contractor's side.
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("homeowner@example.test").await;
+    assert_eq!(
+        homeowner
+            .post(
+                &format!("/v1/contractors/{id}/claims"),
+                json!({ "method": "manual_review" }),
+            )
+            .await
+            .status,
+        StatusCode::FORBIDDEN,
+        "a homeowner account cannot claim a listing"
+    );
+
+    // A contractor account may claim, but claiming confers no moderation
+    // power — that is what the rest of this test pins down.
     let mut ordinary = Client::new(router.clone());
-    ordinary.register("ordinary@example.test").await;
+    ordinary.register_contractor("ordinary@example.test").await;
     assert_eq!(
         ordinary.get("/v1/admin/claims").await.status,
         StatusCode::FORBIDDEN,
@@ -270,7 +294,7 @@ async fn a_claimant_may_withdraw_only_their_own_pending_claim(pool: PgPool) {
     let router = router(pool.clone());
 
     let mut claimant = Client::new(router.clone());
-    claimant.register("claimant@example.test").await;
+    claimant.register_contractor("claimant@example.test").await;
     let opened = claimant
         .post(
             &format!("/v1/contractors/{id}/claims"),
@@ -319,14 +343,22 @@ async fn a_second_claim_on_a_claimed_listing_is_refused(pool: PgPool) {
 
     let owner = cm_core::new_id();
     let mut conn = pool.acquire().await.expect("connection");
-    cm_db::repo::users::insert(&mut conn, owner, "owner@example.test", "Owner")
-        .await
-        .expect("user");
+    cm_db::repo::users::insert(
+        &mut conn,
+        owner,
+        "owner@example.test",
+        "Owner",
+        cm_db::repo::users::AccountType::Contractor,
+    )
+    .await
+    .expect("user");
     drop(conn);
     common::force_claim(&pool, id, owner).await;
 
     let mut latecomer = Client::new(router);
-    latecomer.register("latecomer@example.test").await;
+    latecomer
+        .register_contractor("latecomer@example.test")
+        .await;
     let refused = latecomer
         .post(
             &format!("/v1/contractors/{id}/claims"),
@@ -344,7 +376,7 @@ async fn a_decision_is_auditable_end_to_end(pool: PgPool) {
     let router = router(pool.clone());
 
     let mut claimant = Client::new(router.clone());
-    claimant.register("claimant@example.test").await;
+    claimant.register_contractor("claimant@example.test").await;
     let opened = claimant
         .post(
             &format!("/v1/contractors/{id}/claims"),

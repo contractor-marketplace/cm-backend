@@ -11,6 +11,27 @@ current session and revokes the rest, roles, and an audit trail. Google sign-in
 via Firebase, where Firebase verifies nothing on our behalf beyond issuing a
 token we then check ourselves.
 
+**Account type.** Every account is a **homeowner** or a **contractor**, chosen
+at registration and never changed. This is `users.account_type`, not a role —
+roles are granted and additive, and `Role::Contractor` still means a moderator
+approved a claim. The two are related but distinct: only a contractor *account*
+may open a claim, and only an approved claim grants the contractor *role*.
+
+The rule is enforced in three places, deliberately. The handlers refuse the
+wrong side with a 403 (claiming, starting a conversation, holding a homeowner
+profile). Two database triggers refuse it again, so a code path that forgets
+the check cannot record a homeowner as a claimant or give one a homeowner
+profile. And the front end never offers an action the account cannot take.
+
+There is no conversion. An account is one side of the marketplace or the other
+for its whole life, so somebody who registers as the wrong one needs a new
+account under a different address — which, with no password reset and no email
+verification, is worth saying on the form. It is.
+
+Google sign-in cannot ask, because the account is created from a token rather
+than a form; it defaults to homeowner, the side that cannot claim. Enabling it
+(issue #4) needs a type-selection step first.
+
 **Licence data.** An operator-supplied CSLB file becomes `license_records` with
 the source row preserved verbatim, and `contractors` — our own record, which an
 import may refresh but never overwrite where a claimant has written.

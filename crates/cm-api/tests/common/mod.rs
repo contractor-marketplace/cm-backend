@@ -243,13 +243,25 @@ impl Client {
     }
 
     /// Register an account and end up signed in, as a browser would.
+    /// Registers a homeowner, which is the default side of the marketplace.
     pub async fn register(&mut self, email: &str) -> TestResponse {
+        self.register_as(email, "homeowner").await
+    }
+
+    /// Registers a contractor. Claiming a listing requires one, and the
+    /// database enforces that as well as the handler.
+    pub async fn register_contractor(&mut self, email: &str) -> TestResponse {
+        self.register_as(email, "contractor").await
+    }
+
+    pub async fn register_as(&mut self, email: &str, account_type: &str) -> TestResponse {
         self.post(
             "/v1/auth/register",
             serde_json::json!({
                 "email": email,
                 "display_name": "Test Person",
                 "password": PASSWORD,
+                "account_type": account_type,
             }),
         )
         .await

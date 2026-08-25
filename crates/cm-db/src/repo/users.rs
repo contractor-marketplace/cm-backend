@@ -39,6 +39,73 @@ impl UserStatus {
     }
 }
 
+/// Which side of the marketplace an account is on.
+///
+/// Chosen once at registration and never changed. Deliberately not a role:
+/// roles are additive and granted — `Role::Contractor` is granted when a
+/// moderator approves a claim, and means the holder proved they own a licensed
+/// business. This is a single mutually exclusive value, which is what makes
+/// "an account is never both" something the type system can state.
+///
+/// Mirrors the `users.account_type` CHECK constraint; a migration test asserts
+/// the two agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountType {
+    Homeowner,
+    Contractor,
+}
+
+impl AccountType {
+    pub const ALL: [Self; 2] = [Self::Homeowner, Self::Contractor];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Homeowner => "homeowner",
+            Self::Contractor => "contractor",
+        }
+    }
+
+    /// For a value arriving from a client, so the error is a 400 rather than a
+    /// 500 and names what was expected.
+    pub fn parse_request(value: &str) -> Result<Self, AppError> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| {
+                AppError::invalid(format!(
+                    "Account type must be one of: {}.",
+                    Self::ALL
+                        .iter()
+                        .map(|kind| kind.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+    }
+
+    /// For a value read back out of the database, where an unknown value is a
+    /// bug in this code rather than bad input.
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| AppError::internal(format!("unknown account type in database: {value}")))
+    }
+
+    /// Claiming a listing is the contractor's side of the marketplace.
+    pub fn may_claim_a_listing(self) -> bool {
+        matches!(self, Self::Contractor)
+    }
+
+    /// Starting a conversation, and holding a homeowner profile, are the
+    /// homeowner's side. A contractor replies within a conversation a
+    /// homeowner opened; it never opens one.
+    pub fn may_hire(self) -> bool {
+        matches!(self, Self::Homeowner)
+    }
+}
+
 /// Authorization roles. Mirrors the `user_roles.role` CHECK constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +150,8 @@ pub struct User {
     pub email: String,
     pub display_name: String,
     pub status: UserStatus,
+    /// Which side of the marketplace. Fixed at registration.
+    pub account_type: AccountType,
     pub email_verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -93,6 +162,7 @@ struct UserRow {
     email: String,
     display_name: String,
     status: String,
+    account_type: String,
     email_verified_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
 }
@@ -106,14 +176,15 @@ impl TryFrom<UserRow> for User {
             email: row.email,
             display_name: row.display_name,
             status: UserStatus::parse(&row.status)?,
+            account_type: AccountType::parse(&row.account_type)?,
             email_verified_at: row.email_verified_at,
             created_at: row.created_at,
         })
     }
 }
 
-const SELECT_USER: &str =
-    "SELECT id, email, display_name, status, email_verified_at, created_at FROM users";
+const SELECT_USER: &str = "SELECT id, email, display_name, status, account_type, \
+     email_verified_at, created_at FROM users";
 
 /// Insert a new account.
 ///
@@ -125,14 +196,16 @@ pub async fn insert(
     id: Uuid,
     email: &str,
     display_name: &str,
+    account_type: AccountType,
 ) -> Result<User, AppError> {
     let row: UserRow = sqlx::query_as(
-        "INSERT INTO users (id, email, display_name) VALUES ($1, $2, $3) \
-         RETURNING id, email, display_name, status, email_verified_at, created_at",
+        "INSERT INTO users (id, email, display_name, account_type) VALUES ($1, $2, $3, $4) \
+         RETURNING id, email, display_name, status, account_type, email_verified_at, created_at",
     )
     .bind(id)
     .bind(email)
     .bind(display_name)
+    .bind(account_type.as_str())
     .fetch_one(&mut *conn)
     .await
     .map_err(|error| match &error {

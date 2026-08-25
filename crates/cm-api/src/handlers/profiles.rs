@@ -31,6 +31,11 @@ pub async fn upsert(
     CurrentUser(caller): CurrentUser,
     ValidJson(body): ValidJson<UpsertRequest>,
 ) -> Result<Json<HomeownerProfile>, AppError> {
+    if !caller.user.account_type.may_hire() {
+        // Only a homeowner account has a homeowner profile.
+        return Err(AppError::Forbidden);
+    }
+
     let display_name = body.display_name.trim();
     if display_name.is_empty() || display_name.chars().count() > 120 {
         return Err(AppError::invalid(

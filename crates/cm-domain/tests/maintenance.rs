@@ -11,10 +11,16 @@ use cm_domain::maintenance::prune;
 
 async fn a_user(pool: &PgPool, email: &str) -> uuid::Uuid {
     let mut conn = pool.acquire().await.expect("connection");
-    cm_db::repo::users::insert(&mut conn, cm_core::new_id(), email, "Test")
-        .await
-        .expect("user")
-        .id
+    cm_db::repo::users::insert(
+        &mut conn,
+        cm_core::new_id(),
+        email,
+        "Test",
+        cm_db::repo::users::AccountType::Homeowner,
+    )
+    .await
+    .expect("user")
+    .id
 }
 
 /// Insert a session with explicit lifetimes, ageing the row where needed.

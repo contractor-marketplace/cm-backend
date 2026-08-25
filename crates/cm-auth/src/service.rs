@@ -209,6 +209,7 @@ impl AuthService {
         email: &str,
         display_name: &str,
         password: &str,
+        account_type: users::AccountType,
         context: &RequestContext,
     ) -> Result<LoginOutcome, AppError> {
         let now = Utc::now();
@@ -237,7 +238,7 @@ impl AuthService {
         let password_hash = self.hasher.hash(password).await?;
 
         let mut tx = pool.begin().await.map_err(AppError::internal)?;
-        let user = users::insert(&mut tx, new_id(), email, display_name).await?;
+        let user = users::insert(&mut tx, new_id(), email, display_name, account_type).await?;
         passwords::insert(&mut tx, user.id, &password_hash).await?;
         let session = self.issue_session(&mut tx, user.id, context, now).await?;
         audit::record(
@@ -796,15 +797,28 @@ impl AuthService {
                 })?;
                 let display_name = email.split('@').next().unwrap_or("New user").to_owned();
 
-                let user = users::insert(&mut tx, new_id(), email.trim(), &display_name)
-                    .await
-                    .map_err(|error| match error {
-                        AppError::Conflict { .. } => AppError::conflict(
-                            "An account already uses that email address. Sign in to it, \
+                // Google sign-in cannot ask which side of the marketplace
+                // this is, because the account is created from a token rather
+                // than a form. Homeowner is the safe default: it is the side
+                // that cannot claim a listing, so a contractor arriving this
+                // way is stopped and asked rather than silently given the
+                // wrong capabilities. Enabling Google sign-in (issue #4) needs
+                // a type-selection step before this line.
+                let user = users::insert(
+                    &mut tx,
+                    new_id(),
+                    email.trim(),
+                    &display_name,
+                    users::AccountType::Homeowner,
+                )
+                .await
+                .map_err(|error| match error {
+                    AppError::Conflict { .. } => AppError::conflict(
+                        "An account already uses that email address. Sign in to it, \
                              then link Google from account settings.",
-                        ),
-                        other => other,
-                    })?;
+                    ),
+                    other => other,
+                })?;
 
                 oauth::insert(
                     &mut tx,
