@@ -185,15 +185,19 @@ async fn no_cross_origin_headers_are_sent() {
     }
 }
 
-/// The optional-session layer resolves a caller WITHOUT checking CSRF, which is
-/// safe only for as long as nothing behind it changes state.
+/// The public router carries no CSRF layer, which is safe only for as long as
+/// its read routes stay reads.
 ///
-/// That cannot be asserted by reading the router from outside, so the property
-/// is checked instead: on every path the layer is attached to, a mutating
-/// request with no session must be refused. A route that answered 2xx here
-/// would be a state change reachable without a CSRF token.
+/// The optional-session layer that used to sit here is gone, but the hazard it
+/// created did not leave with it: anything mutating registered next to these
+/// paths would change state with no token to present. That cannot be asserted
+/// by reading the router from outside, so the property is checked instead — a
+/// mutating request with no session must be refused on every one of them.
+///
+/// Register and login are deliberately absent: they are the two public writes,
+/// they have no session to protect, and they are rate limited by address.
 #[sqlx::test(migrations = "../../migrations")]
-async fn no_mutation_is_reachable_through_the_optional_session_layer(pool: PgPool) {
+async fn the_public_read_routes_stay_read_only(pool: PgPool) {
     let paths = [
         "/v1/contractors",
         "/v1/contractors/map",
@@ -220,8 +224,8 @@ async fn no_mutation_is_reachable_through_the_optional_session_layer(pool: PgPoo
 
             assert!(
                 response.status().is_client_error(),
-                "{method} {path} answered {} — a state change behind the \
-                 optional-session layer would bypass CSRF entirely",
+                "{method} {path} answered {} — a state change on the public \
+                 router would bypass CSRF entirely",
                 response.status()
             );
         }

@@ -2,7 +2,7 @@
 
 use crate::handlers;
 use crate::health;
-use crate::middleware::{attach_optional_session, attach_request_context, require_session};
+use crate::middleware::{attach_request_context, require_session};
 use crate::request_id::MakeUuidV7RequestId;
 use crate::state::AppState;
 use axum::extract::DefaultBodyLimit;
@@ -85,38 +85,28 @@ pub fn build(state: AppState) -> Router {
             require_session,
         ));
 
-    // No session to protect yet, so no CSRF token to check. All three are rate
-    // limited by address inside the service.
-    let public_write = Router::new()
+    // Open to anyone, session or not. Nothing here reads the caller: the two
+    // write routes are how a caller comes into existence, and every read route
+    // returns the same bytes to everybody. That is why no CSRF check is needed
+    // on this router — there is no session for a cross-site form to ride on.
+    //
+    // The auth writes are rate limited by address inside the service.
+    let public = Router::new()
         .route("/v1/auth/register", post(handlers::auth::register))
         .route("/v1/auth/login", post(handlers::auth::login))
-        .route("/v1/auth/google", post(handlers::auth::google_sign_in));
-
-    // Readable by anyone, and behind a layer that resolves a session when one
-    // is presented so a route can show more to a caller it can identify — the
-    // jobs board shows its detail only to a contractor.
-    //
-    // That layer does not check CSRF, which is safe ONLY because every route
-    // here is read-only. `public_read_is_read_only` in the tests below fails
-    // the build if a mutating method is ever added to this router.
-    let public_read = Router::new()
+        .route("/v1/auth/google", post(handlers::auth::google_sign_in))
         .route("/v1/contractors", get(handlers::contractors::list))
         .route("/v1/contractors/map", get(handlers::contractors::map))
         .route("/v1/contractors/{id}", get(handlers::contractors::detail))
         .route("/v1/trades", get(handlers::contractors::trades))
         .route("/v1/regions", get(handlers::contractors::regions))
-        .merge(handlers::jobs::public_routes())
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            attach_optional_session,
-        ));
+        .merge(handlers::jobs::public_routes());
 
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
         .route("/version", get(health::version))
-        .merge(public_write)
-        .merge(public_read)
+        .merge(public)
         .merge(authenticated)
         // Unknown paths get the same error envelope as everything else, rather
         // than axum's empty-bodied default.

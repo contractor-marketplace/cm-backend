@@ -1,20 +1,22 @@
-//! Jobs: posting, and the board contractors browse.
+//! Jobs: posting, and the board everyone browses.
 //!
-//! The tiering decision lives here and nowhere else: which of the three
-//! projections in `cm_db::repo::jobs` a request gets. Everything below this
-//! point is already narrowed, so a handler bug can pick the wrong tier but
-//! cannot invent a field the query never selected.
+//! The board has one projection and no notion of who is asking. Reads take no
+//! session at all — not "a session that is ignored", but no extractor for one —
+//! so there is no branch here that could serve the wrong caller the wrong shape.
+//! What a job may reveal is decided in the schema, which has no address column
+//! and no precise point; see `migrations/0017_jobs.sql`.
+//!
+//! Writes are the opposite: posting and closing are the homeowner's side, and
+//! both check the account type before touching the database.
 
-use crate::extract::{Context, CurrentUser, Json as ValidJson, OptionalUser};
+use crate::extract::{Context, CurrentUser, Json as ValidJson};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Json, Router};
 use cm_core::AppError;
-use cm_db::repo::jobs::{
-    ContractorJob, JobStatus, JobTimeline, OwnerJob, PublicJob,
-};
-use cm_db::repo::{jobs, reference, users::AccountType};
+use cm_db::repo::jobs::{JobStatus, JobTimeline, OwnerJob, PublicJob};
+use cm_db::repo::{jobs, reference};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -29,39 +31,15 @@ pub struct PostJobRequest {
     pub timeline: Option<String>,
 }
 
-/// Two shapes, never merged into one with optional fields.
-///
-/// An `Option<String> description` that happens to be `None` for anonymous
-/// callers is one careless `unwrap_or_default` away from leaking; two variants
-/// make the tier visible at every call site.
-#[derive(Debug, serde::Serialize)]
-#[serde(untagged)]
-pub enum JobView {
-    ForContractor(ContractorJob),
-    Public(PublicJob),
-}
-
 #[derive(Debug, serde::Serialize)]
 pub struct ListResponse {
-    pub jobs: Vec<JobView>,
+    pub jobs: Vec<PublicJob>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Filters that were not understood and were dropped. Naming them beats a
+    /// 400: an unknown trade slug should narrow nothing, not fail the page.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ignored_filters: Vec<String>,
-    /// So a client can tell "you are seeing the redacted view" from "there is
-    /// nothing more to see", without guessing from absent fields.
-    pub detail_visible: bool,
-}
-
-/// Whether this caller gets the contractor projection.
-///
-/// A signed-out visitor and a signed-in homeowner both get the public view. The
-/// extra detail is for the side of the marketplace that acts on it.
-fn sees_detail(caller: &OptionalUser) -> bool {
-    caller
-        .0
-        .as_ref()
-        .is_some_and(|auth| auth.user.account_type == AccountType::Contractor)
 }
 
 pub async fn post_job(
@@ -107,12 +85,16 @@ pub async fn post_job(
 
 pub async fn list(
     State(state): State<AppState>,
-    caller: OptionalUser,
     Query(raw): Query<cm_domain::jobs::RawQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
 
-    let trade_ids = match raw.trade.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+    let trade_ids = match raw
+        .trade
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
         Some(list) => {
             let slugs: Vec<String> = list
                 .split(',')
@@ -126,63 +108,33 @@ pub async fn list(
     };
 
     let query = cm_domain::jobs::parse(&raw, trade_ids)?;
-    let detail_visible = sees_detail(&caller);
-
-    let (jobs, next_cursor) = if detail_visible {
-        let page =
-            jobs::list_for_contractor(&mut conn, &query.filters, query.limit, query.cursor.as_ref())
-                .await?;
-        (
-            page.jobs.into_iter().map(JobView::ForContractor).collect(),
-            page.next_cursor,
-        )
-    } else {
-        let page =
-            jobs::list_public(&mut conn, &query.filters, query.limit, query.cursor.as_ref()).await?;
-        (
-            page.jobs.into_iter().map(JobView::Public).collect(),
-            page.next_cursor,
-        )
-    };
+    let page = jobs::list(
+        &mut conn,
+        &query.filters,
+        query.limit,
+        query.cursor.as_ref(),
+    )
+    .await?;
 
     Ok(Json(ListResponse {
-        jobs,
-        next_cursor: next_cursor
+        jobs: page.jobs,
+        next_cursor: page
+            .next_cursor
             .as_ref()
             .map(cm_domain::jobs::encode_cursor),
         ignored_filters: query.ignored,
-        detail_visible,
     }))
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct DetailResponse {
-    #[serde(flatten)]
-    pub job: JobView,
-    pub detail_visible: bool,
 }
 
 pub async fn detail(
     State(state): State<AppState>,
-    caller: OptionalUser,
     Path(id): Path<Uuid>,
-) -> Result<Json<DetailResponse>, AppError> {
+) -> Result<Json<PublicJob>, AppError> {
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    let detail_visible = sees_detail(&caller);
-
-    let job = if detail_visible {
-        jobs::find_for_contractor(&mut conn, id)
-            .await?
-            .map(JobView::ForContractor)
-    } else {
-        jobs::find_public(&mut conn, id).await?.map(JobView::Public)
-    }
-    .ok_or(AppError::NotFound)?;
-
-    Ok(Json(DetailResponse {
-        job,
-        detail_visible,
-    }))
+    jobs::find(&mut conn, id)
+        .await?
+        .map(Json)
+        .ok_or(AppError::NotFound)
 }
 
 /// The caller's own posts, in every state. No account-type check: a contractor
@@ -209,7 +161,12 @@ pub async fn close(
     Path(id): Path<Uuid>,
     ValidJson(body): ValidJson<CloseRequest>,
 ) -> Result<StatusCode, AppError> {
-    let status = match body.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let status = match body
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some("closed") | None => JobStatus::Closed,
         Some("cancelled") => JobStatus::Cancelled,
         Some(other) => {
@@ -223,9 +180,8 @@ pub async fn close(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The read-only half, mounted on the public router behind the optional-session
-/// layer. Kept in one function so it is obvious at the call site that these are
-/// the routes anonymous callers reach.
+/// Kept in one function so it is obvious at the call site which job routes an
+/// anonymous caller reaches.
 pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/jobs", axum::routing::get(list))

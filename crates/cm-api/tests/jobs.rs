@@ -1,7 +1,9 @@
-//! Posting a job, and the three tiers that browse it.
+//! Posting a job, and browsing the board.
 //!
-//! The tests that matter most here are the negative ones: what an anonymous
-//! caller cannot obtain, and what a contractor account cannot do.
+//! There is one browse projection and every caller gets it, so the assertions
+//! here are about what the projection itself carries — a first name and never a
+//! surname or an email — and about what an account may do: only a homeowner
+//! posts, only the poster closes.
 
 mod common;
 
@@ -42,13 +44,15 @@ async fn a_homeowner_posts_and_a_contractor_sees_the_detail(pool: PgPool) {
     contractor.register_contractor("sparks@example.test").await;
     let board = contractor.get("/v1/jobs").await;
     assert_eq!(board.status, StatusCode::OK, "{:?}", board.json);
-    assert_eq!(board.json["detail_visible"], true);
 
     let first = &board.json["jobs"][0];
     assert_eq!(first["title"], "Rewire a 1920s duplex");
     assert!(
-        first["description"].as_str().unwrap().contains("Knob and tube"),
-        "a contractor sees the description"
+        first["description"]
+            .as_str()
+            .unwrap()
+            .contains("Knob and tube"),
+        "the description is part of the listing"
     );
     assert_eq!(
         first["poster_first_name"], "Test",
@@ -56,10 +60,13 @@ async fn a_homeowner_posts_and_a_contractor_sees_the_detail(pool: PgPool) {
     );
 }
 
-/// The headline privacy assertion. An anonymous caller may browse, and may not
-/// learn anything about the person who posted.
+/// The board is one listing, and a signed-out visitor gets all of it.
+///
+/// What the listing withholds it withholds from everyone: the poster is a first
+/// name, never a surname or an email, and a job has no address to leak because
+/// the table has no column for one.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_anonymous_caller_gets_the_board_without_any_pii(pool: PgPool) {
+async fn an_anonymous_caller_sees_the_same_job_as_everyone_else(pool: PgPool) {
     seed_directory(&pool).await;
     let router = router(pool.clone());
 
@@ -82,32 +89,35 @@ async fn an_anonymous_caller_gets_the_board_without_any_pii(pool: PgPool) {
     ] {
         let response = anonymous.get(&path).await;
         assert_eq!(response.status, StatusCode::OK, "{path}");
-        assert_eq!(response.json["detail_visible"], false, "{path}");
-
         let rendered = response.json.to_string();
+
+        for present in [
+            "Rewire a 1920s duplex", // the title
+            "Knob and tube",         // the description
+            "\"poster_first_name\":\"Test\"",
+        ] {
+            assert!(rendered.contains(present), "{path} is missing {present}");
+        }
+
         for leaked in [
-            "Knob and tube",   // the description
-            "owner@example",   // the address
-            "Test Person",     // the full display name
-            "poster_first_name",
-            "posted_by_user_id",
-            "description",
+            "owner@example",     // the address
+            "Test Person",       // the full display name
+            "posted_by_user_id", // the poster's identity
         ] {
             assert!(
                 !rendered.contains(leaked),
                 "{path} leaked {leaked}: {rendered}"
             );
         }
-
-        // The public facts are still there, or the board would be useless.
-        assert!(rendered.contains("Rewire a 1920s duplex"), "{path}");
     }
 }
 
-/// A signed-in homeowner is not a contractor, and gets the same view as a
-/// stranger. The extra detail is for the side of the market that acts on it.
+/// Anonymous, homeowner and contractor get byte-identical jobs.
+///
+/// Pinned rather than assumed: the board used to branch on the caller, and this
+/// is the property that replaced it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn another_homeowner_does_not_get_the_contractor_view(pool: PgPool) {
+async fn every_account_type_sees_the_same_board(pool: PgPool) {
     seed_directory(&pool).await;
     let router = router(pool.clone());
 
@@ -115,12 +125,25 @@ async fn another_homeowner_does_not_get_the_contractor_view(pool: PgPool) {
     poster.register("owner@example.test").await;
     poster.post("/v1/jobs", a_job()).await;
 
-    let mut nosy = Client::new(router.clone());
-    nosy.register("nosy@example.test").await;
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("nosy@example.test").await;
+    let mut contractor = Client::new(router.clone());
+    contractor.register_contractor("sparks@example.test").await;
+    let mut anonymous = Client::new(router.clone());
 
-    let board = nosy.get("/v1/jobs").await;
-    assert_eq!(board.json["detail_visible"], false);
-    assert!(!board.json.to_string().contains("Knob and tube"));
+    let anonymous_jobs = anonymous.get("/v1/jobs").await.json["jobs"].clone();
+    assert_eq!(anonymous_jobs.as_array().expect("array").len(), 1);
+
+    for (label, board) in [
+        ("a signed-in homeowner", homeowner.get("/v1/jobs").await),
+        ("a contractor", contractor.get("/v1/jobs").await),
+        ("the poster themselves", poster.get("/v1/jobs").await),
+    ] {
+        assert_eq!(
+            board.json["jobs"], anonymous_jobs,
+            "{label} sees a different board than a stranger"
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -159,7 +182,10 @@ async fn the_poster_sees_their_own_job_in_full(pool: PgPool) {
     let mine = homeowner.get("/v1/me/jobs").await;
     assert_eq!(mine.status, StatusCode::OK);
     assert_eq!(mine.json.as_array().expect("array").len(), 1);
-    assert!(mine.json[0]["description"].as_str().unwrap().contains("Knob"));
+    assert!(mine.json[0]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Knob"));
     assert!(mine.json[0]["posted_by_user_id"].is_string());
 
     // Somebody else's list is their own, not a way to read anyone's.
@@ -310,7 +336,10 @@ async fn a_post_is_validated_before_it_reaches_the_database(pool: PgPool) {
 
     for (label, body) in [
         ("empty title", json!({ "title": "  ", "description": "x" })),
-        ("empty description", json!({ "title": "x", "description": " " })),
+        (
+            "empty description",
+            json!({ "title": "x", "description": " " }),
+        ),
         (
             "inverted budget",
             json!({ "title": "x", "description": "y",
@@ -386,7 +415,10 @@ async fn a_closed_job_is_no_longer_publicly_readable(pool: PgPool) {
     );
 
     homeowner
-        .post(&format!("/v1/jobs/{id}/close"), json!({ "status": "cancelled" }))
+        .post(
+            &format!("/v1/jobs/{id}/close"),
+            json!({ "status": "cancelled" }),
+        )
         .await;
 
     assert_eq!(
@@ -395,8 +427,8 @@ async fn a_closed_job_is_no_longer_publicly_readable(pool: PgPool) {
         "and gone once cancelled"
     );
 
-    // A contractor gets the same answer: the tier decides how much of a job is
-    // shown, never whether a withdrawn one is shown at all.
+    // A session is not a way back in: a withdrawn job is withdrawn from
+    // everyone, and being signed in does not resurrect it.
     let mut contractor = Client::new(router.clone());
     contractor.register_contractor("sparks@example.test").await;
     assert_eq!(

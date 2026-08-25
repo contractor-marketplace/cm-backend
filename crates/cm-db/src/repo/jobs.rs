@@ -1,14 +1,14 @@
-//! Jobs a homeowner has posted, and the queries contractors browse them with.
+//! Jobs a homeowner has posted, and the queries used to browse them.
 //!
-//! **No query in this file selects `description` or the poster's name into the
-//! anonymous projection.** That is the load-bearing property of this module: the
-//! three tiers are three SQL projections, not one row filtered afterwards in
-//! Rust, because a projection that never names a column cannot leak it through a
-//! handler that forgets to strip it. `the_public_projection_names_nothing_private`
-//! below asserts that against the SQL constant itself, so it cannot drift.
+//! One browse projection, shown to everyone. An earlier version served three
+//! tiers — redacted for signed-out visitors, detailed for contractors — which
+//! was removed: a tier anybody can step around by signing out is complexity
+//! without a guarantee.
 //!
-//! There is no `precise_point` here at all — jobs never store an address. See
-//! the header of `migrations/0017_jobs.sql`.
+//! The protection that does hold is in the schema rather than here. There is no
+//! `precise_point` column and no address field on `jobs` at all, so a job is
+//! published at its ZIP centroid or nowhere, and no projection can widen that.
+//! See the header of `migrations/0017_jobs.sql`.
 
 use chrono::{DateTime, Utc};
 use cm_core::AppError;
@@ -95,9 +95,11 @@ impl JobTimeline {
     }
 }
 
-/// What everyone sees, signed in or not.
+/// A job as it appears on the board, to anyone.
 ///
-/// Deliberately carries no description and nothing identifying the poster.
+/// The poster is identified by first name only — `split_part` of their display
+/// name. That is the shape of the field rather than a tier: nothing here asks
+/// for surnames on a public board, and the email is never selected at all.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PublicJob {
     pub id: Uuid,
@@ -114,15 +116,6 @@ pub struct PublicJob {
     pub location_precision: String,
     pub created_at: DateTime<Utc>,
     pub distance_m: Option<f64>,
-}
-
-/// What a signed-in contractor sees: the detail needed to decide whether to
-/// pursue the work, plus a first name so it reads as a person rather than a
-/// ticket. Never a full name, an email, or a location finer than the ZIP.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ContractorJob {
-    #[serde(flatten)]
-    pub public: PublicJob,
     pub description: String,
     pub poster_first_name: Option<String>,
 }
@@ -132,7 +125,7 @@ pub struct ContractorJob {
 pub struct OwnerJob {
     #[serde(flatten)]
     pub public: PublicJob,
-    pub description: String,
+    /// The board has no reason to carry these; the poster's own list does.
     pub posted_by_user_id: Uuid,
     pub closed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
@@ -168,8 +161,8 @@ pub struct Page<T> {
 pub const MAX_PAGE: i64 = 50;
 pub const DEFAULT_PAGE: i64 = 20;
 
-/// Shared by both list projections so the two tiers can never disagree about
-/// which rows exist — only about how much of each row is returned.
+/// Which rows exist. The list and the detail query share it so they can never
+/// disagree about whether a job is on the board.
 const PREDICATE: &str = "\
     j.status = 'open' \
     AND ($1::float8 IS NULL OR ST_DWithin(j.public_point, \
@@ -177,25 +170,12 @@ const PREDICATE: &str = "\
     AND ($4::uuid[] IS NULL OR j.trade_id = ANY($4)) \
     AND ($5::text IS NULL OR j.postal_code = $5)";
 
-/// The columns everyone may see. Note what is absent: `j.description`, and any
-/// join to `users`.
-const SELECT_PUBLIC: &str = "\
-    SELECT j.id, j.title, t.slug AS trade, j.status, j.timeline, \
-           j.budget_min_cents, j.budget_max_cents, j.postal_code, \
-           ST_Y(j.public_point::geometry) AS lat, \
-           ST_X(j.public_point::geometry) AS lon, \
-           j.public_point_source AS location_precision, j.created_at, \
-           CASE WHEN $1::float8 IS NULL THEN NULL \
-                ELSE ST_Distance(j.public_point, \
-                     ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) END AS distance_m \
-      FROM jobs j LEFT JOIN trades t ON t.id = j.trade_id";
-
-/// The same rows, plus what a signed-in contractor is entitled to.
+/// The one browse projection.
 ///
-/// `split_part` takes only the first whitespace-delimited token of the display
-/// name: a first name identifies a person to talk to without publishing the
-/// full name they registered under.
-const SELECT_FOR_CONTRACTOR: &str = "\
+/// `split_part` takes the first whitespace-delimited token of the display name,
+/// so the board carries a first name and never the whole of it. The email is
+/// not selected here at all.
+const SELECT_JOB: &str = "\
     SELECT j.id, j.title, t.slug AS trade, j.status, j.timeline, \
            j.budget_min_cents, j.budget_max_cents, j.postal_code, \
            ST_Y(j.public_point::geometry) AS lat, \
@@ -210,22 +190,10 @@ const SELECT_FOR_CONTRACTOR: &str = "\
       LEFT JOIN trades t ON t.id = j.trade_id \
       JOIN users u ON u.id = j.posted_by_user_id";
 
-fn bind_public<'q>(
-    query: sqlx::query::QueryAs<'q, sqlx::Postgres, PublicJobRow, sqlx::postgres::PgArguments>,
+fn bind_filters<'q>(
+    query: sqlx::query::QueryAs<'q, sqlx::Postgres, JobRow, sqlx::postgres::PgArguments>,
     filters: &'q Filters,
-) -> sqlx::query::QueryAs<'q, sqlx::Postgres, PublicJobRow, sqlx::postgres::PgArguments> {
-    query
-        .bind(filters.near.map(|n| n.lon))
-        .bind(filters.near.map(|n| n.lat))
-        .bind(filters.near.map(|n| n.radius_m))
-        .bind(filters.trade_ids.clone())
-        .bind(filters.postal_code.clone())
-}
-
-fn bind_contractor<'q>(
-    query: sqlx::query::QueryAs<'q, sqlx::Postgres, ContractorJobRow, sqlx::postgres::PgArguments>,
-    filters: &'q Filters,
-) -> sqlx::query::QueryAs<'q, sqlx::Postgres, ContractorJobRow, sqlx::postgres::PgArguments> {
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, JobRow, sqlx::postgres::PgArguments> {
     query
         .bind(filters.near.map(|n| n.lon))
         .bind(filters.near.map(|n| n.lat))
@@ -240,16 +208,16 @@ const ORDER_AND_KEYSET: &str = "\
     AND ($6::timestamptz IS NULL OR (j.created_at, j.id) < ($6, $7::uuid)) \
     ORDER BY j.created_at DESC, j.id DESC LIMIT $8";
 
-pub async fn list_public(
+pub async fn list(
     conn: &mut PgConnection,
     filters: &Filters,
     limit: i64,
     cursor: Option<&Cursor>,
 ) -> Result<Page<PublicJob>, AppError> {
     let limit = limit.clamp(1, MAX_PAGE);
-    let sql = format!("{SELECT_PUBLIC} WHERE {PREDICATE} {ORDER_AND_KEYSET}");
+    let sql = format!("{SELECT_JOB} WHERE {PREDICATE} {ORDER_AND_KEYSET}");
 
-    let mut rows: Vec<PublicJobRow> = bind_public(sqlx::query_as(&sql), filters)
+    let mut rows: Vec<JobRow> = bind_filters(sqlx::query_as(&sql), filters)
         .bind(cursor.map(|c| c.created_at))
         .bind(cursor.map(|c| c.id))
         .bind(limit + 1)
@@ -265,38 +233,7 @@ pub async fn list_public(
     Ok(Page {
         jobs: rows
             .into_iter()
-            .map(PublicJobRow::into_public)
-            .collect::<Result<_, _>>()?,
-        next_cursor: next,
-    })
-}
-
-pub async fn list_for_contractor(
-    conn: &mut PgConnection,
-    filters: &Filters,
-    limit: i64,
-    cursor: Option<&Cursor>,
-) -> Result<Page<ContractorJob>, AppError> {
-    let limit = limit.clamp(1, MAX_PAGE);
-    let sql = format!("{SELECT_FOR_CONTRACTOR} WHERE {PREDICATE} {ORDER_AND_KEYSET}");
-
-    let mut rows: Vec<ContractorJobRow> = bind_contractor(sqlx::query_as(&sql), filters)
-        .bind(cursor.map(|c| c.created_at))
-        .bind(cursor.map(|c| c.id))
-        .bind(limit + 1)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(AppError::internal)?;
-
-    let next = take_next(&mut rows, limit, |r| Cursor {
-        created_at: r.created_at,
-        id: r.id,
-    });
-
-    Ok(Page {
-        jobs: rows
-            .into_iter()
-            .map(ContractorJobRow::into_contractor)
+            .map(JobRow::into_public)
             .collect::<Result<_, _>>()?,
         next_cursor: next,
     })
@@ -318,9 +255,9 @@ fn take_next<T>(rows: &mut Vec<T>, limit: i64, key: impl Fn(&T) -> Cursor) -> Op
 /// The board filters to open, and the detail page must agree: a homeowner who
 /// closes a job — and especially one who cancels it — has said take it down,
 /// not just stop listing it. The poster still sees it through `for_poster`.
-pub async fn find_public(conn: &mut PgConnection, id: Uuid) -> Result<Option<PublicJob>, AppError> {
-    let sql = format!("{SELECT_PUBLIC} WHERE j.id = $6 AND j.status = 'open'");
-    let row: Option<PublicJobRow> = sqlx::query_as(&sql)
+pub async fn find(conn: &mut PgConnection, id: Uuid) -> Result<Option<PublicJob>, AppError> {
+    let sql = format!("{SELECT_JOB} WHERE j.id = $6 AND j.status = 'open'");
+    let row: Option<JobRow> = sqlx::query_as(&sql)
         .bind(None::<f64>)
         .bind(None::<f64>)
         .bind(None::<f64>)
@@ -331,26 +268,7 @@ pub async fn find_public(conn: &mut PgConnection, id: Uuid) -> Result<Option<Pub
         .await
         .map_err(AppError::internal)?;
 
-    row.map(PublicJobRow::into_public).transpose()
-}
-
-pub async fn find_for_contractor(
-    conn: &mut PgConnection,
-    id: Uuid,
-) -> Result<Option<ContractorJob>, AppError> {
-    let sql = format!("{SELECT_FOR_CONTRACTOR} WHERE j.id = $6 AND j.status = 'open'");
-    let row: Option<ContractorJobRow> = sqlx::query_as(&sql)
-        .bind(None::<f64>)
-        .bind(None::<f64>)
-        .bind(None::<f64>)
-        .bind(None::<Vec<Uuid>>)
-        .bind(None::<String>)
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(AppError::internal)?;
-
-    row.map(ContractorJobRow::into_contractor).transpose()
+    row.map(JobRow::into_public).transpose()
 }
 
 /// The poster's own jobs, in every state — an owner needs to see what they
@@ -462,42 +380,12 @@ pub async fn poster_of(conn: &mut PgConnection, id: Uuid) -> Result<Option<Uuid>
 mod tests {
     use super::*;
 
-    /// The privacy guarantee, asserted against the SQL rather than against a
-    /// comment.
-    ///
-    /// `contractors.rs` claims "a test greps this crate to keep it that way"
-    /// about `precise_point` and no such test exists. This is the same idea
-    /// implemented: the anonymous projection is a `const &str`, so it can be
-    /// inspected directly, and no amount of drift in the handlers can put a
-    /// column into a response that the query never asked for.
+    /// The board's one projection may read the display name — that is where the
+    /// first name comes from — but only ever through split_part, never whole.
+    /// The email is not selected at all.
     #[test]
-    fn the_public_projection_names_nothing_private() {
-        for forbidden in [
-            "description",
-            "display_name",
-            "posted_by_user_id",
-            "users",
-            "email",
-        ] {
-            assert!(
-                !SELECT_PUBLIC.contains(forbidden),
-                "the anonymous projection must never name {forbidden}: {SELECT_PUBLIC}"
-            );
-        }
-    }
-
-    /// The contractor projection is allowed the description and a first name,
-    /// and still nothing else about the person.
-    #[test]
-    fn the_contractor_projection_stops_at_a_first_name() {
-        assert!(SELECT_FOR_CONTRACTOR.contains("j.description"));
-        assert!(SELECT_FOR_CONTRACTOR.contains("split_part"));
-
-        // Only the columns being returned, not the FROM/JOIN clauses. The join
-        // condition legitimately mentions posted_by_user_id — that is how the
-        // first name is reached — and the point is that the id itself is never
-        // handed back.
-        let projection = SELECT_FOR_CONTRACTOR
+    fn the_projection_returns_a_first_name_and_no_contact_details() {
+        let projection = SELECT_JOB
             .split(" FROM ")
             .next()
             .expect("a SELECT has a projection");
@@ -505,32 +393,26 @@ mod tests {
         for forbidden in ["u.email", "posted_by_user_id"] {
             assert!(
                 !projection.contains(forbidden),
-                "the contractor projection must never return {forbidden}: {projection}"
+                "the board must never return {forbidden}: {projection}"
             );
         }
 
-        // The display name may be *read* — that is where the first name comes
-        // from — but only ever through split_part, never returned whole. Any
-        // other use of it would be a full name on the wire.
         for fragment in projection.match_indices("u.display_name") {
-            let before = &projection[..fragment.0];
             assert!(
-                before.ends_with("split_part(btrim("),
+                projection[..fragment.0].ends_with("split_part(btrim("),
                 "u.display_name may only be read through split_part: {projection}"
             );
         }
     }
 
-    /// Both list tiers must filter identically, or the redacted board would
-    /// show a different set of jobs from the detailed one.
+    /// List and detail must agree about which jobs exist. They are built from
+    /// the same SELECT and the same predicate, so the only way to break that is
+    /// to stop using them.
     #[test]
-    fn both_tiers_share_one_predicate() {
+    fn list_and_detail_share_one_projection_and_predicate() {
         assert!(PREDICATE.contains("j.status = 'open'"));
-        // Both SELECTs are formatted with the same PREDICATE constant, so the
-        // only way they can diverge is if one stops using it.
-        let public = format!("{SELECT_PUBLIC} WHERE {PREDICATE}");
-        let contractor = format!("{SELECT_FOR_CONTRACTOR} WHERE {PREDICATE}");
-        assert!(public.contains(PREDICATE) && contractor.contains(PREDICATE));
+        assert!(format!("{SELECT_JOB} WHERE {PREDICATE}").contains(PREDICATE));
+        assert!(SELECT_JOB.contains("j.description"));
     }
 
     #[test]
@@ -552,44 +434,7 @@ mod tests {
  */
 
 #[derive(sqlx::FromRow)]
-struct PublicJobRow {
-    id: Uuid,
-    title: String,
-    trade: Option<String>,
-    status: String,
-    timeline: Option<String>,
-    budget_min_cents: Option<i64>,
-    budget_max_cents: Option<i64>,
-    postal_code: Option<String>,
-    lat: Option<f64>,
-    lon: Option<f64>,
-    location_precision: String,
-    created_at: DateTime<Utc>,
-    distance_m: Option<f64>,
-}
-
-impl PublicJobRow {
-    fn into_public(self) -> Result<PublicJob, AppError> {
-        Ok(PublicJob {
-            id: self.id,
-            title: self.title,
-            trade: self.trade,
-            status: JobStatus::parse(&self.status)?,
-            timeline: self.timeline.as_deref().map(JobTimeline::parse).transpose()?,
-            budget_min_cents: self.budget_min_cents,
-            budget_max_cents: self.budget_max_cents,
-            postal_code: self.postal_code,
-            lat: self.lat,
-            lon: self.lon,
-            location_precision: self.location_precision,
-            created_at: self.created_at,
-            distance_m: self.distance_m,
-        })
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct ContractorJobRow {
+struct JobRow {
     id: Uuid,
     title: String,
     trade: Option<String>,
@@ -607,16 +452,18 @@ struct ContractorJobRow {
     poster_first_name: Option<String>,
 }
 
-impl ContractorJobRow {
-    fn into_contractor(self) -> Result<ContractorJob, AppError> {
-        let description = self.description;
-        let poster_first_name = self.poster_first_name.filter(|n| !n.is_empty());
-        let public = PublicJobRow {
+impl JobRow {
+    fn into_public(self) -> Result<PublicJob, AppError> {
+        Ok(PublicJob {
             id: self.id,
             title: self.title,
             trade: self.trade,
-            status: self.status,
-            timeline: self.timeline,
+            status: JobStatus::parse(&self.status)?,
+            timeline: self
+                .timeline
+                .as_deref()
+                .map(JobTimeline::parse)
+                .transpose()?,
             budget_min_cents: self.budget_min_cents,
             budget_max_cents: self.budget_max_cents,
             postal_code: self.postal_code,
@@ -625,13 +472,10 @@ impl ContractorJobRow {
             location_precision: self.location_precision,
             created_at: self.created_at,
             distance_m: self.distance_m,
-        }
-        .into_public()?;
-
-        Ok(ContractorJob {
-            public,
-            description,
-            poster_first_name,
+            description: self.description,
+            // An all-whitespace display name would split to "", which is worse
+            // than admitting we do not have one.
+            poster_first_name: self.poster_first_name.filter(|n| !n.is_empty()),
         })
     }
 }
@@ -658,13 +502,10 @@ struct OwnerJobRow {
 
 impl OwnerJobRow {
     fn into_owner(self) -> Result<OwnerJob, AppError> {
-        let (description, posted_by_user_id, closed_at, updated_at) = (
-            self.description,
-            self.posted_by_user_id,
-            self.closed_at,
-            self.updated_at,
-        );
-        let public = PublicJobRow {
+        let (posted_by_user_id, closed_at, updated_at) =
+            (self.posted_by_user_id, self.closed_at, self.updated_at);
+
+        let public = JobRow {
             id: self.id,
             title: self.title,
             trade: self.trade,
@@ -678,12 +519,14 @@ impl OwnerJobRow {
             location_precision: self.location_precision,
             created_at: self.created_at,
             distance_m: None,
+            description: self.description,
+            // The poster knows their own name; the field is for the board.
+            poster_first_name: None,
         }
         .into_public()?;
 
         Ok(OwnerJob {
             public,
-            description,
             posted_by_user_id,
             closed_at,
             updated_at,
