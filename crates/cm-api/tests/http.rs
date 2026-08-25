@@ -77,7 +77,10 @@ async fn version_answers_without_touching_the_database() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["environment"], "development");
-    assert_eq!(body["migration_version"], cm_db::migrate::embedded_version());
+    assert_eq!(
+        body["migration_version"],
+        cm_db::migrate::embedded_version()
+    );
     assert!(body["git_sha"].is_string());
 }
 
@@ -88,8 +91,14 @@ async fn readyz_is_ready_once_the_schema_matches(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "body was {body}");
     assert_eq!(body["status"], "ready");
     assert_eq!(body["checks"]["database"]["status"], "ok");
-    assert_eq!(body["checks"]["migrations"]["applied"], cm_db::migrate::embedded_version());
-    assert_eq!(body["checks"]["migrations"]["embedded"], cm_db::migrate::embedded_version());
+    assert_eq!(
+        body["checks"]["migrations"]["applied"],
+        cm_db::migrate::embedded_version()
+    );
+    assert_eq!(
+        body["checks"]["migrations"]["embedded"],
+        cm_db::migrate::embedded_version()
+    );
 }
 
 #[sqlx::test(migrations = false)]

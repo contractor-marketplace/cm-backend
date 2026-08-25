@@ -63,7 +63,10 @@ pub enum BudgetRequest {
 impl BudgetRequest {
     fn parse(self) -> Result<Option<(i64, i64)>, AppError> {
         match self {
-            Self::Range { min_cents, max_cents } => Ok(Some((min_cents, max_cents))),
+            Self::Range {
+                min_cents,
+                max_cents,
+            } => Ok(Some((min_cents, max_cents))),
             Self::Unsure(word) if word.trim().eq_ignore_ascii_case("unsure") => Ok(None),
             Self::Unsure(other) => Err(AppError::invalid(format!(
                 "Budget must be a range or \"unsure\"; got \"{other}\"."

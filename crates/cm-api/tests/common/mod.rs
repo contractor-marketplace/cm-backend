@@ -467,7 +467,7 @@ pub async fn seed_directory(pool: &PgPool) {
             .await
             .expect("trades");
 
-        cm_domain::location::apply_zip_centroid(&mut conn, upserted.id)
+        cm_domain::location::republish(&mut conn, upserted.id)
             .await
             .expect("locate");
         cm_domain::verification::recompute(&mut conn, upserted.id, Some(run_id))

@@ -96,6 +96,13 @@ fn bind_filters<'q>(
 }
 
 /// The projection. `precise_point` is absent by construction.
+///
+/// The address comes from `license_records`, not from anything a contractor
+/// typed: it is the address on the licence, which the CSLB register publishes.
+/// A listing that asked to be kept off the map (`address_visibility` of
+/// 'protected') is still returned here with its address — the register still
+/// publishes it, and pretending otherwise would be theatre. What 'protected'
+/// changes is the published POINT, which is what `location::republish` decides.
 const SELECT: &str = "\
     SELECT c.id, c.slug, c.display_name, c.verified, c.verified_at, c.bio, \
            c.website_url, c.public_phone, c.postal_code, c.accepts_dm, \
@@ -104,6 +111,7 @@ const SELECT: &str = "\
            ST_X(c.public_point::geometry) AS lon, \
            c.public_point_source, \
            l.license_no, l.status AS license_status, \
+           l.address_line1, l.city AS address_city, l.state AS address_state, \
            COALESCE(( \
                SELECT array_agg(DISTINCT t.slug ORDER BY t.slug) \
                  FROM contractor_trades ct JOIN trades t ON t.id = ct.trade_id \
@@ -251,6 +259,9 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PublicContractor {
                 .unwrap_or(PublicPointSource::None),
             license_no: row.try_get("license_no")?,
             license_status: row.try_get("license_status")?,
+            address_line1: row.try_get("address_line1")?,
+            address_city: row.try_get("address_city")?,
+            address_state: row.try_get("address_state")?,
             trades: row.try_get("trades")?,
             distance_m: row.try_get("distance_m")?,
         })

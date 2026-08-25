@@ -88,7 +88,10 @@ impl Bucket {
             .http
             .post(&url)
             .bearer_auth(token)
-            .header(reqwest::header::CONTENT_TYPE, super::Normalised::CONTENT_TYPE)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                super::Normalised::CONTENT_TYPE,
+            )
             // A year, immutable: the key contains a fresh UUID, so an object at
             // a given key never changes. Re-uploading produces a new key.
             .header("Cache-Control", "public, max-age=31536000, immutable")
@@ -182,7 +185,10 @@ impl Bucket {
         let value = token.value.clone();
         *slot = Some(token);
 
-        tracing::debug!(expires_in = fetched.expires_in, "refreshed a GCS access token");
+        tracing::debug!(
+            expires_in = fetched.expires_in,
+            "refreshed a GCS access token"
+        );
         Ok(value)
     }
 }

@@ -340,8 +340,11 @@ pub async fn list(
 /// would return one row per job per photo, and the keyset cursor counts rows —
 /// page two would begin in the middle of a job. `url` is built here rather than
 /// stored, so moving the bucket is a config change and not a data migration.
-pub fn attach_photos(jobs: &mut [PublicJob], rows: Vec<crate::repo::job_photos::PhotoRow>,
-                     url_for: impl Fn(&str) -> String) {
+pub fn attach_photos(
+    jobs: &mut [PublicJob],
+    rows: Vec<crate::repo::job_photos::PhotoRow>,
+    url_for: impl Fn(&str) -> String,
+) {
     use std::collections::HashMap;
 
     let mut by_job: HashMap<Uuid, Vec<Photo>> = HashMap::new();

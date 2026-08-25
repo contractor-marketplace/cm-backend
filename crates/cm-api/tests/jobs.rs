@@ -580,7 +580,10 @@ async fn a_thin_description_is_refused_with_a_count(pool: PgPool) {
     let refused = homeowner.post("/v1/jobs", body).await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST);
     assert!(
-        refused.json["error"]["message"].as_str().unwrap_or_default().contains("49"),
+        refused.json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("49"),
         "the message should say how many they wrote: {:?}",
         refused.json
     );
@@ -706,9 +709,17 @@ async fn a_photo_upload_is_capped_and_must_be_an_image(pool: PgPool) {
 
     // Not an image, whatever it claims to be.
     let refused = homeowner
-        .post_file(&format!("/v1/jobs/{id}/photos"), b"PK\x03\x04 not a photo".to_vec())
+        .post_file(
+            &format!("/v1/jobs/{id}/photos"),
+            b"PK\x03\x04 not a photo".to_vec(),
+        )
         .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.json);
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.json
+    );
 
     for _ in 0..8 {
         homeowner
@@ -721,7 +732,10 @@ async fn a_photo_upload_is_capped_and_must_be_an_image(pool: PgPool) {
         .await;
     assert_eq!(ninth.status, StatusCode::BAD_REQUEST);
     assert!(
-        ninth.json["error"]["message"].as_str().unwrap_or_default().contains("8"),
+        ninth.json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("8"),
         "the message should name the cap: {:?}",
         ninth.json
     );

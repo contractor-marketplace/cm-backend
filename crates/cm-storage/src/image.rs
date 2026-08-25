@@ -94,7 +94,9 @@ pub fn normalise(bytes: &[u8]) -> Result<Normalised, AppError> {
     // Read the orientation BEFORE decoding consumes the decoder. This is the
     // only thing carried across from the metadata, and it is applied to pixels
     // rather than preserved as a tag.
-    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
 
     let mut decoded = image::DynamicImage::from_decoder(decoder)
         .map_err(|_| AppError::invalid("That image could not be decoded."))?;
@@ -113,7 +115,12 @@ pub fn normalise(bytes: &[u8]) -> Result<Normalised, AppError> {
 
     let mut out = Vec::new();
     JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY)
-        .encode(rgb.as_raw(), out_width, out_height, image::ExtendedColorType::Rgb8)
+        .encode(
+            rgb.as_raw(),
+            out_width,
+            out_height,
+            image::ExtendedColorType::Rgb8,
+        )
         .map_err(|error| AppError::internal(format!("re-encoding an image failed: {error}")))?;
 
     Ok(Normalised {
@@ -225,8 +232,12 @@ mod tests {
         // a metadata container that is not APP1.
         assert!(
             !stored.bytes.windows(8).any(|w| w
-                == [34u32.to_le_bytes(), 1u32.to_le_bytes()].concat().as_slice()
-                || w == [118u32.to_le_bytes(), 1u32.to_le_bytes()].concat().as_slice()),
+                == [34u32.to_le_bytes(), 1u32.to_le_bytes()]
+                    .concat()
+                    .as_slice()
+                || w == [118u32.to_le_bytes(), 1u32.to_le_bytes()]
+                    .concat()
+                    .as_slice()),
             "GPS rationals survived the re-encode"
         );
     }
@@ -278,7 +289,8 @@ mod tests {
 
     #[test]
     fn a_large_photo_is_scaled_to_the_long_edge() {
-        let image = image::RgbImage::from_pixel(MAX_EDGE + 600, MAX_EDGE / 2, image::Rgb([1, 2, 3]));
+        let image =
+            image::RgbImage::from_pixel(MAX_EDGE + 600, MAX_EDGE / 2, image::Rgb([1, 2, 3]));
         let mut bytes = Vec::new();
         JpegEncoder::new_with_quality(&mut bytes, 80)
             .encode(

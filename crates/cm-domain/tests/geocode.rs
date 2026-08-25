@@ -94,11 +94,25 @@ async fn published_point(
     .expect("point")
 }
 
+/// Mark a listing as keeping its address off the map.
+///
+/// Since 0019 this is no longer the default — the licence address is a public
+/// record and the directory publishes it — so a test about protection has to
+/// ask for it. `protected` is what a takedown request sets.
+async fn protect(pool: &PgPool, contractor_id: uuid::Uuid) {
+    sqlx::query("UPDATE contractors SET address_visibility = 'protected' WHERE id = $1")
+        .bind(contractor_id)
+        .execute(pool)
+        .await
+        .expect("protect the address");
+}
+
 /// The rule: a protected listing keeps its centroid even once located exactly.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_protected_listing_publishes_its_centroid_not_its_address(pool: PgPool) {
     seed_and_import(&pool).await;
     let contractor_id = contractor_by_licence(&pool, "1047382").await;
+    protect(&pool, contractor_id).await;
 
     let stats = geocode_worker::run_once(&pool, &static_geocoder(), &WorkerConfig::default())
         .await
@@ -130,6 +144,7 @@ async fn a_protected_listing_publishes_its_centroid_not_its_address(pool: PgPool
 async fn a_protected_address_cannot_be_triangulated_through_the_radius_filter(pool: PgPool) {
     seed_and_import(&pool).await;
     let contractor_id = contractor_by_licence(&pool, "1047382").await;
+    protect(&pool, contractor_id).await;
     geocode_worker::run_once(&pool, &static_geocoder(), &WorkerConfig::default())
         .await
         .expect("worker pass");
@@ -468,4 +483,132 @@ async fn the_unlocated_count_is_observable(pool: PgPool) {
             .expect("count"),
         1
     );
+}
+
+/// The default since 0019: an unclaimed listing publishes the address the CSLB
+/// register already publishes.
+///
+/// This is the inverse of `a_protected_listing_publishes_its_centroid_not_its_address`,
+/// and both are worth having — together they say that the published point is a
+/// function of `address_visibility` and nothing else. In particular it is no
+/// longer a function of whether the listing is CLAIMED, which is what 0010's
+/// dropped constraint used to enforce.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unclaimed_listing_publishes_its_licence_address(pool: PgPool) {
+    seed_and_import(&pool).await;
+    let contractor_id = contractor_by_licence(&pool, "1047382").await;
+
+    let claimed: bool =
+        sqlx::query_scalar("SELECT claimed_by_user_id IS NOT NULL FROM contractors WHERE id = $1")
+            .bind(contractor_id)
+            .fetch_one(&pool)
+            .await
+            .expect("claim state");
+    assert!(!claimed, "the point of this test is that nobody claimed it");
+
+    geocode_worker::run_once(&pool, &static_geocoder(), &WorkerConfig::default())
+        .await
+        .expect("worker pass");
+
+    let (lat, lon, source) = published_point(&pool, contractor_id).await;
+    assert_eq!(source, "exact");
+    assert!((lat.expect("lat") - IBARRA_TRUE_POINT.0).abs() < 1e-6);
+    assert!((lon.expect("lon") - IBARRA_TRUE_POINT.1).abs() < 1e-6);
+
+    // And it is findable by a tight ring on the real address, which is the
+    // whole point of publishing it.
+    let mut conn = pool.acquire().await.expect("connection");
+    let found = cm_db::repo::search::list(
+        &mut conn,
+        &cm_db::repo::search::Filters {
+            near: Some(cm_db::repo::search::Near {
+                lat: IBARRA_TRUE_POINT.0,
+                lon: IBARRA_TRUE_POINT.1,
+                radius_m: 200.0,
+            }),
+            ..Default::default()
+        },
+        cm_db::repo::search::Sort::Distance,
+        50,
+        None,
+    )
+    .await
+    .expect("search");
+
+    let listing = found
+        .contractors
+        .iter()
+        .find(|c| c.id == contractor_id)
+        .expect("a 200 m ring on the real address finds it");
+
+    // And the address itself is on the listing, not just the pin.
+    assert!(
+        listing
+            .address_line1
+            .as_deref()
+            .is_some_and(|a| !a.is_empty()),
+        "the licence address should be published alongside the point"
+    );
+}
+
+/// Re-importing the CSLB export must not un-locate the directory.
+///
+/// The importer republishes every row whose location inputs changed, and the
+/// function it used to call passed `None` for the precise point — which
+/// `set_location` writes as NULL rather than leaving alone. Every geocoded
+/// point in the table was erased on each import. That was survivable while the
+/// published point was a centroid regardless; it is not survivable now that the
+/// precise point IS the published point.
+#[sqlx::test(migrations = "../../migrations")]
+async fn re_importing_does_not_erase_geocoded_points(pool: PgPool) {
+    seed_and_import(&pool).await;
+    let contractor_id = contractor_by_licence(&pool, "1047382").await;
+
+    geocode_worker::run_once(&pool, &static_geocoder(), &WorkerConfig::default())
+        .await
+        .expect("worker pass");
+    let before = published_point(&pool, contractor_id).await;
+    assert_eq!(before.2, "exact");
+
+    // Import the same licences again, exactly as a scheduled refresh would.
+    //
+    // The bytes have to differ or the importer refuses them as a duplicate run,
+    // which is the same shape as a real refresh: a fresh CSLB export where this
+    // licensee's address has not changed. A trailing blank line is enough to
+    // make it a different file and leaves every row identical.
+    let refreshed = {
+        let mut csv = std::fs::read_to_string(fixture("cslb_sample.csv")).expect("fixture");
+        csv.push('\n');
+        let path = std::env::temp_dir().join(format!("cslb_refresh_{contractor_id}.csv"));
+        std::fs::write(&path, csv).expect("write the refreshed export");
+        path
+    };
+
+    import::run(
+        &pool,
+        &ImportOptions {
+            source: cm_db::repo::licenses::Source::CslbMasterList,
+            file_path: refreshed.clone(),
+            county: Some("LOS ANGELES".to_owned()),
+            snapshot_date: None,
+            batch_size: 10,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("re-import");
+    let _ = std::fs::remove_file(&refreshed);
+
+    let after = published_point(&pool, contractor_id).await;
+    assert_eq!(after.2, "exact", "a re-import demoted a located contractor");
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, before.1);
+
+    let has_precise: bool =
+        sqlx::query_scalar("SELECT precise_point IS NOT NULL FROM contractors WHERE id = $1")
+            .bind(contractor_id)
+            .fetch_one(&pool)
+            .await
+            .expect("precise");
+    assert!(has_precise, "a re-import erased the geocoded point");
 }

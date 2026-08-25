@@ -83,6 +83,10 @@ pub struct MapPoint {
     lat: f64,
     lon: f64,
     location_precision: contractors::PublicPointSource,
+    /// Only the street line, not the whole address: it is a pin label, and the
+    /// city and ZIP are already implied by where the pin is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_line1: Option<String>,
 }
 
 pub async fn map(
@@ -108,6 +112,7 @@ pub async fn map(
                 lat: c.lat?,
                 lon: c.lon?,
                 location_precision: c.location_precision,
+                address_line1: c.address_line1,
             })
         })
         .collect();

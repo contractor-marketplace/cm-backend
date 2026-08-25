@@ -623,11 +623,15 @@ async fn flush(
             .collect();
         contractors::replace_cslb_trades(&mut tx, upserted.id, &trade_ids).await?;
 
-        // Locate from the ZIP centroid immediately, so a contractor is
-        // searchable at ZIP precision before any geocoder has run — and stays
-        // searchable if the geocoder never succeeds.
+        // Publish a point immediately, so a contractor is searchable before any
+        // geocoder has run — at the exact address if a previous run already
+        // resolved one, and at the ZIP centroid otherwise.
+        //
+        // `republish` reads the stored precise point rather than being handed
+        // one, which is what makes re-importing the CSLB export safe. The
+        // function this replaced passed `None` and wiped it.
         if upserted.created || upserted.location_changed {
-            crate::location::apply_zip_centroid(&mut tx, upserted.id).await?;
+            crate::location::republish(&mut tx, upserted.id).await?;
 
             if let Some(address) = contractors::geocodable_address(&mut tx, upserted.id).await? {
                 geocode::enqueue(&mut tx, upserted.id, &address_hash(&address)).await?;

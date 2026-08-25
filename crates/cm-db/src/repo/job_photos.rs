@@ -100,14 +100,12 @@ pub async fn delete(
     job_id: Uuid,
     photo_id: Uuid,
 ) -> Result<Option<String>, AppError> {
-    sqlx::query_scalar(
-        "DELETE FROM job_photos WHERE id = $1 AND job_id = $2 RETURNING storage_key",
-    )
-    .bind(photo_id)
-    .bind(job_id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(AppError::internal)
+    sqlx::query_scalar("DELETE FROM job_photos WHERE id = $1 AND job_id = $2 RETURNING storage_key")
+        .bind(photo_id)
+        .bind(job_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(AppError::internal)
 }
 
 /// Every storage key for a job, for deleting the objects when it is withdrawn.
