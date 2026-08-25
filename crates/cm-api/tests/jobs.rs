@@ -19,11 +19,37 @@ fn a_job() -> serde_json::Value {
         "title": "Rewire a 1920s duplex",
         "description": "Knob and tube throughout. Needs a full rewire and a new panel.",
         "trade": "electrician",
+        "build_type": "replacement",
+        "job_size": "Whole house, roughly 1,800 sq ft",
         "postal_code": "90026",
-        "budget_min_cents": 800_000,
-        "budget_max_cents": 1_500_000,
-        "timeline": "within_a_month"
+        "budget": { "min_cents": 800_000, "max_cents": 1_500_000 },
+        "timeline": "within_2_weeks"
     })
+}
+
+/// The same post with every escape hatch taken. Everything is still answered —
+/// that is the point of the escapes.
+fn a_job_with_every_unsure() -> serde_json::Value {
+    json!({
+        "title": "Something is leaking under the house",
+        "description": "Water is pooling in the crawlspace and I cannot tell where \
+                        it is coming from. Might be the main.",
+        "trade": "other",
+        "build_type": "unsure",
+        "job_size": "No idea, sorry",
+        "postal_code": "90026",
+        "budget": "unsure",
+        "timeline": "unsure"
+    })
+}
+
+/// A 1x1 PNG. Smallest thing that survives the normaliser.
+fn a_tiny_png() -> Vec<u8> {
+    const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(PIXEL)
+        .expect("a valid base64 pixel")
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -37,6 +63,9 @@ async fn a_homeowner_posts_and_a_contractor_sees_the_detail(pool: PgPool) {
     assert_eq!(posted.status, StatusCode::CREATED, "{:?}", posted.json);
     assert_eq!(posted.json["title"], "Rewire a 1920s duplex");
     assert_eq!(posted.json["trade"], "electrician");
+    assert_eq!(posted.json["build_type"], "replacement");
+    assert_eq!(posted.json["job_size"], "Whole house, roughly 1,800 sq ft");
+    assert_eq!(posted.json["timeline"], "within_2_weeks");
     assert_eq!(posted.json["location_precision"], "zip_centroid");
     assert!(posted.json["lat"].is_number(), "a known ZIP places the job");
 
@@ -440,4 +469,307 @@ async fn a_closed_job_is_no_longer_publicly_readable(pool: PgPool) {
     let mine = homeowner.get("/v1/me/jobs").await;
     assert_eq!(mine.json.as_array().expect("array").len(), 1);
     assert_eq!(mine.json[0]["status"], "cancelled");
+}
+
+/// Every field is required, and the message says which one.
+///
+/// Dropping a field entirely must fail at the request shape, before any of the
+/// domain rules run — that is what makes it safe for the layers below to read a
+/// `None` as "the poster chose the escape hatch" rather than "the client forgot
+/// to send it".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_missing_field_is_refused(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("owner@example.test").await;
+
+    for field in [
+        "title",
+        "description",
+        "trade",
+        "build_type",
+        "job_size",
+        "postal_code",
+        "timeline",
+        "budget",
+    ] {
+        let mut body = a_job();
+        body.as_object_mut().expect("object").remove(field);
+
+        let refused = homeowner.post("/v1/jobs", body).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "a job with no {field} was accepted: {:?}",
+            refused.json
+        );
+    }
+}
+
+/// "I don't know" is an answer, not a blank. Each escape posts, and each one
+/// round-trips as the thing the poster actually chose.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unsure_is_a_valid_answer_everywhere_it_is_offered(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("owner@example.test").await;
+
+    let posted = homeowner.post("/v1/jobs", a_job_with_every_unsure()).await;
+    assert_eq!(posted.status, StatusCode::CREATED, "{:?}", posted.json);
+
+    // "other" is recorded as no trade, which is what the schema stores.
+    assert!(posted.json["trade"].is_null(), "\"other\" means no trade");
+    assert_eq!(posted.json["build_type"], "unsure");
+    assert_eq!(posted.json["timeline"], "unsure");
+    assert_eq!(posted.json["job_size"], "No idea, sorry");
+    assert!(posted.json["budget_min_cents"].is_null());
+    assert!(posted.json["budget_max_cents"].is_null());
+
+    // And it is a real listing, not a second-class one.
+    let mut anonymous = Client::new(router.clone());
+    let board = anonymous.get("/v1/jobs").await;
+    assert_eq!(board.json["jobs"].as_array().expect("array").len(), 1);
+}
+
+/// A half-filled range is neither a range nor an admission, and the schema no
+/// longer represents one — so the API must not accept one either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_budget_is_a_whole_range_or_nothing(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("owner@example.test").await;
+
+    for (label, budget) in [
+        ("only a minimum", json!({ "min_cents": 100_000 })),
+        ("only a maximum", json!({ "max_cents": 100_000 })),
+        ("inverted", json!({ "min_cents": 900, "max_cents": 100 })),
+        ("negative", json!({ "min_cents": -1, "max_cents": 100 })),
+        ("a word that is not unsure", json!("dunno")),
+        ("empty", json!({})),
+    ] {
+        let mut body = a_job();
+        body["budget"] = budget;
+        let refused = homeowner.post("/v1/jobs", body).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{label} was accepted: {:?}",
+            refused.json
+        );
+    }
+}
+
+/// One sentence, floor-wise. "New panel" as an entire brief wastes the time of
+/// every contractor who opens it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_thin_description_is_refused_with_a_count(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("owner@example.test").await;
+
+    let mut body = a_job();
+    body["description"] = json!("x".repeat(49));
+    let refused = homeowner.post("/v1/jobs", body).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert!(
+        refused.json["error"]["message"].as_str().unwrap_or_default().contains("49"),
+        "the message should say how many they wrote: {:?}",
+        refused.json
+    );
+
+    // And exactly 50 is enough.
+    let mut body = a_job();
+    body["description"] = json!("x".repeat(50));
+    assert_eq!(
+        homeowner.post("/v1/jobs", body).await.status,
+        StatusCode::CREATED
+    );
+}
+
+/// A ZIP is required, but an *unknown* ZIP still posts. Requiring the field and
+/// requiring our ZCTA import to know it are different things.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_zip_is_required_but_need_not_be_one_we_know(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("owner@example.test").await;
+
+    for bad in ["", "9004", "9004x", "900265"] {
+        let mut body = a_job();
+        body["postal_code"] = json!(bad);
+        assert_eq!(
+            homeowner.post("/v1/jobs", body).await.status,
+            StatusCode::BAD_REQUEST,
+            "ZIP {bad:?} should be refused"
+        );
+    }
+
+    let mut body = a_job();
+    body["postal_code"] = json!("99999");
+    let posted = homeowner.post("/v1/jobs", body).await;
+    assert_eq!(posted.status, StatusCode::CREATED, "{:?}", posted.json);
+    assert_eq!(posted.json["location_precision"], "none");
+    assert!(posted.json["lat"].is_null(), "unmapped, but posted");
+}
+
+/// Photos: uploaded by the poster, capped, ordered, and visible to everyone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn photos_are_attached_by_the_poster_and_shown_to_everyone(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("owner@example.test").await;
+    let posted = homeowner.post("/v1/jobs", a_job()).await;
+    let id = posted.json["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        posted.json["photos"].as_array().expect("array").len(),
+        0,
+        "a job starts with no photos, and that is a normal state"
+    );
+
+    let first = homeowner
+        .post_file(&format!("/v1/jobs/{id}/photos"), a_tiny_png())
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.json);
+    assert!(first.json["url"].is_string());
+    assert_eq!(first.json["width"], 1);
+
+    homeowner
+        .post_file(&format!("/v1/jobs/{id}/photos"), a_tiny_png())
+        .await;
+
+    // Anyone can see them: a job's photos are exactly as public as its
+    // description.
+    let mut anonymous = Client::new(router.clone());
+    let seen = anonymous.get(&format!("/v1/jobs/{id}")).await;
+    let photos = seen.json["photos"].as_array().expect("array");
+    assert_eq!(photos.len(), 2);
+    assert_ne!(photos[0]["id"], photos[1]["id"], "two distinct photos");
+
+    // A stranger cannot add one, and gets a 404 rather than a 403 — the same
+    // rule closing uses.
+    let mut stranger = Client::new(router.clone());
+    stranger.register("stranger@example.test").await;
+    assert_eq!(
+        stranger
+            .post_file(&format!("/v1/jobs/{id}/photos"), a_tiny_png())
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+
+    // The poster can take one down; a stranger cannot.
+    let photo_id = photos[0]["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        stranger
+            .delete(&format!("/v1/jobs/{id}/photos/{photo_id}"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        homeowner
+            .delete(&format!("/v1/jobs/{id}/photos/{photo_id}"))
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        anonymous.get(&format!("/v1/jobs/{id}")).await.json["photos"]
+            .as_array()
+            .expect("array")
+            .len(),
+        1
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_photo_upload_is_capped_and_must_be_an_image(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("owner@example.test").await;
+    let posted = homeowner.post("/v1/jobs", a_job()).await;
+    let id = posted.json["id"].as_str().expect("id").to_owned();
+
+    // Not an image, whatever it claims to be.
+    let refused = homeowner
+        .post_file(&format!("/v1/jobs/{id}/photos"), b"PK\x03\x04 not a photo".to_vec())
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{:?}", refused.json);
+
+    for _ in 0..8 {
+        homeowner
+            .post_file(&format!("/v1/jobs/{id}/photos"), a_tiny_png())
+            .await;
+    }
+
+    let ninth = homeowner
+        .post_file(&format!("/v1/jobs/{id}/photos"), a_tiny_png())
+        .await;
+    assert_eq!(ninth.status, StatusCode::BAD_REQUEST);
+    assert!(
+        ninth.json["error"]["message"].as_str().unwrap_or_default().contains("8"),
+        "the message should name the cap: {:?}",
+        ninth.json
+    );
+}
+
+/// Cancelling means take it down, and that has to include the photos — a job
+/// page that 404s while its images stay fetchable is not withdrawn.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cancelling_a_job_removes_its_photos(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("owner@example.test").await;
+    let posted = homeowner.post("/v1/jobs", a_job()).await;
+    let id = posted.json["id"].as_str().expect("id").to_owned();
+    homeowner
+        .post_file(&format!("/v1/jobs/{id}/photos"), a_tiny_png())
+        .await;
+
+    homeowner
+        .post(
+            &format!("/v1/jobs/{id}/close"),
+            json!({ "status": "cancelled" }),
+        )
+        .await;
+
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM job_photos WHERE job_id = $1")
+        .bind(uuid::Uuid::parse_str(&id).expect("uuid"))
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(remaining, 0, "a cancelled job keeps no photo rows");
+
+    // Closing is different: the work happened, and the poster keeps the record.
+    let second = homeowner.post("/v1/jobs", a_job()).await;
+    let second_id = second.json["id"].as_str().expect("id").to_owned();
+    homeowner
+        .post_file(&format!("/v1/jobs/{second_id}/photos"), a_tiny_png())
+        .await;
+    homeowner
+        .post(&format!("/v1/jobs/{second_id}/close"), json!({}))
+        .await;
+
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM job_photos WHERE job_id = $1")
+        .bind(uuid::Uuid::parse_str(&second_id).expect("uuid"))
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(kept, 1, "a completed job keeps its record");
 }

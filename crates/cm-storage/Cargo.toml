@@ -1,27 +1,16 @@
 [package]
-name = "cm-domain"
+name = "cm-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-cm-auth.workspace = true
 cm-core.workspace = true
-cm-db.workspace = true
-cm-storage.workspace = true
-base64.workspace = true
 chrono.workspace = true
-csv.workspace = true
+image.workspace = true
 reqwest.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-sqlx.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-cm-auth.workspace = true
-tokio.workspace = true

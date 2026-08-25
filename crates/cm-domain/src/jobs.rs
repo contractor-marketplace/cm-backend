@@ -12,10 +12,12 @@ use cm_auth::ratelimit;
 use cm_core::{new_id, AppError, Secret};
 use cm_db::repo::audit::{self, ActorKind, AuditEvent};
 use cm_db::repo::jobs::{
-    self, Cursor, Filters, JobStatus, JobTimeline, Near, NewJob, OwnerJob, DEFAULT_PAGE, MAX_PAGE,
+    self, BuildType, Cursor, Filters, JobStatus, JobTimeline, Near, NewJob, OwnerJob, DEFAULT_PAGE,
+    MAX_PAGE,
 };
-use cm_db::repo::reference;
+use cm_db::repo::{job_photos, reference};
 use cm_db::PgPool;
+use cm_storage::Store;
 use uuid::Uuid;
 
 /// Posting is infrequent for a real person and creates content other people
@@ -29,14 +31,43 @@ fn job_post_policy() -> ratelimit::Policy {
     }
 }
 
+/// A post, after the handler has parsed the vocabularies but before anything
+/// has been checked against the database.
+///
+/// Every field is required. The escapes are carried as values, not as absent
+/// fields: `trade_slug: None` means the poster picked "Other", and
+/// `budget: None` means they picked "I'm not sure". The handler is what turns a
+/// genuinely missing field into a 400 before it ever reaches here, which is
+/// what lets `None` carry a meaning at all — see the header of
+/// `migrations/0018_job_intake.sql`.
 pub struct PostJob {
     pub title: String,
     pub description: String,
+    /// `None` is the poster's "Other / not listed".
     pub trade_slug: Option<String>,
-    pub postal_code: Option<String>,
-    pub budget_min_cents: Option<i64>,
-    pub budget_max_cents: Option<i64>,
-    pub timeline: Option<JobTimeline>,
+    pub build_type: BuildType,
+    pub job_size: String,
+    pub postal_code: String,
+    /// `None` is the poster's "I'm not sure". Never half a range.
+    pub budget: Option<(i64, i64)>,
+    pub timeline: JobTimeline,
+}
+
+/// The shortest description that is worth a contractor's time to open.
+///
+/// Roughly one sentence. Not a quality bar — a floor under "new panel" as an
+/// entire brief.
+pub const MIN_DESCRIPTION: usize = 50;
+
+/// Photos are bucketed per account like posting is, and more generously:
+/// eight photos on each of ten jobs is eighty in a day, so the limit sits above
+/// legitimate use and well below anything that would fill a bucket.
+fn photo_upload_policy() -> ratelimit::Policy {
+    ratelimit::Policy {
+        name: "job_photo:user",
+        limit: 100,
+        window: chrono::Duration::days(1),
+    }
 }
 
 /// Post a job.
@@ -73,29 +104,49 @@ pub async fn post(
     if description.is_empty() {
         return Err(AppError::invalid("A description is required."));
     }
-    if description.chars().count() > 4000 {
+    // Counted in characters, like the maximum, so a description in a language
+    // that needs more bytes per character is not held to a longer standard.
+    let described = description.chars().count();
+    if described < MIN_DESCRIPTION {
+        return Err(AppError::invalid(format!(
+            "Please describe the work in at least {MIN_DESCRIPTION} characters \
+             — you have written {described}. What needs doing, and where in the \
+             property?"
+        )));
+    }
+    if described > 4000 {
         return Err(AppError::invalid(
             "A description must be under 4000 characters.",
         ));
     }
-    if let (Some(min), Some(max)) = (input.budget_min_cents, input.budget_max_cents) {
+
+    let job_size = input.job_size.trim();
+    if job_size.is_empty() {
+        return Err(AppError::invalid(
+            "Tell us roughly how big the job is. \"Not sure yet\" is a fine answer.",
+        ));
+    }
+    if job_size.chars().count() > 200 {
+        return Err(AppError::invalid(
+            "Keep the size to under 200 characters — the details belong in the description.",
+        ));
+    }
+
+    if let Some((min, max)) = input.budget {
+        if min < 0 || max < 0 {
+            return Err(AppError::invalid("A budget cannot be negative."));
+        }
         if min > max {
             return Err(AppError::invalid(
                 "The lower end of the budget must not exceed the upper end.",
             ));
         }
     }
-    if input.budget_min_cents.is_some_and(|c| c < 0)
-        || input.budget_max_cents.is_some_and(|c| c < 0)
-    {
-        return Err(AppError::invalid("A budget cannot be negative."));
-    }
 
-    let postal_code = match input.postal_code.as_deref().map(str::trim) {
-        Some("") | None => None,
-        Some(zip) if zip.len() == 5 && zip.chars().all(|c| c.is_ascii_digit()) => Some(zip),
-        Some(_) => return Err(AppError::invalid("Enter a valid five-digit ZIP code.")),
-    };
+    let postal_code = input.postal_code.trim();
+    if postal_code.len() != 5 || !postal_code.chars().all(|c| c.is_ascii_digit()) {
+        return Err(AppError::invalid("Enter a valid five-digit ZIP code."));
+    }
 
     let mut tx = pool.begin().await.map_err(AppError::internal)?;
 
@@ -113,10 +164,10 @@ pub async fn post(
     // The published location, decided the same way a contractor's is: the ZIP
     // centroid, or nothing. A job with an unknown ZIP is unlocated rather than
     // dropped at a plausible-looking point.
-    let region = match postal_code {
-        Some(code) => reference::find_zcta(&mut tx, code).await?,
-        None => None,
-    };
+    // An unknown ZIP still posts. It simply has no centroid, so the job is
+    // listed but unmapped — better than refusing a real address because our
+    // ZCTA import does not reach it.
+    let region = reference::find_zcta(&mut tx, postal_code).await?;
 
     let id = new_id();
     jobs::insert(
@@ -127,8 +178,9 @@ pub async fn post(
             title,
             description,
             trade_id,
-            budget_min_cents: input.budget_min_cents,
-            budget_max_cents: input.budget_max_cents,
+            build_type: input.build_type,
+            job_size,
+            budget: input.budget,
             timeline: input.timeline,
             postal_code,
             region_id: region.as_ref().map(|r| r.id),
@@ -144,6 +196,7 @@ pub async fn post(
             .subject(id)
             .data(serde_json::json!({
                 "trade_id": trade_id,
+                "build_type": input.build_type.as_str(),
                 "postal_code": postal_code,
                 "located": region.is_some(),
             }))
@@ -168,6 +221,7 @@ pub async fn post(
 /// is real.
 pub async fn close(
     pool: &PgPool,
+    store: &Store,
     poster: Uuid,
     job_id: Uuid,
     status: JobStatus,
@@ -188,17 +242,169 @@ pub async fn close(
         return Err(AppError::conflict("That job is no longer open."));
     }
 
+    // Cancelling means take it down, so the objects go too. Closing does not:
+    // the work happened, and the poster keeps their own record of it in
+    // /v1/me/jobs. Read the keys before the rows are deleted — after that
+    // there is nothing left to say which objects belonged to this job.
+    let orphaned = if status == JobStatus::Cancelled {
+        let keys = job_photos::keys_for_job(&mut tx, job_id).await?;
+        job_photos::delete_all_for_job(&mut tx, job_id).await?;
+        keys
+    } else {
+        Vec::new()
+    };
+
     audit::record(
         &mut tx,
         AuditEvent::new("job.closed", "jobs")
             .actor(ActorKind::User, Some(poster))
             .subject(job_id)
-            .data(serde_json::json!({ "status": status.as_str() }))
+            .data(serde_json::json!({
+                "status": status.as_str(),
+                "photos_removed": orphaned.len(),
+            }))
             .request_id(request_id),
     )
     .await?;
 
     tx.commit().await.map_err(AppError::internal)?;
+
+    // After the commit, deliberately. A storage failure must not roll back a
+    // cancellation the poster asked for — the row is gone either way, so the
+    // photo is unreachable through the product. What is left is an orphaned
+    // object, which is logged loudly enough to sweep up.
+    for key in orphaned {
+        if let Err(error) = store.delete(&key).await {
+            tracing::error!(%key, %job_id, ?error, "a cancelled job left an orphaned photo object");
+        }
+    }
+
+    Ok(())
+}
+
+/// Attach a photo to a job.
+///
+/// The upload is normalised BEFORE anything is written: an unreadable file is a
+/// 400 and no row, no object and no wasted transaction. The object is written
+/// before the row so a failure leaves an orphaned object rather than a row
+/// pointing at nothing — a photo that 404s in the page is worse than a few
+/// bytes nobody references.
+pub async fn attach_photo(
+    pool: &PgPool,
+    store: &Store,
+    pepper: &Secret<String>,
+    poster: Uuid,
+    job_id: Uuid,
+    bytes: &[u8],
+    request_id: Option<String>,
+) -> Result<jobs::Photo, AppError> {
+    ratelimit::enforce(
+        pool,
+        pepper,
+        photo_upload_policy(),
+        &poster.to_string(),
+        Utc::now(),
+    )
+    .await?;
+
+    let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+
+    // Ownership first, and a 404 rather than a 403: "that is not yours" already
+    // confirms the id is real.
+    match jobs::poster_of(&mut conn, job_id).await? {
+        Some(owner) if owner == poster => {}
+        _ => return Err(AppError::NotFound),
+    }
+
+    let existing = job_photos::count_for_job(&mut conn, job_id).await?;
+    if existing >= job_photos::MAX_PER_JOB {
+        return Err(AppError::invalid(format!(
+            "A job can have up to {} photos.",
+            job_photos::MAX_PER_JOB
+        )));
+    }
+
+    // The pass that makes the file safe to publish: it strips the EXIF a phone
+    // writes into a photograph of a house, which would otherwise hand back the
+    // exact address this schema was built to never hold.
+    let normalised = cm_storage::normalise(bytes)?;
+
+    let id = new_id();
+    let key = cm_storage::photo_key(job_id, id);
+    let url = store.put(&key, &normalised).await?;
+
+    let row = job_photos::insert(
+        &mut conn,
+        job_photos::NewPhoto {
+            id,
+            job_id,
+            storage_key: &key,
+            byte_size: normalised.bytes.len() as i64,
+            width: normalised.width as i32,
+            height: normalised.height as i32,
+        },
+    )
+    .await
+    .inspect_err(|_| {
+        tracing::error!(%key, %job_id, "a photo object was stored but its row was not");
+    })?;
+
+    audit::record(
+        &mut conn,
+        AuditEvent::new("job.photo_added", "job_photos")
+            .actor(ActorKind::User, Some(poster))
+            .subject(id)
+            .data(serde_json::json!({ "job_id": job_id, "bytes": normalised.bytes.len() }))
+            .request_id(request_id),
+    )
+    .await?;
+
+    Ok(jobs::Photo {
+        id: row.id,
+        url,
+        width: row.width,
+        height: row.height,
+    })
+}
+
+/// Remove a photo. The row goes first, then the object.
+pub async fn remove_photo(
+    pool: &PgPool,
+    store: &Store,
+    poster: Uuid,
+    job_id: Uuid,
+    photo_id: Uuid,
+    request_id: Option<String>,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::internal)?;
+
+    match jobs::poster_of(&mut tx, job_id).await? {
+        Some(owner) if owner == poster => {}
+        _ => return Err(AppError::NotFound),
+    }
+
+    let key = job_photos::delete(&mut tx, job_id, photo_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    audit::record(
+        &mut tx,
+        AuditEvent::new("job.photo_removed", "job_photos")
+            .actor(ActorKind::User, Some(poster))
+            .subject(photo_id)
+            .data(serde_json::json!({ "job_id": job_id }))
+            .request_id(request_id),
+    )
+    .await?;
+
+    tx.commit().await.map_err(AppError::internal)?;
+
+    // After the commit, for the same reason as cancelling: the poster asked for
+    // it gone, and it is gone from the product whether or not storage agrees.
+    if let Err(error) = store.delete(&key).await {
+        tracing::error!(%key, %photo_id, ?error, "a removed photo left an orphaned object");
+    }
+
     Ok(())
 }
 

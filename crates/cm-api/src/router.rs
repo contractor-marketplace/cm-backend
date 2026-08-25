@@ -44,6 +44,9 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/jobs", post(handlers::jobs::post_job))
         .route("/v1/me/jobs", get(handlers::jobs::mine))
         .route("/v1/jobs/{id}/close", post(handlers::jobs::close))
+        // Merged rather than listed inline: the upload body limit belongs to
+        // these two routes and must travel with them, not with the router.
+        .merge(handlers::jobs::photo_routes())
         // Claiming a listing.
         .route("/v1/contractors/{id}/claims", post(handlers::claims::open))
         .route("/v1/me/claims", get(handlers::claims::mine))

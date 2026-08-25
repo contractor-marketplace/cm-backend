@@ -262,6 +262,13 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub auth: AuthConfig,
     pub shutdown_grace: Duration,
+    /// The GCS bucket job photos are stored in.
+    ///
+    /// Optional so development and tests run with an in-memory store and no
+    /// credentials. Production refuses to start without it — see
+    /// `Config::production_gaps`, which is what stops an unset variable from
+    /// quietly downgrading a live server to storage that vanishes on restart.
+    pub job_photo_bucket: Option<String>,
 }
 
 /// One thing wrong with the environment.
@@ -576,7 +583,27 @@ impl Config {
             shutdown_grace: Duration::from_secs(
                 shutdown_grace_secs.expect("shutdown_grace validated"),
             ),
+            job_photo_bucket: read(&source, "CM_JOB_PHOTO_BUCKET"),
         })
+    }
+
+    /// Settings that are acceptable in development and not in production.
+    ///
+    /// Kept apart from `load` because they are not malformed values — they are
+    /// absent ones that only matter once real people are using the thing. Each
+    /// is returned as a sentence an operator can act on.
+    pub fn production_gaps(&self) -> Vec<String> {
+        let mut gaps = Vec::new();
+
+        if self.environment == Environment::Production && self.job_photo_bucket.is_none() {
+            gaps.push(
+                "CM_JOB_PHOTO_BUCKET is not set, so job photos would be held in memory and \
+                 lost on restart. Set it to the GCS bucket name."
+                    .to_owned(),
+            );
+        }
+
+        gaps
     }
 
     /// A redacted view suitable for logging at startup.
@@ -593,6 +620,13 @@ impl Config {
                 },
             ),
             ("database_url", "[redacted]".to_owned()),
+            (
+                "job_photo_bucket",
+                match &self.job_photo_bucket {
+                    Some(bucket) => bucket.clone(),
+                    None => "(unset — in-memory, NOT durable)".to_owned(),
+                },
+            ),
             (
                 "db_max_connections",
                 self.database.max_connections.to_string(),

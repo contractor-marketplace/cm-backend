@@ -123,13 +123,14 @@ mod tests {
         let versions: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
         assert_eq!(
             versions,
-            (1..=17).collect::<Vec<i64>>(),
+            (1..=18).collect::<Vec<i64>>(),
             "extensions and reference data, then accounts, credentials, sessions, \
              audit, rate limits, federated identity, the licence register, \
-             contractors, geocoding, claims, profiles, messaging, safety, and \
-             the homeowner/contractor account split, and jobs"
+             contractors, geocoding, claims, profiles, messaging, safety, \
+             the homeowner/contractor account split, jobs, and the structured \
+             job intake with photos"
         );
-        assert_eq!(embedded_version(), 17);
+        assert_eq!(embedded_version(), 18);
     }
 
     #[test]

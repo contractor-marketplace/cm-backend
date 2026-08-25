@@ -16,8 +16,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 /// Lifecycle. Mirrors the `jobs.status` CHECK; a migration test asserts they agree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
     Open,
     Closed,
@@ -44,29 +43,33 @@ impl JobStatus {
 }
 
 /// How soon the work is wanted. Mirrors the `jobs.timeline` CHECK.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Two weeks is the line that matters: a contractor deciding whether to reply
+/// needs to know whether this is work they could start now, work to schedule,
+/// or a person who has not decided yet. `Unsure` is a recorded answer, not a
+/// missing one — the form makes it a choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobTimeline {
     Asap,
-    WithinAMonth,
-    WithinThreeMonths,
-    Flexible,
+    Within2Weeks,
+    MoreThan2Weeks,
+    Unsure,
 }
 
 impl JobTimeline {
     pub const ALL: [Self; 4] = [
         Self::Asap,
-        Self::WithinAMonth,
-        Self::WithinThreeMonths,
-        Self::Flexible,
+        Self::Within2Weeks,
+        Self::MoreThan2Weeks,
+        Self::Unsure,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Asap => "asap",
-            Self::WithinAMonth => "within_a_month",
-            Self::WithinThreeMonths => "within_three_months",
-            Self::Flexible => "flexible",
+            Self::Within2Weeks => "within_2_weeks",
+            Self::MoreThan2Weeks => "more_than_2_weeks",
+            Self::Unsure => "unsure",
         }
     }
 
@@ -95,6 +98,79 @@ impl JobTimeline {
     }
 }
 
+/// Whether this is new work, a like-for-like swap, or a fix. Mirrors the
+/// `jobs.build_type` CHECK.
+///
+/// It changes who wants the job more than almost anything else on the form: a
+/// new build and a repair are different businesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildType {
+    NewBuild,
+    Replacement,
+    Repair,
+    Unsure,
+}
+
+impl BuildType {
+    pub const ALL: [Self; 4] = [
+        Self::NewBuild,
+        Self::Replacement,
+        Self::Repair,
+        Self::Unsure,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NewBuild => "new_build",
+            Self::Replacement => "replacement",
+            Self::Repair => "repair",
+            Self::Unsure => "unsure",
+        }
+    }
+
+    pub fn parse_request(value: &str) -> Result<Self, AppError> {
+        Self::ALL
+            .into_iter()
+            .find(|b| b.as_str() == value)
+            .ok_or_else(|| {
+                AppError::invalid(format!(
+                    "Build type must be one of: {}.",
+                    Self::ALL
+                        .iter()
+                        .map(|b| b.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        Self::ALL
+            .into_iter()
+            .find(|b| b.as_str() == value)
+            .ok_or_else(|| AppError::internal(format!("unknown build type in database: {value}")))
+    }
+}
+
+/// Serialised through `as_str`, never derived.
+///
+/// A derived `rename_all = "snake_case"` renders `Within2Weeks` as
+/// "within2_weeks" while `as_str` writes "within_2_weeks", which would put a
+/// different spelling on the wire than in the database for the same value.
+/// Going through `as_str` leaves one spelling and nowhere for a second to come
+/// from. `the_wire_spelling_matches_the_database` pins it.
+macro_rules! serialize_as_str {
+    ($($kind:ty),+ $(,)?) => {$(
+        impl serde::Serialize for $kind {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+    )+};
+}
+
+serialize_as_str!(JobStatus, JobTimeline, BuildType);
+
 /// A job as it appears on the board, to anyone.
 ///
 /// The poster is identified by first name only — `split_part` of their display
@@ -104,12 +180,16 @@ impl JobTimeline {
 pub struct PublicJob {
     pub id: Uuid,
     pub title: String,
+    /// `None` means the poster chose "Other / not listed" — a recorded answer,
+    /// not a missing one. See the header of `migrations/0018_job_intake.sql`.
     pub trade: Option<String>,
     pub status: JobStatus,
-    pub timeline: Option<JobTimeline>,
+    pub build_type: BuildType,
+    pub job_size: String,
+    pub timeline: JobTimeline,
     pub budget_min_cents: Option<i64>,
     pub budget_max_cents: Option<i64>,
-    pub postal_code: Option<String>,
+    pub postal_code: String,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     /// Always `zip_centroid` or `none`. A job never publishes an exact point.
@@ -118,6 +198,20 @@ pub struct PublicJob {
     pub distance_m: Option<f64>,
     pub description: String,
     pub poster_first_name: Option<String>,
+    /// In upload order. Empty is normal — photos are prompted, not required.
+    pub photos: Vec<Photo>,
+}
+
+/// A stored photo, as published.
+///
+/// The URL is built from the storage key rather than stored, so the bucket can
+/// move without a data migration.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Photo {
+    pub id: Uuid,
+    pub url: String,
+    pub width: i32,
+    pub height: i32,
 }
 
 /// What the poster sees of their own job.
@@ -177,6 +271,7 @@ const PREDICATE: &str = "\
 /// not selected here at all.
 const SELECT_JOB: &str = "\
     SELECT j.id, j.title, t.slug AS trade, j.status, j.timeline, \
+           j.build_type, j.job_size, \
            j.budget_min_cents, j.budget_max_cents, j.postal_code, \
            ST_Y(j.public_point::geometry) AS lat, \
            ST_X(j.public_point::geometry) AS lon, \
@@ -239,6 +334,33 @@ pub async fn list(
     })
 }
 
+/// Fill in the photos for a set of jobs, in one query.
+///
+/// Separate from the projection on purpose: joining photos into `SELECT_JOB`
+/// would return one row per job per photo, and the keyset cursor counts rows —
+/// page two would begin in the middle of a job. `url` is built here rather than
+/// stored, so moving the bucket is a config change and not a data migration.
+pub fn attach_photos(jobs: &mut [PublicJob], rows: Vec<crate::repo::job_photos::PhotoRow>,
+                     url_for: impl Fn(&str) -> String) {
+    use std::collections::HashMap;
+
+    let mut by_job: HashMap<Uuid, Vec<Photo>> = HashMap::new();
+    for row in rows {
+        by_job.entry(row.job_id).or_default().push(Photo {
+            id: row.id,
+            url: url_for(&row.storage_key),
+            width: row.width,
+            height: row.height,
+        });
+    }
+
+    for job in jobs {
+        if let Some(photos) = by_job.remove(&job.id) {
+            job.photos = photos;
+        }
+    }
+}
+
 /// One extra row answers "is there another page" without a second COUNT over a
 /// table that will grow without bound.
 fn take_next<T>(rows: &mut Vec<T>, limit: i64, key: impl Fn(&T) -> Cursor) -> Option<Cursor> {
@@ -276,6 +398,7 @@ pub async fn find(conn: &mut PgConnection, id: Uuid) -> Result<Option<PublicJob>
 pub async fn for_poster(conn: &mut PgConnection, user_id: Uuid) -> Result<Vec<OwnerJob>, AppError> {
     let rows: Vec<OwnerJobRow> = sqlx::query_as(
         "SELECT j.id, j.title, t.slug AS trade, j.status, j.timeline, \
+                j.build_type, j.job_size, \
                 j.budget_min_cents, j.budget_max_cents, j.postal_code, \
                 ST_Y(j.public_point::geometry) AS lat, \
                 ST_X(j.public_point::geometry) AS lon, \
@@ -298,11 +421,15 @@ pub struct NewJob<'a> {
     pub posted_by_user_id: Uuid,
     pub title: &'a str,
     pub description: &'a str,
+    /// `None` is the poster's "Other / not listed", not an omission.
     pub trade_id: Option<Uuid>,
-    pub budget_min_cents: Option<i64>,
-    pub budget_max_cents: Option<i64>,
-    pub timeline: Option<JobTimeline>,
-    pub postal_code: Option<&'a str>,
+    pub build_type: BuildType,
+    pub job_size: &'a str,
+    /// Both or neither. `None` is the poster's "I'm not sure"; the schema no
+    /// longer represents a half-filled range.
+    pub budget: Option<(i64, i64)>,
+    pub timeline: JobTimeline,
+    pub postal_code: &'a str,
     pub region_id: Option<Uuid>,
     /// `(lon, lat)` of the ZIP centroid, when the ZIP resolves to one.
     pub centroid: Option<(f64, f64)>,
@@ -311,21 +438,24 @@ pub struct NewJob<'a> {
 pub async fn insert(conn: &mut PgConnection, job: NewJob<'_>) -> Result<Uuid, AppError> {
     sqlx::query(
         "INSERT INTO jobs (id, posted_by_user_id, title, description, trade_id, \
+                           build_type, job_size, \
                            budget_min_cents, budget_max_cents, timeline, postal_code, \
                            region_id, public_point, public_point_source) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-                 CASE WHEN $11::float8 IS NULL THEN NULL \
-                      ELSE ST_SetSRID(ST_MakePoint($11, $12), 4326)::geography END, \
-                 CASE WHEN $11::float8 IS NULL THEN 'none' ELSE 'zip_centroid' END)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                 CASE WHEN $13::float8 IS NULL THEN NULL \
+                      ELSE ST_SetSRID(ST_MakePoint($13, $14), 4326)::geography END, \
+                 CASE WHEN $13::float8 IS NULL THEN 'none' ELSE 'zip_centroid' END)",
     )
     .bind(job.id)
     .bind(job.posted_by_user_id)
     .bind(job.title)
     .bind(job.description)
     .bind(job.trade_id)
-    .bind(job.budget_min_cents)
-    .bind(job.budget_max_cents)
-    .bind(job.timeline.map(|t| t.as_str()))
+    .bind(job.build_type.as_str())
+    .bind(job.job_size)
+    .bind(job.budget.map(|(min, _)| min))
+    .bind(job.budget.map(|(_, max)| max))
+    .bind(job.timeline.as_str())
     .bind(job.postal_code)
     .bind(job.region_id)
     .bind(job.centroid.map(|(lon, _)| lon))
@@ -415,6 +545,32 @@ mod tests {
         assert!(SELECT_JOB.contains("j.description"));
     }
 
+    /// The spelling that reaches a client and the spelling stored in Postgres
+    /// are the same string. They were not, once: a derived snake_case rename
+    /// turned `Within2Weeks` into "within2_weeks" on the wire while the CHECK
+    /// constraint held "within_2_weeks".
+    #[test]
+    fn the_wire_spelling_matches_the_database() {
+        for status in JobStatus::ALL {
+            assert_eq!(
+                serde_json::to_string(&status).expect("serialize"),
+                format!("\"{}\"", status.as_str())
+            );
+        }
+        for timeline in JobTimeline::ALL {
+            assert_eq!(
+                serde_json::to_string(&timeline).expect("serialize"),
+                format!("\"{}\"", timeline.as_str())
+            );
+        }
+        for build_type in BuildType::ALL {
+            assert_eq!(
+                serde_json::to_string(&build_type).expect("serialize"),
+                format!("\"{}\"", build_type.as_str())
+            );
+        }
+    }
+
     #[test]
     fn status_and_timeline_round_trip() {
         for status in JobStatus::ALL {
@@ -423,8 +579,12 @@ mod tests {
         for timeline in JobTimeline::ALL {
             assert_eq!(JobTimeline::parse(timeline.as_str()).unwrap(), timeline);
         }
+        for build_type in BuildType::ALL {
+            assert_eq!(BuildType::parse(build_type.as_str()).unwrap(), build_type);
+        }
         assert!(JobStatus::parse("elsewhere").is_err());
         assert!(JobTimeline::parse_request("eventually").is_err());
+        assert!(BuildType::parse_request("knocking_it_down").is_err());
     }
 }
 
@@ -439,10 +599,12 @@ struct JobRow {
     title: String,
     trade: Option<String>,
     status: String,
-    timeline: Option<String>,
+    build_type: String,
+    job_size: String,
+    timeline: String,
     budget_min_cents: Option<i64>,
     budget_max_cents: Option<i64>,
-    postal_code: Option<String>,
+    postal_code: String,
     lat: Option<f64>,
     lon: Option<f64>,
     location_precision: String,
@@ -459,11 +621,9 @@ impl JobRow {
             title: self.title,
             trade: self.trade,
             status: JobStatus::parse(&self.status)?,
-            timeline: self
-                .timeline
-                .as_deref()
-                .map(JobTimeline::parse)
-                .transpose()?,
+            build_type: BuildType::parse(&self.build_type)?,
+            job_size: self.job_size,
+            timeline: JobTimeline::parse(&self.timeline)?,
             budget_min_cents: self.budget_min_cents,
             budget_max_cents: self.budget_max_cents,
             postal_code: self.postal_code,
@@ -476,6 +636,11 @@ impl JobRow {
             // An all-whitespace display name would split to "", which is worse
             // than admitting we do not have one.
             poster_first_name: self.poster_first_name.filter(|n| !n.is_empty()),
+            // Filled in by `attach_photos` after the rows are read. Left empty
+            // here rather than joined into the projection: a job with eight
+            // photos would multiply every row by eight, and the keyset cursor
+            // counts rows.
+            photos: Vec::new(),
         })
     }
 }
@@ -486,10 +651,12 @@ struct OwnerJobRow {
     title: String,
     trade: Option<String>,
     status: String,
-    timeline: Option<String>,
+    build_type: String,
+    job_size: String,
+    timeline: String,
     budget_min_cents: Option<i64>,
     budget_max_cents: Option<i64>,
-    postal_code: Option<String>,
+    postal_code: String,
     lat: Option<f64>,
     lon: Option<f64>,
     location_precision: String,
@@ -510,6 +677,8 @@ impl OwnerJobRow {
             title: self.title,
             trade: self.trade,
             status: self.status,
+            build_type: self.build_type,
+            job_size: self.job_size,
             timeline: self.timeline,
             budget_min_cents: self.budget_min_cents,
             budget_max_cents: self.budget_max_cents,

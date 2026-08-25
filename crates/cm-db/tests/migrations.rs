@@ -396,6 +396,13 @@ async fn job_vocabularies_match_the_rust_enums(pool: PgPool) {
                 .map(|t| t.as_str())
                 .collect::<Vec<_>>(),
         ),
+        (
+            "build_type",
+            cm_db::repo::jobs::BuildType::ALL
+                .iter()
+                .map(|b| b.as_str())
+                .collect::<Vec<_>>(),
+        ),
     ] {
         let definition: String = sqlx::query_scalar(
             "SELECT pg_get_constraintdef(c.oid) \

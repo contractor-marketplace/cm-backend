@@ -152,6 +152,57 @@ impl Client {
         self.send(http::Method::POST, path, Some(body)).await
     }
 
+    pub async fn delete(&mut self, path: &str) -> TestResponse {
+        self.send(http::Method::DELETE, path, None).await
+    }
+
+    /// A multipart upload with one `file` field.
+    ///
+    /// Hand-built rather than pulled from a crate: the body is a dozen lines,
+    /// and a test that constructs the bytes itself is a test that proves the
+    /// handler parses real multipart rather than whatever a helper produced.
+    pub async fn post_file(&mut self, path: &str, bytes: Vec<u8>) -> TestResponse {
+        const BOUNDARY: &str = "----cmtestboundary9c1f";
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"photo.png\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&bytes);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+
+        let mut builder = Request::builder()
+            .method(http::Method::POST)
+            .uri(path)
+            .header(
+                http::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            );
+
+        if !self.jar.is_empty() {
+            let cookie = self
+                .jar
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            builder = builder.header(http::header::COOKIE, cookie);
+        }
+        if self.send_csrf {
+            if let Some(token) = self.jar.get("__Host-cm_csrf") {
+                builder = builder.header("x-cm-csrf", token.clone());
+            }
+        }
+        if let Some(origin) = &self.origin {
+            builder = builder.header(http::header::ORIGIN, origin.clone());
+        }
+
+        let request = builder.body(Body::from(body)).expect("build request");
+        self.dispatch(request).await
+    }
+
     pub async fn send(
         &mut self,
         method: http::Method,
@@ -186,6 +237,13 @@ impl Client {
             None => builder.body(Body::empty()).expect("build request"),
         };
 
+        self.dispatch(request).await
+    }
+
+    /// Send a fully built request and absorb whatever cookies come back.
+    /// Shared by `send` and `post_file` so the two cannot drift apart on
+    /// connection info, body limits or cookie handling.
+    async fn dispatch(&mut self, request: Request<Body>) -> TestResponse {
         let mut request = request;
         request
             .extensions_mut()
@@ -479,12 +537,16 @@ pub async fn seed_jobs(
                 id,
                 posted_by_user_id: poster,
                 title: &format!("Job number {n}"),
-                description: "Seeded for a test that is not about posting.",
+                // Long enough to clear the 50-character floor, so a seeded job
+                // is a job the API would also have accepted.
+                description: "Seeded for a test that is not about posting a job, \
+                              only about reading many of them back.",
                 trade_id: None,
-                budget_min_cents: None,
-                budget_max_cents: None,
-                timeline: None,
-                postal_code: Some(postal_code),
+                build_type: cm_db::repo::jobs::BuildType::Unsure,
+                job_size: "Not specified",
+                budget: None,
+                timeline: cm_db::repo::jobs::JobTimeline::Unsure,
+                postal_code,
                 region_id: region.as_ref().map(|r| r.id),
                 centroid: region.as_ref().map(|r| (r.lon, r.lat)),
             },
