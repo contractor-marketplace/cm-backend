@@ -37,9 +37,16 @@ import store
 BATCH_SIZE = 20
 SLEEP_BETWEEN_BATCHES = 5
 
-# From the spec, and fixed. maxConcurrency above 3 gets runs throttled, and
-# maxReviews of 0 means "all", which on a contractor with 800 reviews burns
-# credits for data the prototype does not read.
+# The spec's values, and the defaults here, so running the job with no flags
+# does exactly what was specified. Each is overridable because each is a cost
+# lever, and the measured cost breakdown makes clear which one matters:
+#
+#   PROXY_RESIDENTIAL_TRANSFER  $1.4138   84%
+#   ACTOR_COMPUTE_UNITS         $0.2009   12%
+#   everything else             $0.0146    <1%
+#
+# Residential proxy is $8/GB and this actor pulls ~10 MB per place loading full
+# Google Maps pages. Nothing else is worth tuning until that is settled.
 ACTOR_DEFAULTS = {
     "maxConcurrency": 3,
     "maxReviews": 50,
@@ -87,6 +94,7 @@ class Totals:
     reviews_written: int = 0
     batches_ok: int = 0
     batches_failed: int = 0
+    unqueried: int = 0
     spend_usd: float = 0.0
 
 
@@ -210,8 +218,14 @@ def process_batch(
     actor_id: str,
     log,
     dry_run: bool,
+    actor_input: Optional[dict] = None,
+    label: Optional[str] = None,
 ) -> None:
-    payload = {"locationNames": [c.query for c in batch], **ACTOR_DEFAULTS}
+    payload = {"locationNames": [c.query for c in batch], **(actor_input or ACTOR_DEFAULTS)}
+    if label:
+        # Recorded in input_payload so two experiments can be compared later
+        # from the database alone. Ignored by the actor.
+        payload["_label"] = label
 
     if dry_run:
         log(f"  dry run: would send {len(batch)} queries, e.g. {batch[0].query!r}")
@@ -358,19 +372,31 @@ def write_batch(conn, *, batch, rows, run_id, run_status, cost, totals, log) -> 
             # `no_result` rather than `rejected`, because "Google returned
             # nothing" and "Google returned the wrong business" are different
             # facts and only one of them is about a place.
-            for contractor in batch:
-                if contractor.id in matched_contractors:
-                    continue
-                totals.attempted += 1
-                totals.no_result += 1
-                store.record_attempt(
-                    cursor,
-                    {
-                        "contractor_id": contractor.id,
-                        "query_used": contractor.query,
-                        "run_id": run_id,
-                        "outcome": "no_result",
-                    },
+            #
+            # ONLY when the run actually finished. An aborted or timed-out run
+            # stopped partway through its queries, so a contractor with no
+            # place is indistinguishable from one that was never asked about.
+            # Recording those as no_result would retire them for
+            # --retry-after-days on the strength of a question we never put.
+            unmatched = [c for c in batch if c.id not in matched_contractors]
+            if run_status == "SUCCEEDED":
+                for contractor in unmatched:
+                    totals.attempted += 1
+                    totals.no_result += 1
+                    store.record_attempt(
+                        cursor,
+                        {
+                            "contractor_id": contractor.id,
+                            "query_used": contractor.query,
+                            "run_id": run_id,
+                            "outcome": "no_result",
+                        },
+                    )
+            elif unmatched:
+                totals.unqueried += len(unmatched)
+                log(
+                    f"  {len(unmatched)} contractor(s) left unattempted: the run ended "
+                    f"{run_status} before reaching them, so they stay in the queue"
                 )
 
             store.update_run_row(
@@ -484,10 +510,54 @@ def main() -> int:
         metavar="RUN_ID",
         help="re-score and re-write an existing run's dataset; costs nothing",
     )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="run without the residential proxy. 84%% of the cost, and the "
+             "actor calls it strongly recommended — verify results before trusting it",
+    )
+    parser.add_argument(
+        "--max-reviews",
+        type=int,
+        default=None,
+        metavar="N",
+        help="reviews per place (spec default 50). Never 0: that means ALL",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        metavar="N",
+        help="parallel browsers (spec default 3)",
+    )
+    parser.add_argument(
+        "--label",
+        default=None,
+        help="note recorded on each scrape_runs row, for comparing experiments",
+    )
     args = parser.parse_args()
 
     def log(message: str) -> None:
         print(message, flush=True)
+
+    actor_input = dict(ACTOR_DEFAULTS)
+    if args.no_proxy:
+        actor_input["useProxy"] = False
+    if args.concurrency is not None:
+        actor_input["maxConcurrency"] = max(1, args.concurrency)
+    if args.max_reviews is not None:
+        if args.max_reviews <= 0:
+            print(
+                "error: --max-reviews 0 means ALL reviews and is refused. "
+                "A place with 20,000 reviews would consume the whole budget.",
+                file=sys.stderr,
+            )
+            return 2
+        actor_input["maxReviews"] = args.max_reviews
+
+    if actor_input != ACTOR_DEFAULTS:
+        changed = {k: v for k, v in actor_input.items() if ACTOR_DEFAULTS.get(k) != v}
+        log(f"actor input differs from the spec defaults: {changed}")
 
     database_url = require_env("DATABASE_URL")
     conn = connect(database_url)
@@ -549,7 +619,9 @@ def main() -> int:
             f"(spent ${spent:.2f} of ${args.max_spend:.2f})"
         )
 
-        process_batch(conn, client, batch, totals, actor_id, log, args.dry_run)
+        process_batch(
+            conn, client, batch, totals, actor_id, log, args.dry_run, actor_input, args.label
+        )
         remaining -= len(batch)
 
         if args.dry_run:
@@ -570,6 +642,8 @@ def main() -> int:
     log(f"  places written        : {totals.places_written}")
     log(f"  reviews written       : {totals.reviews_written}")
     log(f"  batches ok / failed   : {totals.batches_ok} / {totals.batches_failed}")
+    if totals.unqueried:
+        log(f"  left in the queue     : {totals.unqueried} (run ended before reaching them)")
     log(f"  spend this session    : ${totals.spend_usd:.2f}")
     log(f"  spend recorded total  : ${already_spent + totals.spend_usd:.2f}")
 
