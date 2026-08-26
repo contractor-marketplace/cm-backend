@@ -7,6 +7,7 @@
 //! endpoint, and is called out in the handover notes.
 
 use cm_auth::firebase::{FirebaseVerifier, KeySet, Mode, VerifiedIdentity};
+use cm_db::repo::oauth::Provider;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
 use serde_json::json;
 use std::collections::HashMap;
@@ -132,6 +133,17 @@ impl TokenBuilder {
         }
     }
 
+    /// A token as Firebase mints it for a Facebook sign-in. The subject is
+    /// Meta's app-scoped user id, which is what `oauth_identities` stores.
+    fn facebook() -> Self {
+        Self::valid()
+            .claim("firebase.sign_in_provider", json!("facebook.com"))
+            .claim(
+                "firebase.identities",
+                json!({ "facebook.com": ["fb-app-scoped-id-1"] }),
+            )
+    }
+
     fn claim(mut self, path: &str, value: serde_json::Value) -> Self {
         let mut cursor = &mut self.claims;
         let parts: Vec<&str> = path.split('.').collect();
@@ -190,7 +202,7 @@ async fn a_valid_token_yields_the_google_subject_not_the_firebase_uid() {
     let (verifier, fetches) = verifier(Duration::from_secs(3600));
 
     let identity = verifier
-        .verify(&TokenBuilder::valid().sign())
+        .verify(&TokenBuilder::valid().sign(), Provider::Google)
         .await
         .expect("should verify");
 
@@ -208,12 +220,84 @@ async fn a_valid_token_yields_the_google_subject_not_the_firebase_uid() {
 }
 
 #[tokio::test]
+async fn a_facebook_token_yields_the_app_scoped_id() {
+    let (verifier, _) = verifier(Duration::from_secs(3600));
+
+    let identity = verifier
+        .verify(&TokenBuilder::facebook().sign(), Provider::Facebook)
+        .await
+        .expect("should verify");
+
+    assert_eq!(
+        identity.provider_subject, "fb-app-scoped-id-1",
+        "Meta's app-scoped id is the key, so a later direct Facebook Login \
+         against the same Meta app re-links nobody"
+    );
+}
+
+/// The takeover that email-based account linking creates, refused in both
+/// directions.
+///
+/// With linking left on in the Firebase console, one Firebase user accumulates
+/// several identities and every token it mints carries all of them at once. A
+/// token obtained by signing in with Facebook then also contains the Google
+/// subject of whoever first signed in under that address — so a verifier
+/// willing to read any slot other than the one that signed in would let control
+/// of the Facebook side become control of the Google account.
+///
+/// The console setting is required to be off. This is the check that does not
+/// depend on somebody having remembered to set it.
+#[tokio::test]
+async fn a_token_from_one_provider_is_never_accepted_as_another() {
+    let (verifier, _) = verifier(Duration::from_secs(3600));
+
+    let both = json!({
+        "google.com": ["100000000000000000001"],
+        "facebook.com": ["fb-app-scoped-id-1"]
+    });
+
+    let signed_in_with_facebook = TokenBuilder::valid()
+        .claim("firebase.sign_in_provider", json!("facebook.com"))
+        .claim("firebase.identities", both.clone())
+        .sign();
+
+    assert!(
+        verifier
+            .verify(&signed_in_with_facebook, Provider::Google)
+            .await
+            .is_err(),
+        "a Facebook sign-in must never resolve to the Google identity riding \
+         along in the same token"
+    );
+
+    let signed_in_with_google = TokenBuilder::valid()
+        .claim("firebase.sign_in_provider", json!("google.com"))
+        .claim("firebase.identities", both)
+        .sign();
+
+    assert!(
+        verifier
+            .verify(&signed_in_with_google, Provider::Facebook)
+            .await
+            .is_err(),
+        "and the mirror image, so neither direction is safe only by accident"
+    );
+
+    // What it must still do: read its own slot and ignore the other.
+    let identity = verifier
+        .verify(&signed_in_with_google, Provider::Google)
+        .await
+        .expect("the provider that actually signed in still verifies");
+    assert_eq!(identity.provider_subject, "100000000000000000001");
+}
+
+#[tokio::test]
 async fn a_fresh_key_set_is_not_refetched() {
     let (verifier, fetches) = verifier(Duration::from_secs(3600));
 
     for _ in 0..5 {
         verifier
-            .verify(&TokenBuilder::valid().sign())
+            .verify(&TokenBuilder::valid().sign(), Provider::Google)
             .await
             .expect("verify");
     }
@@ -230,11 +314,11 @@ async fn a_stale_key_set_is_refetched() {
     let (verifier, fetches) = verifier(Duration::from_secs(0));
 
     verifier
-        .verify(&TokenBuilder::valid().sign())
+        .verify(&TokenBuilder::valid().sign(), Provider::Google)
         .await
         .expect("verify");
     verifier
-        .verify(&TokenBuilder::valid().sign())
+        .verify(&TokenBuilder::valid().sign(), Provider::Google)
         .await
         .expect("verify");
 
@@ -327,7 +411,7 @@ async fn every_invalid_token_is_rejected() {
 
     let (verifier, _) = verifier(Duration::from_secs(3600));
     for (label, token) in cases {
-        let result = verifier.verify(&token).await;
+        let result = verifier.verify(&token, Provider::Google).await;
         assert!(result.is_err(), "{label} should be rejected");
     }
 }
@@ -360,7 +444,7 @@ async fn a_token_signed_by_another_key_is_rejected() {
 
     let (verifier, _) = verifier(Duration::from_secs(3600));
     assert!(
-        verifier.verify(&token).await.is_err(),
+        verifier.verify(&token, Provider::Google).await.is_err(),
         "a valid-looking token signed by the wrong key must be refused"
     );
 }
@@ -375,7 +459,7 @@ async fn verification_fails_closed_when_keys_are_unavailable() {
 
     assert!(
         verifier
-            .verify(&TokenBuilder::valid().sign())
+            .verify(&TokenBuilder::valid().sign(), Provider::Google)
             .await
             .is_err(),
         "an unavailable key source must never mean 'accept'"
@@ -388,7 +472,7 @@ async fn emulator_mode_accepts_unsigned_tokens_but_still_checks_claims() {
     let verifier = FirebaseVerifier::new(PROJECT, Mode::Emulator);
 
     let identity = verifier
-        .verify(&TokenBuilder::valid().unsigned())
+        .verify(&TokenBuilder::valid().unsigned(), Provider::Google)
         .await
         .expect("the emulator issues unsigned tokens");
     assert_eq!(identity.provider_subject, "100000000000000000001");
@@ -405,7 +489,7 @@ async fn emulator_mode_accepts_unsigned_tokens_but_still_checks_claims() {
             .unsigned(),
     ] {
         assert!(
-            verifier.verify(&token).await.is_err(),
+            verifier.verify(&token, Provider::Google).await.is_err(),
             "emulator mode must still enforce the claims"
         );
     }

@@ -9,6 +9,8 @@ use axum::Json;
 use cm_auth::cookie;
 use cm_auth::{IssuedSession, LoginOutcome};
 use cm_core::AppError;
+use cm_db::repo::oauth::Provider;
+use cm_db::repo::users::AccountType;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -30,10 +32,23 @@ pub struct LoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GoogleSignInRequest {
+pub struct FederatedSignInRequest {
     /// The Firebase ID token the browser obtained. Verified, used once, and
     /// never stored.
+    ///
+    /// Note what this body does *not* carry: which provider it came from. That
+    /// is fixed by the route, so a token can never nominate the identity slot
+    /// it wants to be checked against.
     pub id_token: String,
+
+    /// Which side of the marketplace to create, if this token turns out to
+    /// belong to nobody yet. Optional because signing in does not need it, and
+    /// ignored outright when the identity already resolves to an account — an
+    /// account never changes sides, so this can only ever describe a new one.
+    ///
+    /// The sign-up page sends it; the sign-in page does not.
+    #[serde(default)]
+    pub account_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,11 +115,56 @@ pub async fn login(
 pub async fn google_sign_in(
     State(state): State<AppState>,
     Context(context): Context,
-    ValidJson(body): ValidJson<GoogleSignInRequest>,
+    ValidJson(body): ValidJson<FederatedSignInRequest>,
 ) -> Result<Response, AppError> {
+    // Parsed here so an unknown value is a 400 naming the options, rather than
+    // reaching the service as something it has to guess about.
+    let account_type = body
+        .account_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(AccountType::parse_request)
+        .transpose()?;
+
     let outcome = state
         .auth
-        .sign_in_with_google(&state.pool, &body.id_token, &context)
+        .sign_in_with_provider(
+            &state.pool,
+            Provider::Google,
+            &body.id_token,
+            account_type,
+            &context,
+        )
+        .await?;
+
+    Ok(session_response(StatusCode::OK, &outcome, &state))
+}
+
+pub async fn facebook_sign_in(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<FederatedSignInRequest>,
+) -> Result<Response, AppError> {
+    // Parsed here so an unknown value is a 400 naming the options, rather than
+    // reaching the service as something it has to guess about.
+    let account_type = body
+        .account_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(AccountType::parse_request)
+        .transpose()?;
+
+    let outcome = state
+        .auth
+        .sign_in_with_provider(
+            &state.pool,
+            Provider::Facebook,
+            &body.id_token,
+            account_type,
+            &context,
+        )
         .await?;
 
     Ok(session_response(StatusCode::OK, &outcome, &state))
@@ -114,11 +174,37 @@ pub async fn link_google(
     State(state): State<AppState>,
     Context(context): Context,
     CurrentUser(caller): CurrentUser,
-    ValidJson(body): ValidJson<GoogleSignInRequest>,
+    ValidJson(body): ValidJson<FederatedSignInRequest>,
 ) -> Result<StatusCode, AppError> {
     state
         .auth
-        .link_google(&state.pool, caller.user.id, &body.id_token, &context)
+        .link_provider(
+            &state.pool,
+            caller.user.id,
+            Provider::Google,
+            &body.id_token,
+            &context,
+        )
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn link_facebook(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    ValidJson(body): ValidJson<FederatedSignInRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .auth
+        .link_provider(
+            &state.pool,
+            caller.user.id,
+            Provider::Facebook,
+            &body.id_token,
+            &context,
+        )
         .await?;
 
     Ok(StatusCode::NO_CONTENT)

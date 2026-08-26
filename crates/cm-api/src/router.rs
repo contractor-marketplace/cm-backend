@@ -35,6 +35,10 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/auth/logout-all", post(handlers::auth::logout_all))
         .route("/v1/auth/password", post(handlers::auth::change_password))
         .route("/v1/auth/link/google", post(handlers::auth::link_google))
+        .route(
+            "/v1/auth/link/facebook",
+            post(handlers::auth::link_facebook),
+        )
         // Homeowner profile.
         .route(
             "/v1/me/homeowner-profile",
@@ -98,6 +102,7 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/auth/register", post(handlers::auth::register))
         .route("/v1/auth/login", post(handlers::auth::login))
         .route("/v1/auth/google", post(handlers::auth::google_sign_in))
+        .route("/v1/auth/facebook", post(handlers::auth::facebook_sign_in))
         .route("/v1/contractors", get(handlers::contractors::list))
         .route("/v1/contractors/map", get(handlers::contractors::map))
         .route("/v1/contractors/{id}", get(handlers::contractors::detail))

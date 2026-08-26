@@ -738,26 +738,35 @@ impl AuthService {
     fn firebase(&self) -> Result<&FirebaseVerifier, AppError> {
         self.firebase
             .as_deref()
-            .ok_or_else(|| AppError::unavailable("Google sign-in is not configured."))
+            .ok_or_else(|| AppError::unavailable("Federated sign-in is not configured."))
     }
 
-    /// Sign in with a Firebase-issued Google token.
+    /// Sign in with a Firebase-issued token from `provider`.
     ///
     /// The account is resolved by `(provider, subject)` and by nothing else. If
     /// no identity matches, a **new** account is created — the address on the
     /// token is never used to find an existing one, however verified it claims
     /// to be. That rule is the whole defence: an attacker who can obtain a
-    /// Google account bearing someone's address must not thereby obtain their
-    /// account here.
+    /// Google or Facebook account bearing someone's address must not thereby
+    /// obtain their account here.
     ///
     /// The consequence is deliberate and visible to users: someone who
-    /// registered with a password and then clicks "Sign in with Google" gets a
-    /// second account. Joining them is `link_google`, which requires being
+    /// registered with a password and then clicks "Continue with Google" gets a
+    /// second account. Joining them is `link_provider`, which requires being
     /// signed in to the first one.
-    pub async fn sign_in_with_google(
+    /// Sign in with a federated provider, registering on first arrival.
+    ///
+    /// `intended_account_type` is consulted ONLY when this call creates an
+    /// account. An identity that already resolves to a user ignores it
+    /// entirely, so the field cannot be used to flip an existing account's
+    /// side of the marketplace — which is not a thing this product allows at
+    /// all, by any route.
+    pub async fn sign_in_with_provider(
         &self,
         pool: &PgPool,
+        provider: Provider,
         id_token: &str,
+        intended_account_type: Option<users::AccountType>,
         context: &RequestContext,
     ) -> Result<LoginOutcome, AppError> {
         let now = Utc::now();
@@ -770,12 +779,12 @@ impl AuthService {
         )
         .await?;
 
-        let identity = self.firebase()?.verify(id_token).await?;
+        let identity = self.firebase()?.verify(id_token, provider).await?;
 
         let mut tx = pool.begin().await.map_err(AppError::internal)?;
 
         let existing =
-            oauth::find_by_subject(&mut tx, Provider::Google, &identity.provider_subject).await?;
+            oauth::find_by_subject(&mut tx, provider, &identity.provider_subject).await?;
 
         let (user, action) = match existing {
             Some(link) => {
@@ -786,37 +795,71 @@ impl AuthService {
                     return Err(AppError::Unauthenticated);
                 }
                 oauth::touch_login(&mut tx, link.id).await?;
-                (user, "auth.google_login_succeeded")
+                (user, "auth.federated_login_succeeded")
             }
             None => {
                 // A fresh account. The address is stored as this account's
                 // email; if it collides with an existing account the insert
                 // fails, and the caller is told to sign in and link instead.
+                //
+                // Facebook makes the absent case real rather than theoretical:
+                // an account created from a phone number, or one that declined
+                // the email permission, returns no address at all. There is
+                // nowhere to put such a user yet — `users.email` is NOT NULL —
+                // so they are turned away with a message that says what to do.
                 let email = identity.email.clone().ok_or_else(|| {
-                    AppError::invalid("That Google account has no email address.")
+                    AppError::invalid(format!(
+                        "That {} account has no email address. Sign up with an email \
+                         address instead.",
+                        provider.display_name()
+                    ))
                 })?;
                 let display_name = email.split('@').next().unwrap_or("New user").to_owned();
 
-                // Google sign-in cannot ask which side of the marketplace
-                // this is, because the account is created from a token rather
-                // than a form. Homeowner is the safe default: it is the side
-                // that cannot claim a listing, so a contractor arriving this
-                // way is stopped and asked rather than silently given the
-                // wrong capabilities. Enabling Google sign-in (issue #4) needs
-                // a type-selection step before this line.
+                // Which side of the marketplace this account is on has to come
+                // from the person, not from a token — a token cannot know, and
+                // an account can never change sides afterwards. Defaulting to
+                // homeowner would silently trap every contractor who signed up
+                // with a provider button: wrong capabilities, and no route out
+                // except abandoning the account.
+                //
+                // So the sign-up page sends the choice it already collected,
+                // and arriving here without one is refused with something the
+                // person can act on. The sign-in page sends nothing, which is
+                // correct: someone signing in is expected to have an account
+                // already, and if they do not, being sent to sign up and
+                // choose is the right outcome rather than being assigned a
+                // side at random.
+                let account_type = intended_account_type.ok_or_else(|| {
+                    AppError::invalid(format!(
+                        "No account here yet uses that {} sign-in. Create an account first \
+                         and choose whether you are a homeowner or a contractor — it cannot \
+                         be changed later.",
+                        provider.display_name()
+                    ))
+                })?;
+
                 let user = users::insert(
                     &mut tx,
                     new_id(),
                     email.trim(),
                     &display_name,
-                    users::AccountType::Homeowner,
+                    account_type,
                 )
                 .await
                 .map_err(|error| match error {
-                    AppError::Conflict { .. } => AppError::conflict(
-                        "An account already uses that email address. Sign in to it, \
-                             then link Google from account settings.",
-                    ),
+                    // Says what can actually be done today. The link endpoints
+                    // exist for both providers, but nothing in the product
+                    // reaches them yet — there is no account-settings page —
+                    // so naming one sends people looking for something that is
+                    // not there. Restore the fuller wording when that page
+                    // ships.
+                    AppError::Conflict { .. } => AppError::conflict(format!(
+                        "An account already uses that email address. Sign in with your \
+                         email and password instead. Connecting {} to an existing account \
+                         isn't available yet.",
+                        provider.display_name()
+                    )),
                     other => other,
                 })?;
 
@@ -824,7 +867,7 @@ impl AuthService {
                     &mut tx,
                     new_id(),
                     user.id,
-                    Provider::Google,
+                    provider,
                     &identity.provider_subject,
                     Some(&identity.firebase_uid),
                     identity.email.as_deref(),
@@ -832,7 +875,7 @@ impl AuthService {
                 )
                 .await?;
 
-                (user, "auth.google_registered")
+                (user, "auth.federated_registered")
             }
         };
 
@@ -842,7 +885,10 @@ impl AuthService {
             self.event(action, context)
                 .actor(ActorKind::User, Some(user.id))
                 .subject(user.id)
-                .data(serde_json::json!({ "session_id": session.session_id })),
+                .data(serde_json::json!({
+                    "session_id": session.session_id,
+                    "provider": provider.as_str(),
+                })),
         )
         .await?;
         tx.commit().await.map_err(AppError::internal)?;
@@ -850,14 +896,17 @@ impl AuthService {
         Ok(LoginOutcome { user, session })
     }
 
-    /// Attach a Google identity to the account that is already signed in.
+    /// Attach a provider identity to the account that is already signed in.
     ///
     /// Linking is only reachable from an authenticated session, so control of
-    /// both identities is proved before they are joined.
-    pub async fn link_google(
+    /// both identities is proved before they are joined. This is the only way
+    /// two identities ever end up on one account: nothing merges them on the
+    /// strength of a shared email address.
+    pub async fn link_provider(
         &self,
         pool: &PgPool,
         user_id: Uuid,
+        provider: Provider,
         id_token: &str,
         context: &RequestContext,
     ) -> Result<(), AppError> {
@@ -870,29 +919,31 @@ impl AuthService {
         )
         .await?;
 
-        let identity = self.firebase()?.verify(id_token).await?;
+        let identity = self.firebase()?.verify(id_token, provider).await?;
 
         let mut tx = pool.begin().await.map_err(AppError::internal)?;
 
-        if oauth::exists_for_user(&mut tx, user_id, Provider::Google).await? {
-            return Err(AppError::conflict(
-                "This account already has a Google identity linked.",
-            ));
+        if oauth::exists_for_user(&mut tx, user_id, provider).await? {
+            return Err(AppError::conflict(format!(
+                "This account already has a {} identity linked.",
+                provider.display_name()
+            )));
         }
-        if oauth::find_by_subject(&mut tx, Provider::Google, &identity.provider_subject)
+        if oauth::find_by_subject(&mut tx, provider, &identity.provider_subject)
             .await?
             .is_some()
         {
-            return Err(AppError::conflict(
-                "That Google account is already linked to another account.",
-            ));
+            return Err(AppError::conflict(format!(
+                "That {} account is already linked to another account.",
+                provider.display_name()
+            )));
         }
 
         oauth::insert(
             &mut tx,
             new_id(),
             user_id,
-            Provider::Google,
+            provider,
             &identity.provider_subject,
             Some(&identity.firebase_uid),
             identity.email.as_deref(),
@@ -905,7 +956,7 @@ impl AuthService {
             self.event("auth.identity_linked", context)
                 .actor(ActorKind::User, Some(user_id))
                 .subject(user_id)
-                .data(serde_json::json!({ "provider": "google" })),
+                .data(serde_json::json!({ "provider": provider.as_str() })),
         )
         .await?;
         tx.commit().await.map_err(AppError::internal)?;
