@@ -37,6 +37,15 @@ import store
 BATCH_SIZE = 20
 SLEEP_BETWEEN_BATCHES = 5
 
+# Give up after this many consecutive failures to START a run.
+#
+# A single failed batch is worth continuing past — the spec says so, and a
+# transient 5xx should not end the job. But a run that cannot start is usually
+# an account-level condition that the next attempt will hit too: out of credit,
+# or out of the memory the platform allows concurrently. Retrying that in a
+# loop burns wall-clock and hammers the API without ever succeeding.
+MAX_CONSECUTIVE_START_FAILURES = 3
+
 # The spec's values, and the defaults here, so running the job with no flags
 # does exactly what was specified. Each is overridable because each is a cost
 # lever, and the measured cost breakdown makes clear which one matters:
@@ -95,6 +104,7 @@ class Totals:
     batches_ok: int = 0
     batches_failed: int = 0
     unqueried: int = 0
+    consecutive_start_failures: int = 0
     spend_usd: float = 0.0
 
 
@@ -266,6 +276,7 @@ def process_batch(
             )
         conn.commit()
         totals.batches_failed += 1
+        totals.consecutive_start_failures += 1
         log(f"  batch failed to start: {error}")
         return
 
@@ -281,6 +292,7 @@ def process_batch(
         )
         store.update_run_row(cursor, handle.run_id, dataset_id=handle.dataset_id)
     conn.commit()
+    totals.consecutive_start_failures = 0
     log(f"  run {handle.run_id} started (dataset {handle.dataset_id})")
 
     final = client.wait_for_run(handle.run_id)
@@ -659,6 +671,14 @@ def main() -> int:
             conn, client, batch, totals, actor_id, log, args.dry_run, actor_input, args.label
         )
         remaining -= len(batch)
+
+        if totals.consecutive_start_failures >= MAX_CONSECUTIVE_START_FAILURES:
+            log(
+                f"\n{totals.consecutive_start_failures} runs in a row could not start. "
+                "That is an account condition rather than a transient error — out of "
+                "credit, or out of the concurrent actor memory the plan allows. Stopping."
+            )
+            break
 
         if args.dry_run:
             # Nothing was recorded, so the same batch would load forever.
