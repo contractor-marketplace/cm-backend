@@ -538,6 +538,26 @@ def total_spend_usd(cursor) -> float:
 
 # ── Selecting work ────────────────────────────────────────────────────────
 
+# Sharding, so several workers can run at once without coordinating.
+#
+# The obvious approach — every worker running the same "not yet attempted"
+# query — is wrong: they all see the same rows at the same moment and every
+# worker scrapes the same twenty contractors. Paying five times for one batch
+# is the failure mode, and nothing in the data afterwards would show it
+# happened.
+#
+# A claim table with SELECT ... FOR UPDATE SKIP LOCKED would work, but it needs
+# stale-claim expiry for workers that die mid-batch, and that is machinery to
+# get wrong. Hashing the licence number into N buckets needs no coordination at
+# all: the shards are disjoint by construction, a worker that dies loses
+# nothing, and each shard resumes independently.
+#
+# The mask clears the sign bit — ('x'||hex)::bit(32)::bigint is signed, and a
+# negative modulus would silently produce a shard nothing matches.
+SHARD_PREDICATE = """
+   AND ((('x' || left(md5(l.license_no), 8))::bit(32)::bigint & 2147483647)
+        %% %s) = %s"""
+
 SELECT_CONTRACTORS = f"""
 SELECT c.id, c.display_name, l.city, l.license_no
   FROM public.contractors c
@@ -551,6 +571,7 @@ SELECT c.id, c.display_name, l.city, l.license_no
             AND a.attempted_at > now() - (%s || ' days')::interval)
    AND l.city IS NOT NULL
    AND btrim(c.display_name) <> ''
+ {{shard}}
  ORDER BY l.license_no
  LIMIT %s
 """

@@ -125,9 +125,24 @@ def connect(database_url: str):
     return psycopg2.connect(database_url)
 
 
-def load_batch(conn, retry_after_days: int, limit: int) -> list[Contractor]:
+def load_batch(
+    conn,
+    retry_after_days: int,
+    limit: int,
+    shard: Optional[tuple[int, int]] = None,
+) -> list[Contractor]:
+    """The next contractors to attempt, optionally restricted to one shard."""
+    params: list = [str(retry_after_days)]
+    if shard:
+        index, total = shard
+        sql = store.SELECT_CONTRACTORS.format(shard=store.SHARD_PREDICATE)
+        params += [total, index]
+    else:
+        sql = store.SELECT_CONTRACTORS.format(shard="")
+    params.append(limit)
+
     with conn.cursor() as cursor:
-        cursor.execute(store.SELECT_CONTRACTORS, (str(retry_after_days), limit))
+        cursor.execute(sql, tuple(params))
         return [Contractor(str(r[0]), r[1], r[2], r[3]) for r in cursor.fetchall()]
 
 
@@ -535,6 +550,14 @@ def main() -> int:
         default=None,
         help="note recorded on each scrape_runs row, for comparing experiments",
     )
+    parser.add_argument(
+        "--shard",
+        default=None,
+        metavar="I/N",
+        help="take only shard I of N, so N workers can run at once without "
+             "claiming each other's contractors. Shards are disjoint by "
+             "construction and each resumes independently",
+    )
     args = parser.parse_args()
 
     def log(message: str) -> None:
@@ -597,6 +620,19 @@ def main() -> int:
     if already_spent:
         log(f"previously recorded spend: ${already_spent:.2f}")
 
+    shard = None
+    if args.shard:
+        try:
+            index, total = (int(part) for part in args.shard.split("/", 1))
+        except ValueError:
+            print("error: --shard expects I/N, e.g. 0/5", file=sys.stderr)
+            return 2
+        if not 0 <= index < total:
+            print(f"error: shard {index} is not inside 0..{total - 1}", file=sys.stderr)
+            return 2
+        shard = (index, total)
+        log(f"shard {index} of {total}")
+
     remaining = args.limit if args.limit is not None else float("inf")
     batch_number = 0
 
@@ -607,16 +643,16 @@ def main() -> int:
             break
 
         take = int(min(BATCH_SIZE, remaining))
-        batch = load_batch(conn, args.retry_after_days, take)
+        batch = load_batch(conn, args.retry_after_days, take, shard)
         if not batch:
-            log("\nno contractors left to attempt")
+            log("\nno contractors left to attempt" + (" in this shard" if shard else ""))
             break
 
         batch_number += 1
         log(
             f"\nbatch {batch_number}: {len(batch)} contractor(s) "
             f"from licence {batch[0].license_no} "
-            f"(spent ${spent:.2f} of ${args.max_spend:.2f})"
+            f"(all workers have spent ${spent:.2f} of ${args.max_spend:.2f})"
         )
 
         process_batch(
