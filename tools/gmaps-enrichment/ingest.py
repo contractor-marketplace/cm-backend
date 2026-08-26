@@ -269,6 +269,26 @@ def process_batch(
         except apify_client.ApifyError as error:
             log(f"  could not page the dataset: {error}")
 
+    write_batch(
+        conn,
+        batch=batch,
+        rows=rows,
+        run_id=handle.run_id,
+        run_status=final.status,
+        cost=cost,
+        totals=totals,
+        log=log,
+    )
+
+
+def write_batch(conn, *, batch, rows, run_id, run_status, cost, totals, log) -> None:
+    """Score a fetched dataset and write it. One transaction for the whole run.
+
+    Split out of `process_batch` so `--reprocess-run` can reuse it byte for
+    byte. A second implementation of "how a dataset becomes rows" would drift
+    from this one, and the drift would be invisible until the numbers
+    disagreed.
+    """
     places, reviews_by_place, skipped = split_dataset(rows, log)
     if skipped:
         log(f"  skipped {skipped} unusable row(s)")
@@ -291,7 +311,7 @@ def process_batch(
                     {
                         "contractor_id": contractor.id,
                         "query_used": contractor.query,
-                        "run_id": handle.run_id,
+                        "run_id": run_id,
                         "outcome": result.status,
                         "place_id": place_id,
                         "place_name": places[place_id].get("place_name"),
@@ -348,15 +368,15 @@ def process_batch(
                     {
                         "contractor_id": contractor.id,
                         "query_used": contractor.query,
-                        "run_id": handle.run_id,
+                        "run_id": run_id,
                         "outcome": "no_result",
                     },
                 )
 
             store.update_run_row(
                 cursor,
-                handle.run_id,
-                status="succeeded" if final.status == "SUCCEEDED" else final.status.lower(),
+                run_id,
+                status="succeeded" if run_status == "SUCCEEDED" else run_status.lower(),
                 places_found=len(places),
                 reviews_found=sum(len(v) for v in reviews_by_place.values()),
                 cost_usd=cost,
@@ -368,7 +388,7 @@ def process_batch(
         with conn.cursor() as cursor:
             store.update_run_row(
                 cursor,
-                handle.run_id,
+                run_id,
                 status="failed",
                 error_message=str(error)[:2000],
                 cost_usd=cost,
@@ -388,6 +408,70 @@ def process_batch(
     )
 
 
+def reprocess_run(conn, client, run_id: str, totals: Totals, log) -> None:
+    """Re-score and re-write a run's dataset without calling the actor again.
+
+    Datasets persist on Apify and reading one is free, so this recovers a run
+    whose process died — or, as here, one whose dataset was fetched correctly
+    and then discarded because the parser expected fields the actor does not
+    send. Re-running the actor to fix a parser bug would pay twice for the same
+    bytes.
+
+    The contractors are recovered from the recorded `input_payload`, which is
+    why the payload is stored: the queries are the only link back from a run to
+    the rows that produced it.
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"SELECT dataset_id, input_payload, status, cost_usd "
+            f"  FROM {store.SCHEMA}.scrape_runs WHERE run_id = %s",
+            (run_id,),
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        log(f"no run recorded with id {run_id}")
+        return
+    dataset_id, payload, status, cost = row
+    if not dataset_id:
+        log(f"run {run_id} has no dataset to reprocess")
+        return
+
+    queries = (payload or {}).get("locationNames") or []
+    log(f"reprocessing {run_id} (dataset {dataset_id}, {len(queries)} queries, already paid)")
+
+    # Map each recorded query back to the contractor that produced it. The
+    # query is built as "{display_name}, {city}, CA", so it is reconstructed
+    # in SQL and compared, rather than parsed apart — splitting on commas would
+    # break on every business name that contains one.
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """SELECT c.id, c.display_name, l.city, l.license_no
+                 FROM public.contractors c
+                 JOIN public.license_records l ON l.id = c.license_record_id
+                WHERE c.display_name || ', ' || l.city || ', CA' = ANY(%s)""",
+            (queries,),
+        )
+        batch = [Contractor(str(r[0]), r[1], r[2], r[3]) for r in cursor.fetchall()]
+
+    if len(batch) != len(queries):
+        log(f"  matched {len(batch)} of {len(queries)} queries back to contractors")
+
+    rows = list(client.iter_dataset(dataset_id))
+    log(f"  {len(rows)} dataset row(s)")
+
+    write_batch(
+        conn,
+        batch=batch,
+        rows=rows,
+        run_id=run_id,
+        run_status="SUCCEEDED" if status == "succeeded" else (status or "").upper(),
+        cost=float(cost or 0),
+        totals=totals,
+        log=log,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=None)
@@ -395,6 +479,11 @@ def main() -> int:
     parser.add_argument("--retry-after-days", type=int, default=30)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--schema-only", action="store_true")
+    parser.add_argument(
+        "--reprocess-run",
+        metavar="RUN_ID",
+        help="re-score and re-write an existing run's dataset; costs nothing",
+    )
     args = parser.parse_args()
 
     def log(message: str) -> None:
@@ -414,10 +503,20 @@ def main() -> int:
 
     client = None
     actor_id = os.environ.get("APIFY_ACTOR_ID", "gT99sk2Z5BOn6jD7M")
-    if not args.dry_run:
+    if not args.dry_run or args.reprocess_run:
         token = require_env("APIFY_TOKEN")
         actor_id = require_env("APIFY_ACTOR_ID", actor_id)
         client = apify_client.ApifyClient(token, actor_id, log=log)
+
+    if args.reprocess_run:
+        totals = Totals()
+        reprocess_run(conn, client, args.reprocess_run, totals, log)
+        log("")
+        log(f"  confirmed {totals.confirmed}, needs_review {totals.needs_review}, "
+            f"rejected {totals.rejected}, no result {totals.no_result}")
+        log(f"  places {totals.places_written}, reviews {totals.reviews_written}")
+        conn.close()
+        return 0
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)

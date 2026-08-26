@@ -26,8 +26,11 @@ a normal cm-backend migration, because that IS product schema.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Any, Iterable, Optional, Sequence
+import re
+import urllib.parse
+from typing import Any, Optional, Sequence
 
 SCHEMA = "staging"
 
@@ -191,21 +194,112 @@ class MalformedRow(ValueError):
     """A dataset row that cannot be used. Logged and skipped, never fatal."""
 
 
+# ── Reconciling the spec with what the actor actually returns ─────────────
+#
+# The spec documents `placeId`, `reviewId`, `placeCategory`, `publishedAtDate`
+# and several reviewer fields. Measured against the real actor
+# (datablow/google-reviews-scraper, run sdL5McXqMvLoaaHoN), NONE of those are
+# present. What arrives is:
+#
+#   placeName, placeAddress, placeOverallRating, placeTotalReviews, placeUrl,
+#   scrapedAt, reviewNumber, reviewerName, reviewerProfileUrl, rating,
+#   publishedAt, reviewText, reviewPhotoUrls, reviewPhotoCount, ownerReply,
+#   ownerReplyDate
+#
+# Three consequences, handled here rather than by relaxing the schema:
+#
+#  1. No placeId. Google's own feature id is embedded in placeUrl as
+#     `!1s0x<hex>:0x<hex>`, which is stable for a place across runs, so it is
+#     extracted and used as the primary key. That is a real identifier, not a
+#     hash of mutable fields.
+#
+#  2. No reviewId. Derived as a digest of the things about a review that do not
+#     drift. Deliberately NOT included: `publishedAt`, which is relative text
+#     and changes from "4 months ago" to "5 months ago" on its own, and
+#     `reviewNumber`, which shifts as newer reviews arrive. Including either
+#     would mint a new id on every run and duplicate the whole table.
+#
+#  3. No placeCategory, ever. The category signal is therefore always 0, and
+#     the maximum achievable score is 0.9 rather than 1.0. Confirming at 0.75
+#     now requires a name similarity of at least 0.625 alongside a matching
+#     city and state, which is a higher bar than the spec intended — the right
+#     direction to err, but worth knowing when reading the match rate.
+
+# Google Maps embeds the feature id as `!1s0x8cba451fd5df596d:0xb34214a87b15e528`.
+_FEATURE_ID = re.compile(r"!1s(0x[0-9a-f]+:0x[0-9a-f]+)", re.IGNORECASE)
+# And the Knowledge Graph id as `!16s%2Fg%2F11yhpk4xxp` -> /g/11yhpk4xxp.
+_KG_ID = re.compile(r"!16s([^!?&]+)")
+
+# Google prefixes the address with a private-use glyph (U+E0C8, a Material
+# icon). It is not part of the address and must not reach the database or the
+# comma parser that recovers the city.
+_PRIVATE_USE = re.compile(r"[\ue000-\uf8ff]")
+
+
+def clean_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = _PRIVATE_USE.sub("", str(value)).strip()
+    return text or None
+
+
+def place_key(row: dict) -> Optional[str]:
+    """A stable identifier for a place, from its Google Maps URL.
+
+    Prefers Google's feature id, then its Knowledge Graph id. Returns None when
+    neither is present — the caller decides whether to fall back, so that a
+    silent hash-of-the-name never masquerades as a real place id.
+    """
+    url = _first(row, "placeUrl", "place_url")
+    if not url:
+        return None
+
+    found = _FEATURE_ID.search(url)
+    if found:
+        return found.group(1).lower()
+
+    found = _KG_ID.search(url)
+    if found:
+        return urllib.parse.unquote(found.group(1))
+
+    return None
+
+
+def derive_review_id(place_id: str, row: dict) -> str:
+    """A stable synthetic review id.
+
+    Built only from fields that do not drift between runs. The reviewer's
+    profile URL is included when present because it identifies a person, which
+    keeps two rating-only reviews by different people with the same display
+    name from colliding.
+    """
+    parts = [
+        place_id,
+        _as_text(_first(row, "reviewerName", "reviewer_name")) or "",
+        _as_text(_first(row, "reviewerProfileUrl", "reviewer_profile_url")) or "",
+        _as_text(_first(row, "reviewText", "review_text")) or "",
+    ]
+    digest = hashlib.sha256("\u0000".join(parts).encode("utf-8")).hexdigest()
+    return f"d:{digest[:40]}"
+
+
 def place_from_row(row: dict) -> dict:
     """The place-level fields, identical across every row for a given place."""
-    place_id = _as_text(_first(row, "placeId", "place_id"))
+    # The documented field first, then Google's own id out of the URL. A row
+    # with neither cannot be keyed and is genuinely unusable.
+    place_id = _as_text(_first(row, "placeId", "place_id")) or place_key(row)
     if not place_id:
-        raise MalformedRow("row carries no placeId")
+        raise MalformedRow("row carries neither a placeId nor a usable placeUrl")
 
-    name = _as_text(_first(row, "placeName", "place_name"))
+    name = clean_text(_first(row, "placeName", "place_name"))
     if not name:
         raise MalformedRow(f"place {place_id} carries no placeName")
 
     return {
         "place_id": place_id,
         "place_name": name,
-        "place_address": _as_text(_first(row, "placeAddress", "place_address")),
-        "place_category": _as_text(_first(row, "placeCategory", "place_category")),
+        "place_address": clean_text(_first(row, "placeAddress", "place_address")),
+        "place_category": clean_text(_first(row, "placeCategory", "place_category")),
         "overall_rating": _as_float(_first(row, "placeOverallRating", "place_overall_rating")),
         "total_reviews": _as_int(_first(row, "placeTotalReviews", "place_total_reviews")),
         "place_url": _as_text(_first(row, "placeUrl", "place_url")),
@@ -222,7 +316,16 @@ def review_from_row(row: dict, place_id: str) -> Optional[dict]:
     """
     review_id = _as_text(_first(row, "reviewId", "review_id"))
     if not review_id:
-        return None
+        # The actor sends no review id. A row that carries an actual review is
+        # still a review, so one is derived rather than the row discarded.
+        # A row with no reviewer AND no text is a place with no reviews.
+        has_content = any(
+            _first(row, key) is not None
+            for key in ("reviewerName", "reviewText", "rating", "reviewNumber")
+        )
+        if not has_content:
+            return None
+        review_id = derive_review_id(place_id, row)
 
     rating = _as_float(_first(row, "rating", "reviewRating", "stars"))
     if rating is None:
@@ -263,7 +366,7 @@ def review_from_row(row: dict, place_id: str) -> Optional[dict]:
         "published_at": published_iso,
         # An empty review is valid and common: a rating with no words still
         # counts toward the average, so it is kept rather than dropped.
-        "review_text": _as_text(_first(row, "reviewText", "review_text")),
+        "review_text": clean_text(_first(row, "reviewText", "review_text")),
         "review_text_original": _as_text(_first(row, "reviewTextOriginal", "review_text_original")),
         "review_photo_urls": json.dumps(photos),
         "review_photo_count": photo_count if photo_count is not None else len(photos),

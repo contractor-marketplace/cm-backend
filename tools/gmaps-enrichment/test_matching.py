@@ -299,8 +299,16 @@ class RowSplitting(unittest.TestCase):
         review = store.review_from_row(self._row(ownerReply=None), "ChIJabc123")
         self.assertIsNone(review["owner_reply"])
 
-    def test_a_row_with_no_review_id_is_a_place_with_no_review(self):
-        self.assertIsNone(store.review_from_row(self._row(reviewId=None), "ChIJabc123"))
+    def test_a_row_with_no_review_id_gets_a_derived_one(self):
+        # The real actor sends no reviewId at all, so a row carrying an actual
+        # review must still produce one rather than being discarded.
+        review = store.review_from_row(self._row(reviewId=None), "ChIJabc123")
+        self.assertIsNotNone(review)
+        self.assertTrue(review["review_id"].startswith("d:"), "derived ids are marked")
+
+    def test_a_row_with_no_review_content_at_all_is_not_a_review(self):
+        bare = {"placeId": "ChIJabc123", "placeName": "Somewhere"}
+        self.assertIsNone(store.review_from_row(bare, "ChIJabc123"))
 
     def test_a_review_without_a_rating_is_malformed(self):
         with self.assertRaises(store.MalformedRow):
@@ -309,3 +317,126 @@ class RowSplitting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealActorShape(unittest.TestCase):
+    """The actor returns none of the ids the spec documents. Measured against
+    run sdL5McXqMvLoaaHoN: no placeId, no reviewId, no placeCategory, no
+    publishedAtDate, and placeAddress prefixed with a private-use glyph."""
+
+    REAL_URL = (
+        "https://www.google.com/maps/place/Best+Top+Painting/@34.31,-118.74,10z/"
+        "data=!4m8!3m7!1s0x8cba451fd5df596d:0xb34214a87b15e528!8m2!3d34.31!4d-118.74"
+        "!9m1!1b1!16s%2Fg%2F11yhpk4xxp?hl=en"
+    )
+
+    def _real_row(self, **overrides):
+        row = {
+            "placeName": "TROYCO",
+            "placeAddress": "\ue0c821541 Nordhoff St # D, Chatsworth, CA 91311, United States",
+            "placeOverallRating": 5,
+            "placeTotalReviews": 67,
+            "placeUrl": self.REAL_URL,
+            "scrapedAt": "2026-08-25T21:59:24.388Z",
+            "reviewNumber": 1,
+            "reviewerName": "Sherry Zeitler",
+            "reviewerProfileUrl": None,
+            "rating": 5,
+            "publishedAt": "4 months ago",
+            "reviewText": "Masterful painting and drywall repair.",
+            "reviewPhotoUrls": [],
+            "reviewPhotoCount": 0,
+            "ownerReply": None,
+            "ownerReplyDate": None,
+        }
+        row.update(overrides)
+        return row
+
+    def test_the_place_id_comes_out_of_the_maps_url(self):
+        self.assertEqual(
+            store.place_key(self._real_row()),
+            "0x8cba451fd5df596d:0xb34214a87b15e528",
+        )
+
+    def test_the_knowledge_graph_id_is_the_fallback(self):
+        row = self._real_row(placeUrl="https://maps.google.com/x?q=1!16s%2Fg%2F11yhpk4xxp")
+        self.assertEqual(store.place_key(row), "/g/11yhpk4xxp")
+
+    def test_a_url_with_no_identifier_yields_none_rather_than_a_guess(self):
+        # A hash of the name masquerading as a place id would silently merge
+        # two different businesses that share a name.
+        self.assertIsNone(store.place_key({"placeUrl": "https://maps.google.com/"}))
+        self.assertIsNone(store.place_key({}))
+
+    def test_a_real_row_parses_without_a_placeId_field(self):
+        place = store.place_from_row(self._real_row())
+        self.assertEqual(place["place_id"], "0x8cba451fd5df596d:0xb34214a87b15e528")
+        self.assertIsNone(place["place_category"], "the actor never sends one")
+
+    def test_the_private_use_glyph_is_stripped_from_the_address(self):
+        place = store.place_from_row(self._real_row())
+        self.assertTrue(place["place_address"].startswith("21541 Nordhoff"))
+        self.assertNotIn("\ue0c8", place["place_address"])
+
+    def test_the_cleaned_address_still_parses_to_a_city_and_state(self):
+        place = store.place_from_row(self._real_row())
+        parsed = matching.parse_address(place["place_address"])
+        self.assertEqual(parsed.city, "Chatsworth")
+        self.assertEqual(parsed.state, "CA")
+
+    def test_a_website_in_place_of_an_address_rejects_on_state(self):
+        # Some listings show a domain instead of an address. No state parses,
+        # so the match is rejected — which is the correct outcome.
+        row = self._real_row(placeAddress="besttopremodeling.com")
+        place = store.place_from_row(row)
+        result = matching.score_match(
+            contractor_name="Best Top Painting",
+            contractor_city="Los Angeles",
+            place_name=place["place_name"],
+            place_address=place["place_address"],
+            place_category=place["place_category"],
+        )
+        self.assertEqual(result.status, "rejected")
+
+    def test_the_derived_review_id_is_stable_across_runs(self):
+        # publishedAt drifts on its own — "4 months ago" becomes "5 months
+        # ago" — and reviewNumber shifts as newer reviews arrive. Neither may
+        # affect the id, or every run would duplicate the whole table.
+        place = store.place_from_row(self._real_row())
+        first = store.review_from_row(self._real_row(), place["place_id"])
+        later = store.review_from_row(
+            self._real_row(publishedAt="5 months ago", reviewNumber=9),
+            place["place_id"],
+        )
+        self.assertEqual(first["review_id"], later["review_id"])
+
+    def test_different_reviews_get_different_ids(self):
+        place = store.place_from_row(self._real_row())
+        a = store.review_from_row(self._real_row(), place["place_id"])
+        b = store.review_from_row(
+            self._real_row(reviewerName="Someone Else", reviewText="Different"),
+            place["place_id"],
+        )
+        self.assertNotEqual(a["review_id"], b["review_id"])
+
+    def test_two_rating_only_reviews_by_distinct_people_do_not_collide(self):
+        place = store.place_from_row(self._real_row())
+        a = store.review_from_row(
+            self._real_row(reviewText=None, reviewerName="J S",
+                           reviewerProfileUrl="https://maps.google.com/u/1"),
+            place["place_id"],
+        )
+        b = store.review_from_row(
+            self._real_row(reviewText=None, reviewerName="J S",
+                           reviewerProfileUrl="https://maps.google.com/u/2"),
+            place["place_id"],
+        )
+        self.assertNotEqual(a["review_id"], b["review_id"])
+
+    def test_the_relative_date_leaves_the_timestamp_null(self):
+        # The actor sends no publishedAtDate at all, so EVERY review lands with
+        # a null timestamp and the raw string kept. That is the spec's rule,
+        # and it means idx_reviews_published indexes nothing useful.
+        review = store.review_from_row(self._real_row(), "p1")
+        self.assertIsNone(review["published_at"])
+        self.assertEqual(review["published_at_raw"], "4 months ago")
