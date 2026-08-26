@@ -5,6 +5,7 @@ members = [
     "crates/cm-db",
     "crates/cm-auth",
     "crates/cm-domain",
+    "crates/cm-storage",
     "crates/cm-api",
     "crates/cm-server",
 ]
@@ -20,6 +21,7 @@ cm-core = { path = "crates/cm-core" }
 cm-db = { path = "crates/cm-db" }
 cm-auth = { path = "crates/cm-auth" }
 cm-domain = { path = "crates/cm-domain" }
+cm-storage = { path = "crates/cm-storage" }
 cm-api = { path = "crates/cm-api" }
 
 argon2 = { version = "0.5", features = ["std"] }
@@ -32,6 +34,7 @@ csv = "1"
 getrandom = "0.3"
 hmac = "0.12"
 http = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "charset", "http2"] }
 serde = { version = "1", features = ["derive"] }

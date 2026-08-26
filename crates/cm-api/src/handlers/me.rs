@@ -3,7 +3,7 @@
 use crate::extract::CurrentUser;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use cm_db::repo::users::{Role, UserStatus};
+use cm_db::repo::users::{AccountType, Role, UserStatus};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -20,6 +20,9 @@ pub struct UserView {
     email: String,
     display_name: String,
     status: UserStatus,
+    /// Which side of the marketplace. Every client needs this to decide what
+    /// to render, and it never changes for the life of the account.
+    account_type: AccountType,
     email_verified: bool,
     created_at: DateTime<Utc>,
 }
@@ -52,6 +55,7 @@ pub(crate) fn user_view(user: &cm_db::repo::users::User) -> UserView {
         email: user.email.clone(),
         display_name: user.display_name.clone(),
         status: user.status,
+        account_type: user.account_type,
         email_verified: user.email_verified_at.is_some(),
         created_at: user.created_at,
     }

@@ -11,10 +11,16 @@ use sqlx::PgPool;
 
 async fn a_user(pool: &PgPool, email: &str) -> uuid::Uuid {
     let mut conn = pool.acquire().await.expect("connection");
-    users::insert(&mut conn, new_id(), email, "Test Person")
-        .await
-        .expect("insert user")
-        .id
+    users::insert(
+        &mut conn,
+        new_id(),
+        email,
+        "Test Person",
+        users::AccountType::Homeowner,
+    )
+    .await
+    .expect("insert user")
+    .id
 }
 
 /// Two simultaneous registrations of the same address: exactly one wins, and
@@ -23,7 +29,14 @@ async fn a_user(pool: &PgPool, email: &str) -> uuid::Uuid {
 async fn concurrent_registration_of_one_address_produces_one_account(pool: PgPool) {
     let attempt = |pool: PgPool| async move {
         let mut conn = pool.acquire().await.expect("connection");
-        users::insert(&mut conn, new_id(), "race@example.test", "Racer").await
+        users::insert(
+            &mut conn,
+            new_id(),
+            "race@example.test",
+            "Racer",
+            users::AccountType::Homeowner,
+        )
+        .await
     };
 
     let (first, second) = tokio::join!(attempt(pool.clone()), attempt(pool.clone()));

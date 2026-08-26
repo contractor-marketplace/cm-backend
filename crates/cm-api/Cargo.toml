@@ -10,7 +10,8 @@ cm-auth.workspace = true
 cm-core.workspace = true
 cm-db.workspace = true
 cm-domain.workspace = true
-axum.workspace = true
+cm-storage.workspace = true
+axum = { workspace = true, features = ["multipart"] }
 chrono.workspace = true
 http.workspace = true
 serde.workspace = true
@@ -24,5 +25,6 @@ uuid.workspace = true
 [dev-dependencies]
 base64.workspace = true
 cm-domain.workspace = true
+cm-storage.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

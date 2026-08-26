@@ -211,6 +211,41 @@ pub async fn replace_cslb_trades(
 /// The published point is what every read path uses, including distance search.
 /// If search ran on the precise point while the map showed a centroid, the
 /// radius filter could be binary-searched to recover the protected address.
+/// Store the geocoded point without touching what is published.
+///
+/// Separate from `set_location` because that function writes all three location
+/// columns together, and a caller who wants to record a geocode without
+/// deciding publication would have to pass the published point back in — or
+/// pass `None` and silently erase it, which is exactly the bug this exists to
+/// make impossible.
+pub async fn set_precise_point(
+    conn: &mut PgConnection,
+    contractor_id: Uuid,
+    lon: f64,
+    lat: f64,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE contractors \
+            SET precise_point = ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography, \
+                updated_at = now() \
+          WHERE id = $1",
+    )
+    .bind(contractor_id)
+    .bind(lon)
+    .bind(lat)
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(())
+}
+
+/// Write all three location columns together.
+///
+/// A `None` for either point WRITES NULL rather than leaving the column alone.
+/// That is deliberate — it is how a listing gets unlocated — but it is also
+/// sharp, so prefer `location::republish`, which reads the row and cannot
+/// accidentally drop a point it did not know about.
 pub async fn set_location(
     conn: &mut PgConnection,
     contractor_id: Uuid,
@@ -248,22 +283,41 @@ pub struct LocationInputs {
     pub address_visibility: AddressVisibility,
     pub postal_code: Option<String>,
     pub is_claimed: bool,
+    /// `(lon, lat)` of the geocoded address, when one has been resolved.
+    ///
+    /// Read here so the publish decision can be made from stored state alone.
+    /// Without it, recomputing the published point means either passing the
+    /// precise point back in from the caller or losing it — and losing it is
+    /// what used to happen on every re-import.
+    pub precise_point: Option<(f64, f64)>,
 }
+
+/// `(id, address_visibility, postal_code, claimed_by, precise lon, precise lat)`
+/// — the raw row behind `LocationInputs`, named so the query's type is readable.
+type LocationRow = (
+    Uuid,
+    String,
+    Option<String>,
+    Option<Uuid>,
+    Option<f64>,
+    Option<f64>,
+);
 
 pub async fn location_inputs(
     conn: &mut PgConnection,
     contractor_id: Uuid,
 ) -> Result<Option<LocationInputs>, AppError> {
-    let row: Option<(Uuid, String, Option<String>, Option<Uuid>)> = sqlx::query_as(
-        "SELECT id, address_visibility, postal_code, claimed_by_user_id \
-           FROM contractors WHERE id = $1",
+    let row: Option<LocationRow> = sqlx::query_as(
+        "SELECT id, address_visibility, postal_code, claimed_by_user_id, \
+                    ST_X(precise_point::geometry), ST_Y(precise_point::geometry) \
+               FROM contractors WHERE id = $1",
     )
     .bind(contractor_id)
     .fetch_optional(&mut *conn)
     .await
     .map_err(AppError::internal)?;
 
-    row.map(|(id, visibility, postal_code, claimed_by)| {
+    row.map(|(id, visibility, postal_code, claimed_by, lon, lat)| {
         Ok(LocationInputs {
             id,
             address_visibility: AddressVisibility::parse(&visibility).ok_or_else(|| {
@@ -271,6 +325,7 @@ pub async fn location_inputs(
             })?,
             postal_code,
             is_claimed: claimed_by.is_some(),
+            precise_point: lon.zip(lat),
         })
     })
     .transpose()
@@ -439,7 +494,13 @@ pub async fn messaging_target(
     }))
 }
 
-/// A contractor as the public sees it. No precise coordinates, by construction.
+/// A contractor as the public sees it.
+///
+/// Built only from the published point — no read path selects `precise_point`.
+/// Since 0019 the two are usually the same coordinates, because the licence
+/// address is a public record and the directory publishes it. The separation
+/// still matters: it is what a `protected` listing relies on, and it is why
+/// search and map can never disagree about where somebody is.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PublicContractor {
     pub id: Uuid,
@@ -460,6 +521,14 @@ pub struct PublicContractor {
     pub location_precision: PublicPointSource,
     pub license_no: Option<String>,
     pub license_status: Option<String>,
+    /// The business address on the licence, as the CSLB register publishes it.
+    ///
+    /// Not a field a contractor filled in, and not one they can edit here: it
+    /// is what the register says. A correction goes through the CSLB and
+    /// arrives at the next import.
+    pub address_line1: Option<String>,
+    pub address_city: Option<String>,
+    pub address_state: Option<String>,
     pub trades: Vec<String>,
     pub distance_m: Option<f64>,
 }

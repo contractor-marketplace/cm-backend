@@ -21,12 +21,20 @@ async fn the_directory_lists_contractors_without_a_session(pool: PgPool) {
     assert_eq!(contractors[0]["location_precision"], "zip_centroid");
 }
 
-/// The assertion that matters most on this surface.
+/// No read path selects `precise_point`, only the published one.
+///
+/// Since 0019 the two usually hold the same coordinates, because the licence
+/// address is a public record and the directory publishes it. This test writes
+/// a precise point WITHOUT republishing, so the two deliberately disagree, and
+/// then checks the published point is what comes back. That separation is what
+/// a `protected` listing relies on, and it is why search and map can never
+/// disagree about where somebody is.
 #[sqlx::test(migrations = "../../migrations")]
-async fn no_directory_response_ever_contains_a_precise_coordinate(pool: PgPool) {
+async fn reads_return_the_published_point_and_never_the_precise_column(pool: PgPool) {
     seed_directory(&pool).await;
 
-    // Give one contractor a precise point that differs from its centroid.
+    // Give one contractor a precise point that differs from its published one,
+    // by writing the column directly rather than going through `republish`.
     sqlx::query(
         "UPDATE contractors SET precise_point = ST_SetSRID(ST_MakePoint(-118.18751, 34.11801), 4326)::geography \
           WHERE postal_code = '90042'",
@@ -136,9 +144,15 @@ async fn filters_narrow_the_directory(pool: PgPool) {
 
     let owner = cm_core::new_id();
     let mut conn = pool.acquire().await.expect("connection");
-    cm_db::repo::users::insert(&mut conn, owner, "owner@example.test", "Owner")
-        .await
-        .expect("user");
+    cm_db::repo::users::insert(
+        &mut conn,
+        owner,
+        "owner@example.test",
+        "Owner",
+        cm_db::repo::users::AccountType::Contractor,
+    )
+    .await
+    .expect("user");
     drop(conn);
     force_claim(&pool, contractor_id(&pool, "1047382").await, owner).await;
 
@@ -280,7 +294,7 @@ async fn only_the_claimant_may_edit_a_listing_and_never_its_badge(pool: PgPool) 
     let router = router(pool.clone());
 
     let mut owner = Client::new(router.clone());
-    owner.register("owner@example.test").await;
+    owner.register_contractor("owner@example.test").await;
     let mut stranger = Client::new(router.clone());
     stranger.register("stranger@example.test").await;
 
@@ -344,4 +358,45 @@ async fn reference_data_is_public(pool: PgPool) {
     let regions = client.get("/v1/regions").await;
     assert_eq!(regions.status, StatusCode::OK);
     assert_eq!(regions.json.as_array().expect("array").len(), 4);
+}
+
+/// The licence address is published, which is the point of the directory.
+///
+/// It comes from `license_records` rather than from anything a contractor
+/// typed, so it is the address the CSLB register already publishes. Asserted on
+/// every read surface, because a field that appears in the list and not on the
+/// detail page is the sort of gap nobody notices until somebody asks why.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_directory_publishes_the_address_on_the_licence(pool: PgPool) {
+    seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+
+    let listed = client.get("/v1/contractors").await;
+    assert_eq!(listed.status, StatusCode::OK, "{:?}", listed.json);
+
+    let first = &listed.json["contractors"][0];
+    let street = first["address_line1"]
+        .as_str()
+        .expect("the list carries the street line");
+    assert!(!street.is_empty());
+    assert!(first["address_city"].is_string(), "and the city");
+
+    // The detail page agrees.
+    let slug = first["slug"].as_str().expect("slug");
+    let detail = client.get(&format!("/v1/contractors/{slug}")).await;
+    assert_eq!(detail.status, StatusCode::OK, "{:?}", detail.json);
+    assert_eq!(detail.json["address_line1"], street);
+
+    // And so does the map, which labels a single pin with it.
+    let map = client.get("/v1/contractors/map?bbox=-119,33,-117,35").await;
+    assert_eq!(map.status, StatusCode::OK, "{:?}", map.json);
+    assert!(
+        map.json["points"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|p| p["address_line1"].is_string()),
+        "a map pin should carry the street line: {:?}",
+        map.json
+    );
 }

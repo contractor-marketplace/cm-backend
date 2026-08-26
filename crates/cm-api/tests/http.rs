@@ -77,7 +77,10 @@ async fn version_answers_without_touching_the_database() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["environment"], "development");
-    assert_eq!(body["migration_version"], 15);
+    assert_eq!(
+        body["migration_version"],
+        cm_db::migrate::embedded_version()
+    );
     assert!(body["git_sha"].is_string());
 }
 
@@ -88,8 +91,14 @@ async fn readyz_is_ready_once_the_schema_matches(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "body was {body}");
     assert_eq!(body["status"], "ready");
     assert_eq!(body["checks"]["database"]["status"], "ok");
-    assert_eq!(body["checks"]["migrations"]["applied"], 15);
-    assert_eq!(body["checks"]["migrations"]["embedded"], 15);
+    assert_eq!(
+        body["checks"]["migrations"]["applied"],
+        cm_db::migrate::embedded_version()
+    );
+    assert_eq!(
+        body["checks"]["migrations"]["embedded"],
+        cm_db::migrate::embedded_version()
+    );
 }
 
 #[sqlx::test(migrations = false)]
@@ -182,5 +191,52 @@ async fn no_cross_origin_headers_are_sent() {
             headers.get(header).is_none(),
             "{header} must not be sent: the API is same-origin by design"
         );
+    }
+}
+
+/// The public router carries no CSRF layer, which is safe only for as long as
+/// its read routes stay reads.
+///
+/// The optional-session layer that used to sit here is gone, but the hazard it
+/// created did not leave with it: anything mutating registered next to these
+/// paths would change state with no token to present. That cannot be asserted
+/// by reading the router from outside, so the property is checked instead — a
+/// mutating request with no session must be refused on every one of them.
+///
+/// Register and login are deliberately absent: they are the two public writes,
+/// they have no session to protect, and they are rate limited by address.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_public_read_routes_stay_read_only(pool: PgPool) {
+    let paths = [
+        "/v1/contractors",
+        "/v1/contractors/map",
+        "/v1/contractors/00000000-0000-0000-0000-000000000000",
+        "/v1/trades",
+        "/v1/regions",
+        "/v1/jobs",
+        "/v1/jobs/00000000-0000-0000-0000-000000000000",
+    ];
+
+    for path in paths {
+        for method in [http::Method::POST, http::Method::PUT, http::Method::DELETE] {
+            let response = router(pool.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert!(
+                response.status().is_client_error(),
+                "{method} {path} answered {} — a state change on the public \
+                 router would bypass CSRF entirely",
+                response.status()
+            );
+        }
     }
 }

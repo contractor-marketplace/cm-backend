@@ -3,6 +3,7 @@
 use cm_auth::AuthService;
 use cm_core::{AppError, Config, Environment};
 use cm_db::PgPool;
+use cm_storage::Store;
 use std::sync::Arc;
 
 /// Identity of the running binary, reported by `/version`.
@@ -33,7 +34,7 @@ impl Default for BuildInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub environment: Environment,
@@ -43,6 +44,9 @@ pub struct AppState {
     pub auth: Arc<AuthService>,
     /// Whether `X-Forwarded-For` may be believed when identifying a client.
     pub trust_proxy_headers: bool,
+    /// Where job photos go. In-memory unless a bucket is configured, which
+    /// production refuses to start without.
+    pub store: Store,
 }
 
 impl AppState {
@@ -53,6 +57,10 @@ impl AppState {
             build: BuildInfo::from_env(),
             auth: Arc::new(AuthService::new(&config.auth, config.site_origin.clone())?),
             trust_proxy_headers: config.auth.trust_proxy_headers,
+            store: match &config.job_photo_bucket {
+                Some(bucket) => Store::Gcs(cm_storage::gcs::Bucket::new(bucket)?),
+                None => Store::memory(),
+            },
         })
     }
 }

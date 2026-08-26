@@ -28,6 +28,15 @@ pub async fn open(
     Path(contractor_id): Path<Uuid>,
     ValidJson(body): ValidJson<OpenClaimRequest>,
 ) -> Result<(StatusCode, Json<Claim>), AppError> {
+    // The two sides of the marketplace are mutually exclusive, and claiming a
+    // listing is the contractor's. A homeowner account is refused here rather
+    // than at the database trigger, so the caller gets an explanation instead
+    // of a 500.
+    if !caller.user.account_type.may_claim_a_listing() {
+        // Only a contractor account can claim a listing.
+        return Err(AppError::Forbidden);
+    }
+
     let method = ClaimMethod::parse(&body.method).ok_or_else(|| {
         AppError::invalid(format!(
             "unknown method \"{}\"; expected one of {}",

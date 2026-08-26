@@ -12,7 +12,7 @@ async fn claimed_and_open(pool: &PgPool, router: &axum::Router) -> (uuid::Uuid, 
     let id = contractor_id(pool, "1047382").await;
 
     let mut owner = Client::new(router.clone());
-    owner.register("owner@example.test").await;
+    owner.register_contractor("owner@example.test").await;
     force_claim(pool, id, user_id(pool, "owner@example.test").await).await;
 
     let opened = owner
@@ -111,9 +111,15 @@ async fn messaging_is_refused_unless_the_listing_is_claimed_and_open(pool: PgPoo
     let claimed = contractor_id(&pool, "1047382").await;
     let owner = cm_core::new_id();
     let mut conn = pool.acquire().await.expect("connection");
-    cm_db::repo::users::insert(&mut conn, owner, "owner@example.test", "Owner")
-        .await
-        .expect("user");
+    cm_db::repo::users::insert(
+        &mut conn,
+        owner,
+        "owner@example.test",
+        "Owner",
+        cm_db::repo::users::AccountType::Contractor,
+    )
+    .await
+    .expect("user");
     drop(conn);
     force_claim(&pool, claimed, owner).await;
 

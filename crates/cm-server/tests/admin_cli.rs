@@ -70,10 +70,16 @@ impl Cli {
 
 async fn an_account(pool: &PgPool, email: &str) -> uuid::Uuid {
     let mut conn = pool.acquire().await.expect("connection");
-    cm_db::repo::users::insert(&mut conn, cm_core::new_id(), email, "Operator Target")
-        .await
-        .expect("insert user")
-        .id
+    cm_db::repo::users::insert(
+        &mut conn,
+        cm_core::new_id(),
+        email,
+        "Operator Target",
+        cm_db::repo::users::AccountType::Homeowner,
+    )
+    .await
+    .expect("insert user")
+    .id
 }
 
 #[sqlx::test(migrations = "../../migrations")]

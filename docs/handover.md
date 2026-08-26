@@ -11,6 +11,27 @@ current session and revokes the rest, roles, and an audit trail. Google sign-in
 via Firebase, where Firebase verifies nothing on our behalf beyond issuing a
 token we then check ourselves.
 
+**Account type.** Every account is a **homeowner** or a **contractor**, chosen
+at registration and never changed. This is `users.account_type`, not a role —
+roles are granted and additive, and `Role::Contractor` still means a moderator
+approved a claim. The two are related but distinct: only a contractor *account*
+may open a claim, and only an approved claim grants the contractor *role*.
+
+The rule is enforced in three places, deliberately. The handlers refuse the
+wrong side with a 403 (claiming, starting a conversation, holding a homeowner
+profile). Two database triggers refuse it again, so a code path that forgets
+the check cannot record a homeowner as a claimant or give one a homeowner
+profile. And the front end never offers an action the account cannot take.
+
+There is no conversion. An account is one side of the marketplace or the other
+for its whole life, so somebody who registers as the wrong one needs a new
+account under a different address — which, with no password reset and no email
+verification, is worth saying on the form. It is.
+
+Google sign-in cannot ask, because the account is created from a token rather
+than a form; it defaults to homeowner, the side that cannot claim. Enabling it
+(issue #4) needs a type-selection step first.
+
 **Licence data.** An operator-supplied CSLB file becomes `license_records` with
 the source row preserved verbatim, and `contractors` — our own record, which an
 import may refresh but never overwrite where a claimant has written.
@@ -70,10 +91,21 @@ concurrency to trade login throughput for memory.
 
 ## Risks worth carrying into the first week
 
-**Publishing unclaimed listings is a product decision, not a technical one.**
-Tens of thousands of businesses will appear here without signing up, many of
-them sole traders whose CSLB address is their home. The centroid rule and the
-takedown path are in place; whether to publish at all is yours.
+**Unclaimed listings are published. Decided 2026-08-24.** Tens of thousands of
+businesses appear here without having signed up, many of them sole traders whose
+CSLB address of record is their home. The decision is to publish the aggregated
+directory.
+
+That decision needed no code change. Centroid-only publication for anything
+unclaimed is what the schema already enforces, and search reads the same
+protected point. It was the other answer — claimed listings only — that would
+have added a condition to the search predicate, and it is not being taken.
+
+What remains open is **takedown**. Removal is an operator action today: there is
+no self-service endpoint, no named owner and no target response time. Requests
+to be delisted arrive regardless of the decision above, and right now they have
+nowhere to land. Name an owner and write the procedure into `runbook.md` before
+the first real import goes live.
 
 **The badge is only as fresh as the last import.** Statuses change between
 downloads. The detail endpoint returns `license_data_as_of` so a client can say

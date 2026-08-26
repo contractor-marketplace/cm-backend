@@ -17,6 +17,10 @@ pub struct RegisterRequest {
     pub email: String,
     pub display_name: String,
     pub password: String,
+    /// "homeowner" or "contractor". Required, and fixed for the life of the
+    /// account: the two sides of the marketplace are mutually exclusive, so
+    /// there is no later step at which this could be chosen instead.
+    pub account_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +67,8 @@ pub async fn register(
     Context(context): Context,
     ValidJson(body): ValidJson<RegisterRequest>,
 ) -> Result<Response, AppError> {
+    let account_type = cm_db::repo::users::AccountType::parse_request(&body.account_type)?;
+
     let outcome = state
         .auth
         .register(
@@ -70,6 +76,7 @@ pub async fn register(
             &body.email,
             &body.display_name,
             &body.password,
+            account_type,
             &context,
         )
         .await?;

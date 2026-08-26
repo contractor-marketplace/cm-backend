@@ -67,7 +67,14 @@ fn database_url(pool: &PgPool) -> String {
 
 async fn an_account(service: &AuthService, pool: &PgPool, email: &str) -> uuid::Uuid {
     service
-        .register(pool, email, "Test Person", PASSWORD, &context())
+        .register(
+            pool,
+            email,
+            "Test Person",
+            PASSWORD,
+            cm_db::repo::users::AccountType::Homeowner,
+            &context(),
+        )
         .await
         .expect("register")
         .user

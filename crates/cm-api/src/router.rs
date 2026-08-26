@@ -40,6 +40,13 @@ pub fn build(state: AppState) -> Router {
             "/v1/me/homeowner-profile",
             get(handlers::profiles::get).put(handlers::profiles::upsert),
         )
+        // Jobs a homeowner posts. The board itself is public; these are not.
+        .route("/v1/jobs", post(handlers::jobs::post_job))
+        .route("/v1/me/jobs", get(handlers::jobs::mine))
+        .route("/v1/jobs/{id}/close", post(handlers::jobs::close))
+        // Merged rather than listed inline: the upload body limit belongs to
+        // these two routes and must travel with them, not with the router.
+        .merge(handlers::jobs::photo_routes())
         // Claiming a listing.
         .route("/v1/contractors/{id}/claims", post(handlers::claims::open))
         .route("/v1/me/claims", get(handlers::claims::mine))
@@ -81,18 +88,22 @@ pub fn build(state: AppState) -> Router {
             require_session,
         ));
 
-    // No session to protect yet, so no CSRF token to check. Both are rate
-    // limited by address inside the service.
+    // Open to anyone, session or not. Nothing here reads the caller: the two
+    // write routes are how a caller comes into existence, and every read route
+    // returns the same bytes to everybody. That is why no CSRF check is needed
+    // on this router — there is no session for a cross-site form to ride on.
+    //
+    // The auth writes are rate limited by address inside the service.
     let public = Router::new()
         .route("/v1/auth/register", post(handlers::auth::register))
         .route("/v1/auth/login", post(handlers::auth::login))
         .route("/v1/auth/google", post(handlers::auth::google_sign_in))
-        // The public directory.
         .route("/v1/contractors", get(handlers::contractors::list))
         .route("/v1/contractors/map", get(handlers::contractors::map))
         .route("/v1/contractors/{id}", get(handlers::contractors::detail))
         .route("/v1/trades", get(handlers::contractors::trades))
-        .route("/v1/regions", get(handlers::contractors::regions));
+        .route("/v1/regions", get(handlers::contractors::regions))
+        .merge(handlers::jobs::public_routes());
 
     Router::new()
         .route("/healthz", get(health::healthz))
