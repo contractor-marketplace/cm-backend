@@ -97,11 +97,17 @@ async fn a_returning_google_user_gets_the_same_account(pool: PgPool) {
     let id_token = token("100000000000000000001", "marisol@example.test");
 
     let first = Client::new(router.clone())
-        .post("/v1/auth/google", json!({ "id_token": id_token, "account_type": "homeowner" }))
+        .post(
+            "/v1/auth/google",
+            json!({ "id_token": id_token, "account_type": "homeowner" }),
+        )
         .await;
     let id_token = token("100000000000000000001", "marisol@example.test");
     let second = Client::new(router)
-        .post("/v1/auth/google", json!({ "id_token": id_token, "account_type": "homeowner" }))
+        .post(
+            "/v1/auth/google",
+            json!({ "id_token": id_token, "account_type": "homeowner" }),
+        )
         .await;
 
     assert_eq!(first.json["user"]["id"], second.json["user"]["id"]);
@@ -431,7 +437,10 @@ async fn a_facebook_token_without_an_email_is_refused_with_advice(pool: PgPool) 
     let id_token = format!("{header}.{}.", URL_SAFE_NO_PAD.encode(claims.to_string()));
 
     let response = Client::new(emulator_router(pool.clone()))
-        .post("/v1/auth/facebook", json!({ "id_token": id_token, "account_type": "homeowner" }))
+        .post(
+            "/v1/auth/facebook",
+            json!({ "id_token": id_token, "account_type": "homeowner" }),
+        )
         .await;
 
     assert_eq!(
@@ -455,7 +464,6 @@ async fn a_facebook_token_without_an_email_is_refused_with_advice(pool: PgPool) 
         .expect("count");
     assert_eq!(accounts, 0);
 }
-
 
 /// Signing up with a provider button creates the side the person chose.
 ///
@@ -482,12 +490,11 @@ async fn federated_sign_up_creates_the_side_the_person_chose(pool: PgPool) {
         assert_eq!(response.json["user"]["account_type"], chosen);
     }
 
-    let contractors: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM users WHERE account_type = 'contractor'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("count");
+    let contractors: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM users WHERE account_type = 'contractor'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
     assert_eq!(contractors, 1, "the contractor was created as a contractor");
 }
 
@@ -505,10 +512,23 @@ async fn federated_sign_in_without_an_account_refuses_rather_than_guessing(pool:
         )
         .await;
 
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "{:?}", response.json);
-    let message = response.json["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("homeowner"), "the message names the choice: {message}");
-    assert!(message.contains("cannot be changed"), "and says it is permanent: {message}");
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        response.json
+    );
+    let message = response.json["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("homeowner"),
+        "the message names the choice: {message}"
+    );
+    assert!(
+        message.contains("cannot be changed"),
+        "and says it is permanent: {message}"
+    );
 
     let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
         .fetch_one(&pool)

@@ -839,29 +839,24 @@ impl AuthService {
                     ))
                 })?;
 
-                let user = users::insert(
-                    &mut tx,
-                    new_id(),
-                    email.trim(),
-                    &display_name,
-                    account_type,
-                )
-                .await
-                .map_err(|error| match error {
-                    // Says what can actually be done today. The link endpoints
-                    // exist for both providers, but nothing in the product
-                    // reaches them yet — there is no account-settings page —
-                    // so naming one sends people looking for something that is
-                    // not there. Restore the fuller wording when that page
-                    // ships.
-                    AppError::Conflict { .. } => AppError::conflict(format!(
-                        "An account already uses that email address. Sign in with your \
+                let user =
+                    users::insert(&mut tx, new_id(), email.trim(), &display_name, account_type)
+                        .await
+                        .map_err(|error| match error {
+                            // Says what can actually be done today. The link endpoints
+                            // exist for both providers, but nothing in the product
+                            // reaches them yet — there is no account-settings page —
+                            // so naming one sends people looking for something that is
+                            // not there. Restore the fuller wording when that page
+                            // ships.
+                            AppError::Conflict { .. } => AppError::conflict(format!(
+                                "An account already uses that email address. Sign in with your \
                          email and password instead. Connecting {} to an existing account \
                          isn't available yet.",
-                        provider.display_name()
-                    )),
-                    other => other,
-                })?;
+                                provider.display_name()
+                            )),
+                            other => other,
+                        })?;
 
                 oauth::insert(
                     &mut tx,
