@@ -5,6 +5,7 @@
 //! `cm-db`, so "which query touches a restricted column" stays a grep.
 
 pub mod claims;
+pub mod contractors;
 pub mod geocode_worker;
 pub mod geocoder;
 pub mod import;

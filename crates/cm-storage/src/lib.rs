@@ -130,3 +130,15 @@ impl MemoryStore {
 pub fn photo_key(job_id: uuid::Uuid, photo_id: uuid::Uuid) -> String {
     format!("jobs/{job_id}/{photo_id}.jpg")
 }
+
+/// The object key for a contractor's profile photo.
+///
+/// Carries a fresh `photo_id` rather than living at a fixed
+/// `contractors/{id}.jpg`, so replacing a photo writes a new object instead of
+/// overwriting one. A fixed key would be served stale from every cache between
+/// here and the viewer for as long as they cache it, and the URL would give no
+/// way to tell the versions apart. The displaced object is deleted by the
+/// caller once the row points at the new one.
+pub fn contractor_photo_key(contractor_id: uuid::Uuid, photo_id: uuid::Uuid) -> String {
+    format!("contractors/{contractor_id}/{photo_id}.jpg")
+}

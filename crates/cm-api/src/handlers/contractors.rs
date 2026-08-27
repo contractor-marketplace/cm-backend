@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use cm_core::AppError;
 use cm_db::repo::contractors::{self, AddressVisibility, ProfileUpdate, PublicContractor};
-use cm_db::repo::{claims, reference, search};
+use cm_db::repo::{claims, reference, reviews, search};
 use cm_domain::search as search_input;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -50,7 +50,7 @@ pub async fn list(
     let request = search_input::parse(&raw, ids)?;
 
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    let page = search::list(
+    let mut page = search::list(
         &mut conn,
         &request.filters,
         request.sort,
@@ -58,6 +58,10 @@ pub async fn list(
         request.cursor.as_ref(),
     )
     .await?;
+
+    // Storage keys become URLs here, never in the row reader. Every read path
+    // that serves a contractor has to do this or photos go out as bare keys.
+    search::attach_photo_urls(&mut page.contractors, |key| state.store.url_for(key));
 
     Ok(Json(ListResponse {
         contractors: page.contractors,
@@ -137,6 +141,14 @@ pub struct DetailResponse {
     license_data_as_of: Option<chrono::NaiveDate>,
     /// The evidence behind the badge.
     verification: Vec<VerificationView>,
+    /// Third-party reviews, capped. Empty for a listing the enrichment load
+    /// never reached, which is most of them.
+    ///
+    /// The totals live on the flattened contractor as `google_rating` and
+    /// `google_review_count`, and the count is Google's own — normally larger
+    /// than this array, which is a sample. A client that renders "N reviews"
+    /// should use the count, not `reviews.len()`.
+    reviews: Vec<reviews::PublicReview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,11 +165,14 @@ pub async fn detail(
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
 
     // Accepts an id or a slug, so a shareable URL does not have to be a UUID.
-    let contractor = match Uuid::parse_str(&id) {
+    let mut one = match Uuid::parse_str(&id) {
         Ok(uuid) => search::find_public(&mut conn, uuid).await?,
         Err(_) => search::find_public_by_slug(&mut conn, &id).await?,
     }
+    .map(|c| vec![c])
     .ok_or(AppError::NotFound)?;
+    search::attach_photo_urls(&mut one, |key| state.store.url_for(key));
+    let contractor = one.remove(0);
 
     let verification_reason: Option<String> =
         sqlx::query_scalar("SELECT verification_reason FROM contractors WHERE id = $1")
@@ -180,11 +195,15 @@ pub async fn detail(
         })
         .collect();
 
+    let reviews =
+        reviews::list_for_contractor(&mut conn, contractor.id, reviews::MAX_PER_CONTRACTOR).await?;
+
     Ok(Json(DetailResponse {
         contractor,
         verification_reason,
         license_data_as_of,
         verification,
+        reviews,
     }))
 }
 
@@ -209,10 +228,95 @@ pub struct UpdateProfileRequest {
     pub public_phone: Option<String>,
     pub accepts_dm: Option<bool>,
     pub address_visibility: Option<String>,
+    /// The claimant's own address. All four parts or none — a partial address
+    /// is refused rather than merged with the licence's, because merging would
+    /// geocode a building that exists nowhere.
+    ///
+    /// `Some(null)` clears it and the listing falls back to the licence
+    /// address; absent leaves it alone. That distinction is why this is
+    /// `Option<Option<_>>` rather than a flat option.
+    #[serde(default, deserialize_with = "double_option")]
+    pub owner_address: Option<Option<OwnerAddressRequest>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub google_review_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub yelp_url: Option<Option<String>>,
     /// Present only so a client that sends it gets a clear refusal instead of
     /// silently having it ignored — which would teach the client it worked.
     #[serde(default)]
     pub verified: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OwnerAddressRequest {
+    pub line1: String,
+    pub city: String,
+    pub state: String,
+    pub postal_code: String,
+}
+
+/// Distinguish "absent" from "explicitly null".
+///
+/// serde collapses both to `None` on a plain `Option`, which would make
+/// "leave my Yelp link alone" and "remove my Yelp link" the same request.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Turn the wire's `Option<Option<T>>` into the repo's explicit `Edit`.
+fn edit<T>(field: Option<Option<T>>) -> contractors::Edit<T> {
+    match field {
+        None => contractors::Edit::Unchanged,
+        Some(None) => contractors::Edit::Cleared,
+        Some(Some(value)) => contractors::Edit::Set(value),
+    }
+}
+
+/// A link the contractor supplies about themselves.
+///
+/// Checked rather than trusted: this string is rendered as an `href` on a
+/// public page, so `javascript:` and `data:` must not survive. Only http(s) is
+/// accepted, and the host has to look like a host.
+fn clean_link(value: String, field: &str) -> Result<String, AppError> {
+    let trimmed = value.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err(AppError::invalid(format!("{field} cannot be blank.")));
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if !(lowered.starts_with("https://") || lowered.starts_with("http://")) {
+        return Err(AppError::invalid(format!(
+            "{field} must start with https:// or http://"
+        )));
+    }
+    // Cheap structural check rather than a URL parser: everything after the
+    // scheme up to the first slash must contain a dot and no whitespace.
+    let host = lowered
+        .split_once("//")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    if host.is_empty() || !host.contains('.') || host.contains(char::is_whitespace) {
+        return Err(AppError::invalid(format!("{field} is not a valid link.")));
+    }
+    if trimmed.chars().count() > 500 {
+        return Err(AppError::invalid(format!("{field} is too long.")));
+    }
+    Ok(trimmed)
+}
+
+/// One part of an address, trimmed and bounded.
+fn clean_address_part(value: &str, field: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::invalid(format!("{field} cannot be blank.")));
+    }
+    if trimmed.chars().count() > 200 {
+        return Err(AppError::invalid(format!("{field} is too long.")));
+    }
+    Ok(trimmed.to_owned())
 }
 
 pub async fn update_profile(
@@ -247,6 +351,29 @@ pub async fn update_profile(
         }
     };
 
+    // Validated before the transaction opens, so a bad link is a 400 rather
+    // than a rolled-back write.
+    let owner_address = match body.owner_address {
+        None => contractors::Edit::Unchanged,
+        Some(None) => contractors::Edit::Cleared,
+        Some(Some(a)) => contractors::Edit::Set(contractors::OwnerAddress {
+            line1: clean_address_part(&a.line1, "Street address")?,
+            city: clean_address_part(&a.city, "City")?,
+            state: clean_address_part(&a.state, "State")?,
+            postal_code: clean_address_part(&a.postal_code, "ZIP code")?,
+        }),
+    };
+    let address_changed = !matches!(owner_address, contractors::Edit::Unchanged);
+
+    let google_review_url = match edit(body.google_review_url) {
+        contractors::Edit::Set(v) => contractors::Edit::Set(clean_link(v, "Google review link")?),
+        other => other,
+    };
+    let yelp_url = match edit(body.yelp_url) {
+        contractors::Edit::Set(v) => contractors::Edit::Set(clean_link(v, "Yelp link")?),
+        other => other,
+    };
+
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
     contractors::update_profile(
         &mut tx,
@@ -257,6 +384,9 @@ pub async fn update_profile(
             public_phone: body.public_phone,
             accepts_dm: body.accepts_dm,
             address_visibility: visibility,
+            owner_address,
+            google_review_url,
+            yelp_url,
         },
     )
     .await?;
@@ -265,11 +395,88 @@ pub async fn update_profile(
     if visibility.is_some() {
         cm_domain::location::reapply(&mut tx, contractor_id).await?;
     }
+
+    // A new address means a new pin. Queued inside the same transaction as the
+    // write, so a rollback cannot leave a geocode job for an address that was
+    // never saved.
+    if address_changed {
+        cm_domain::contractors::relocate_after_address_change(&mut tx, contractor_id).await?;
+    }
+
     tx.commit().await.map_err(AppError::internal)?;
 
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    search::find_public(&mut conn, contractor_id)
+    let mut found = search::find_public(&mut conn, contractor_id)
         .await?
-        .map(Json)
-        .ok_or(AppError::NotFound)
+        .map(|c| vec![c])
+        .ok_or(AppError::NotFound)?;
+    search::attach_photo_urls(&mut found, |key| state.store.url_for(key));
+    Ok(Json(found.remove(0)))
+}
+
+/// Set the listing's profile photo. Multipart, claimant only.
+pub async fn set_photo(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+    mut form: axum::extract::Multipart,
+) -> Result<Json<cm_domain::contractors::ProfilePhoto>, AppError> {
+    let mut bytes: Option<Vec<u8>> = None;
+
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|error| AppError::invalid(format!("That upload could not be read: {error}")))?
+    {
+        if field.name() == Some("file") {
+            bytes = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|error| {
+                        AppError::invalid(format!("That upload could not be read: {error}"))
+                    })?
+                    .to_vec(),
+            );
+            break;
+        }
+    }
+
+    let bytes = bytes.ok_or_else(|| AppError::invalid("Attach a photo in a \"file\" field."))?;
+
+    let photo = cm_domain::contractors::set_photo(
+        &state.pool,
+        &state.store,
+        state.auth.pepper(),
+        caller.user.id,
+        contractor_id,
+        &bytes,
+    )
+    .await?;
+
+    Ok(Json(photo))
+}
+
+pub async fn remove_photo(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+) -> Result<http::StatusCode, AppError> {
+    cm_domain::contractors::remove_photo(&state.pool, &state.store, caller.user.id, contractor_id)
+        .await?;
+    Ok(http::StatusCode::NO_CONTENT)
+}
+
+/// A profile photo is one image, so the limit is lower than the job composer's
+/// twelve megabytes — it is a logo or a van, not a set of site photographs.
+const MAX_PHOTO_BYTES: usize = 8 * 1024 * 1024;
+
+/// The photo routes, with the upload limit attached to them and nowhere else.
+pub fn photo_routes() -> axum::Router<AppState> {
+    axum::Router::new().route(
+        "/v1/contractors/{id}/photo",
+        axum::routing::post(set_photo)
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_PHOTO_BYTES))
+            .delete(remove_photo),
+    )
 }

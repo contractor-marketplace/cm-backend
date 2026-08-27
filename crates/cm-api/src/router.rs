@@ -63,6 +63,9 @@ pub fn build(state: AppState) -> Router {
             "/v1/contractors/{id}",
             patch(handlers::contractors::update_profile),
         )
+        // Merged for the same reason the job photo routes are: the upload body
+        // limit belongs to the route, not to the whole router.
+        .merge(handlers::contractors::photo_routes())
         // Messaging.
         .route("/v1/conversations", get(handlers::messaging::list))
         .route("/v1/conversations", post(handlers::messaging::start))

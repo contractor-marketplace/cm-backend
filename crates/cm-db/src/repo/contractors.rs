@@ -339,14 +339,32 @@ type AddressParts = (
     Option<String>,
 );
 
-/// The address the geocoder should resolve, assembled from the licence record.
+/// The address the geocoder should resolve.
+///
+/// The claimant's address when they have set one, the licence address
+/// otherwise. This must agree with what the profile displays: if the page
+/// showed the owner's address while the pin resolved the licence's, the map and
+/// the page would disagree about where somebody is — the same class of bug the
+/// public/precise point split exists to prevent, reintroduced from a new
+/// direction.
+///
+/// The per-column COALESCE is only safe because 0024 constrains the owner
+/// address to be all four parts or none: it can never take the owner's street
+/// and the licence's city and geocode a building that exists nowhere.
+///
+/// A LEFT JOIN, not the inner join this used to be. `owner_address_*` lives on
+/// `contractors`, and a listing with an owner address but no licence record
+/// still has an address worth resolving.
 pub async fn geocodable_address(
     conn: &mut PgConnection,
     contractor_id: Uuid,
 ) -> Result<Option<String>, AppError> {
     let row: Option<AddressParts> = sqlx::query_as(
-        "SELECT l.address_line1, l.city, l.state, l.postal_code \
-           FROM contractors c JOIN license_records l ON l.id = c.license_record_id \
+        "SELECT COALESCE(c.owner_address_line1, l.address_line1), \
+                COALESCE(c.owner_address_city, l.city), \
+                COALESCE(c.owner_address_state, l.state), \
+                COALESCE(c.owner_address_postal_code, l.postal_code) \
+           FROM contractors c LEFT JOIN license_records l ON l.id = c.license_record_id \
           WHERE c.id = $1",
     )
     .bind(contractor_id)
@@ -396,6 +414,44 @@ pub async fn claimed_by(conn: &mut PgConnection, user_id: Uuid) -> Result<Option
 
 /// Fields a claimant may edit. `verified` is deliberately absent: it is
 /// computed, and the handler rejects a request that mentions it.
+/// A contractor's own address, all four parts together.
+///
+/// One struct rather than four `Option<String>` fields because 0024 constrains
+/// them to be whole or absent, and four independent options would make the
+/// half-filled state representable in Rust even though the database refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerAddress {
+    pub line1: String,
+    pub city: String,
+    pub state: String,
+    pub postal_code: String,
+}
+
+/// What a field-level edit is asking for.
+///
+/// `Unchanged` and `Cleared` have to be distinguishable, and `Option<Option<T>>`
+/// does it at the cost of being unreadable at every call site. Every optional
+/// profile field goes through this: without it, "leave my bio alone" and
+/// "delete my bio" are the same request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Edit<T> {
+    #[default]
+    Unchanged,
+    Set(T),
+    Cleared,
+}
+
+impl<T> Edit<T> {
+    /// `(should_write, value)` — the shape the SQL below binds.
+    fn parts(self) -> (bool, Option<T>) {
+        match self {
+            Self::Unchanged => (false, None),
+            Self::Set(value) => (true, Some(value)),
+            Self::Cleared => (true, None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ProfileUpdate {
     pub bio: Option<String>,
@@ -403,6 +459,14 @@ pub struct ProfileUpdate {
     pub public_phone: Option<String>,
     pub accepts_dm: Option<bool>,
     pub address_visibility: Option<AddressVisibility>,
+    /// The claimant's own address, which REPLACES the licence address on every
+    /// read path once set. See migrations/0024 for why that reversal is
+    /// deliberate, and `geocodable_address` for the pin following it.
+    pub owner_address: Edit<OwnerAddress>,
+    /// The contractor's assertion about their own Google page, distinct from
+    /// the `google_place_url` our matcher inferred. Theirs wins.
+    pub google_review_url: Edit<String>,
+    pub yelp_url: Edit<String>,
 }
 
 pub async fn update_profile(
@@ -410,6 +474,14 @@ pub async fn update_profile(
     contractor_id: Uuid,
     update: &ProfileUpdate,
 ) -> Result<(), AppError> {
+    // The older fields keep their COALESCE semantics — absent means unchanged,
+    // and there has never been a way to clear them. The fields added in 0024
+    // use `Edit`, which can express "clear this", so each one binds a written
+    // flag alongside its value rather than relying on NULL to mean two things.
+    let (write_address, address) = update.owner_address.clone().parts();
+    let (write_google, google) = update.google_review_url.clone().parts();
+    let (write_yelp, yelp) = update.yelp_url.clone().parts();
+
     sqlx::query(
         "UPDATE contractors SET \
              bio = COALESCE($2, bio), \
@@ -417,6 +489,13 @@ pub async fn update_profile(
              public_phone = COALESCE($4, public_phone), \
              accepts_dm = COALESCE($5, accepts_dm), \
              address_visibility = COALESCE($6, address_visibility), \
+             owner_address_line1 = CASE WHEN $7 THEN $8 ELSE owner_address_line1 END, \
+             owner_address_city = CASE WHEN $7 THEN $9 ELSE owner_address_city END, \
+             owner_address_state = CASE WHEN $7 THEN $10 ELSE owner_address_state END, \
+             owner_address_postal_code = \
+                 CASE WHEN $7 THEN $11 ELSE owner_address_postal_code END, \
+             google_review_url = CASE WHEN $12 THEN $13 ELSE google_review_url END, \
+             yelp_url = CASE WHEN $14 THEN $15 ELSE yelp_url END, \
              updated_at = now() \
           WHERE id = $1",
     )
@@ -426,11 +505,76 @@ pub async fn update_profile(
     .bind(&update.public_phone)
     .bind(update.accepts_dm)
     .bind(update.address_visibility.map(|v| v.as_str()))
+    .bind(write_address)
+    .bind(address.as_ref().map(|a| a.line1.clone()))
+    .bind(address.as_ref().map(|a| a.city.clone()))
+    .bind(address.as_ref().map(|a| a.state.clone()))
+    .bind(address.as_ref().map(|a| a.postal_code.clone()))
+    .bind(write_google)
+    .bind(google)
+    .bind(write_yelp)
+    .bind(yelp)
     .execute(&mut *conn)
     .await
     .map_err(AppError::internal)?;
 
     Ok(())
+}
+
+/// Record the profile photo, returning the key it replaced so the caller can
+/// delete the old object.
+///
+/// Returning the displaced key rather than deleting here keeps this function
+/// pure database work: object deletion is a network call that can fail, and it
+/// must not be able to roll back the row that already points at the new photo.
+pub async fn set_photo(
+    conn: &mut PgConnection,
+    contractor_id: Uuid,
+    key: &str,
+    width: u32,
+    height: u32,
+) -> Result<Option<String>, AppError> {
+    // The old key is read in a CTE rather than a subquery inside RETURNING.
+    // A CTE is evaluated against the snapshot the statement started with, so it
+    // reliably yields the displaced key; a bare subquery over the same row
+    // being updated is not well defined and can hand back the value just
+    // written, which would leak the old object by reporting nothing to delete.
+    let previous: Option<String> = sqlx::query_scalar(
+        "WITH previous AS (SELECT photo_storage_key AS k FROM contractors WHERE id = $1) \
+         UPDATE contractors \
+            SET photo_storage_key = $2, photo_width = $3, photo_height = $4, updated_at = now() \
+          WHERE id = $1 \
+      RETURNING (SELECT k FROM previous)",
+    )
+    .bind(contractor_id)
+    .bind(key)
+    .bind(width as i32)
+    .bind(height as i32)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(AppError::internal)?
+    .flatten();
+
+    Ok(previous.filter(|old| old != key))
+}
+
+/// Clear the profile photo, returning the key that was there.
+pub async fn clear_photo(
+    conn: &mut PgConnection,
+    contractor_id: Uuid,
+) -> Result<Option<String>, AppError> {
+    sqlx::query_scalar(
+        "UPDATE contractors \
+            SET photo_storage_key = NULL, photo_width = NULL, photo_height = NULL, \
+                updated_at = now() \
+          WHERE id = $1 \
+      RETURNING photo_storage_key",
+    )
+    .bind(contractor_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(AppError::internal)
+    .map(Option::flatten)
 }
 
 /// Write the verified badge. Called from exactly one place in the codebase.
@@ -531,4 +675,42 @@ pub struct PublicContractor {
     pub address_state: Option<String>,
     pub trades: Vec<String>,
     pub distance_m: Option<f64>,
+    /// Google's own rating for the business this listing was matched to, and
+    /// Google's own count of the reviews behind it.
+    ///
+    /// Named for their provenance rather than as a bare `rating`, because they
+    /// are not ours and not the contractor's: they come from a third party via
+    /// the enrichment load, and a client should be able to say so. Both are
+    /// `None` for the great majority of listings, which the load never reached.
+    ///
+    /// The count is Google's total, which is usually LARGER than the number of
+    /// reviews `contractor_reviews` holds — the scrape caps at 200 per place.
+    /// See migrations/0022.
+    pub google_rating: Option<f64>,
+    pub google_review_count: Option<i32>,
+    /// The Google listing these came from, so a reader can check the match and
+    /// read the reviews the sample does not carry.
+    ///
+    /// Worth treating as load-bearing rather than decorative: the profile
+    /// asserts that a particular Google business is this licence holder, and
+    /// this link is the only way a visitor can audit that claim.
+    pub google_place_url: Option<String>,
+
+    /// True when `address_*` above came from the claimant rather than the CSLB
+    /// register, so a client can attribute it instead of implying the register
+    /// says something it does not.
+    pub address_is_owner_supplied: bool,
+    /// The licence address, always, even when the owner has overridden the
+    /// displayed one. Kept so a profile can show "on the licence: …" and a
+    /// reader can see both.
+    pub license_address_line1: Option<String>,
+    pub license_address_city: Option<String>,
+    /// Review pages the contractor asserts are theirs.
+    pub google_review_url: Option<String>,
+    pub yelp_url: Option<String>,
+    /// Their profile photo, already a public URL. `None` for the ~49,700
+    /// listings nobody has claimed.
+    pub photo_url: Option<String>,
+    pub photo_width: Option<i32>,
+    pub photo_height: Option<i32>,
 }

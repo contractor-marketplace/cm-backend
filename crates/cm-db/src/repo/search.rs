@@ -73,7 +73,7 @@ const PREDICATE: &str = "\
     AND ($6::uuid[] IS NULL OR EXISTS ( \
             SELECT 1 FROM contractor_trades ct \
              WHERE ct.contractor_id = c.id AND ct.trade_id = ANY($6))) \
-    AND ($7::text IS NULL OR c.postal_code = $7) \
+    AND ($7::text IS NULL OR COALESCE(c.owner_address_postal_code, c.postal_code) = $7) \
     AND ($8::float8 IS NULL OR c.public_point && \
          ST_MakeEnvelope($8, $9, $10, $11, 4326)::geography)";
 
@@ -105,22 +105,46 @@ fn bind_filters<'q>(
 /// changes is the published POINT, which is what `location::republish` decides.
 const SELECT: &str = "\
     SELECT c.id, c.slug, c.display_name, c.verified, c.verified_at, c.bio, \
-           c.website_url, c.public_phone, c.postal_code, c.accepts_dm, \
+           c.website_url, c.public_phone, c.accepts_dm, \
            (c.claimed_by_user_id IS NOT NULL) AS is_claimed, \
            ST_Y(c.public_point::geometry) AS lat, \
            ST_X(c.public_point::geometry) AS lon, \
            c.public_point_source, \
+           COALESCE(c.owner_address_postal_code, c.postal_code) AS postal_code, \
            l.license_no, l.status AS license_status, \
-           l.address_line1, l.city AS address_city, l.state AS address_state, \
+           COALESCE(c.owner_address_line1, l.address_line1) AS address_line1, \
+           COALESCE(c.owner_address_city, l.city) AS address_city, \
+           COALESCE(c.owner_address_state, l.state) AS address_state, \
+           (c.owner_address_line1 IS NOT NULL) AS address_is_owner_supplied, \
+           l.address_line1 AS license_address_line1, l.city AS license_address_city, \
+           c.google_review_url, c.yelp_url, \
+           c.photo_storage_key, c.photo_width, c.photo_height, \
            COALESCE(( \
                SELECT array_agg(DISTINCT t.slug ORDER BY t.slug) \
                  FROM contractor_trades ct JOIN trades t ON t.id = ct.trade_id \
                 WHERE ct.contractor_id = c.id), '{}') AS trades, \
            CASE WHEN $1::float8 IS NULL THEN NULL \
                 ELSE ST_Distance(c.public_point, \
-                     ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) END AS distance_m \
+                     ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) END AS distance_m, \
+           c.google_rating::float8 AS google_rating, c.google_review_count, \
+           c.google_place_url \
       FROM contractors c \
       LEFT JOIN license_records l ON l.id = c.license_record_id";
+
+/// Turn the stored object keys into public URLs.
+///
+/// Separate from the query for the same reason `jobs::attach_photos` is: the
+/// row reader has no access to the object store, and giving it one would put a
+/// deployment concern inside a `FromRow`. Every read path that serves a
+/// contractor to a client must call this, or profile photos go out as bare
+/// storage keys.
+pub fn attach_photo_urls(contractors: &mut [PublicContractor], url_for: impl Fn(&str) -> String) {
+    for contractor in contractors {
+        if let Some(key) = contractor.photo_url.take() {
+            contractor.photo_url = Some(url_for(&key));
+        }
+    }
+}
 
 /// A page of results plus the cursor for the next one.
 #[derive(Debug)]
@@ -264,6 +288,21 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PublicContractor {
             address_state: row.try_get("address_state")?,
             trades: row.try_get("trades")?,
             distance_m: row.try_get("distance_m")?,
+            google_rating: row.try_get("google_rating")?,
+            google_review_count: row.try_get("google_review_count")?,
+            google_place_url: row.try_get("google_place_url")?,
+            address_is_owner_supplied: row.try_get("address_is_owner_supplied")?,
+            license_address_line1: row.try_get("license_address_line1")?,
+            license_address_city: row.try_get("license_address_city")?,
+            google_review_url: row.try_get("google_review_url")?,
+            yelp_url: row.try_get("yelp_url")?,
+            // The raw object key, not yet a URL. `attach_photo_urls` rewrites
+            // it once a caller with the store is in scope, the same way
+            // `jobs::attach_photos` does — the row reader has no store and
+            // should not grow one.
+            photo_url: row.try_get("photo_storage_key")?,
+            photo_width: row.try_get("photo_width")?,
+            photo_height: row.try_get("photo_height")?,
         })
     }
 }

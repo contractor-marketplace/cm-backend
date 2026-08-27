@@ -14,6 +14,7 @@ pub mod passwords;
 pub mod profiles;
 pub mod rate_limit;
 pub mod reference;
+pub mod reviews;
 pub mod search;
 pub mod sessions;
 pub mod users;
