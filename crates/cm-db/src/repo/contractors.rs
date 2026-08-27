@@ -4,8 +4,15 @@
 //!
 //! **No query in this file selects `precise_point`.** Every read path returns
 //! `public_point` only, so a contractor whose address is protected cannot have
-//! it leaked by a projection somebody forgot to narrow. A test greps this crate
-//! to keep it that way.
+//! it leaked by a projection somebody forgot to narrow.
+//!
+//! What keeps it that way is `reads_return_the_published_point_and_never_the_
+//! precise_column` in `cm-api/tests/directory.rs`: it writes a precise point
+//! that deliberately disagrees with the published one, then drives the list,
+//! the map, a text search and a radius search and asserts all four return the
+//! published coordinates. (This comment previously claimed a test "greps this
+//! crate". None does, and none should — a grep would miss a leak arriving
+//! through a join or a view, which the behavioural test catches.)
 //!
 //! **The importer never writes claimant-owned fields.** `upsert_from_license`
 //! touches source-derived columns only, so a refresh cannot overwrite a bio.

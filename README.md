@@ -3,11 +3,18 @@
 The contractor marketplace v1 backend: Rust, axum, sqlx, PostgreSQL 16 with
 PostGIS, deployed on a single self-hosted VPS.
 
-**Current state: v1 feature-complete.** Password and Google authentication,
-CSLB licence import, background geocoding, PostGIS search and map, contractor
-claims with an auditable verified badge, and direct messaging with blocking and
-reporting. See `docs/runbook.md` to deploy it and `docs/handover.md` for what is
-and is not covered.
+**Current state: v1 feature-complete.** Password, Google and Facebook
+authentication; CSLB licence import; background geocoding; PostGIS search and
+map; contractor claims with an auditable verified badge and a moderation queue;
+a structured job board with photos; a claimant-owned profile; and ~11,000
+published Google reviews.
+
+| Document | Read it for |
+|---|---|
+| **`docs/architecture.md`** | **The whole stack and everything that has been built — start here** |
+| `docs/runbook.md` | Deploying, importing, backups, what to do when something breaks |
+| `docs/handover.md` | What is and is not covered |
+| This file | Running it locally |
 
 ## Layout
 

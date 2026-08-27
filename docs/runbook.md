@@ -2,6 +2,10 @@
 
 Everything an operator needs that is not obvious from the code.
 
+For what the system is made of and why — the stack, the crates, the schema
+invariants, the pipelines — see [`architecture.md`](architecture.md). This file
+is the procedure; that one is the map.
+
 ## First deploy, in order
 
 ```bash
