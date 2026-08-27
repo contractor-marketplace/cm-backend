@@ -61,6 +61,25 @@ async fn an_approved_claim_grants_ownership_and_the_badge(pool: PgPool) {
         .expect("reason")
         .contains("1047382"));
 
+    // The claim in the response must reflect the decision that was just made.
+    // This asserted nothing until it was added, and the endpoint was returning
+    // the claim as it stood BEFORE the decision — so every approval and every
+    // rejection reported back as still `pending` with no `decided_at`, and a
+    // moderator's client would have shown that nothing happened.
+    assert_eq!(
+        decided.json["claim"]["status"], "approved",
+        "the decision response returned a stale claim: {:?}",
+        decided.json["claim"]
+    );
+    assert!(
+        !decided.json["claim"]["decided_at"].is_null(),
+        "a decided claim must carry the time it was decided"
+    );
+    assert_eq!(
+        decided.json["claim"]["decision_note"],
+        "licence and phone check passed"
+    );
+
     let after = anyone.get(&format!("/v1/contractors/{id}")).await;
     assert_eq!(after.json["verified"], true);
     assert_eq!(after.json["is_claimed"], true);

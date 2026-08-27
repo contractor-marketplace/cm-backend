@@ -196,8 +196,22 @@ pub async fn decide(
 
     tx.commit().await.map_err(AppError::internal)?;
 
+    // Re-read rather than returning `claim`, which was loaded before the
+    // decision was written and therefore still says `pending` with no
+    // `decided_at`. Returning it made every response to an approval — and to a
+    // rejection — report the claim as still awaiting a decision, so a client
+    // rendering `claim.status` would show the moderator that nothing happened.
+    //
+    // After the commit, so what is returned is what is durably stored. If the
+    // re-read fails, the decision still stands and the caller is told the truth
+    // about it rather than being handed a stale row.
+    let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+    let decided = claims::find(&mut conn, claim_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
     Ok(Decision {
-        claim,
+        claim: decided,
         verified: outcome.verified,
         verification_reason: outcome.reason,
     })
