@@ -557,3 +557,82 @@ async fn messaging_endpoints_require_a_session_and_a_csrf_token(pool: PgPool) {
         StatusCode::FORBIDDEN
     );
 }
+
+/// A retracted message keeps its place, and only its sender may retract it.
+///
+/// The sequence is the poll cursor. If a delete removed the row, a client
+/// resuming from `after_seq` could not tell "seq 2 was deleted" from "seq 2 has
+/// not arrived yet", and would either stall or skip. So the row survives as a
+/// tombstone with its body replaced, and every seq around it is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deleted_message_keeps_its_place_in_the_sequence(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, mut owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router);
+    homeowner.register("homeowner@example.test").await;
+
+    let started = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+
+    let messages = format!("/v1/conversations/{conversation}/messages");
+    for body in ["first", "second, to be retracted", "third"] {
+        let sent = homeowner.post(&messages, json!({ "body": body })).await;
+        assert_eq!(sent.status, StatusCode::CREATED, "{:?}", sent.json);
+    }
+
+    let page = homeowner.get(&messages).await;
+    let second = page.json["messages"][1]["id"]
+        .as_str()
+        .expect("the second message")
+        .to_owned();
+
+    // The recipient may not delete what they did not write. Answered 404 rather
+    // than 403 so a probe learns nothing about what exists.
+    let refused = owner
+        .delete(&format!(
+            "/v1/conversations/{conversation}/messages/{second}"
+        ))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::NOT_FOUND,
+        "a recipient deleted the sender's message: {:?}",
+        refused.json
+    );
+
+    let removed = homeowner
+        .delete(&format!(
+            "/v1/conversations/{conversation}/messages/{second}"
+        ))
+        .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{:?}", removed.json);
+
+    // Three messages still, in the same order, with the middle one tombstoned.
+    let after = owner.get(&messages).await;
+    let rows = after.json["messages"].as_array().expect("messages");
+    assert_eq!(rows.len(), 3, "a delete left a hole in the sequence");
+
+    assert_eq!(rows[0]["seq"], 1);
+    assert_eq!(rows[0]["body"], "first");
+    assert_eq!(rows[0]["deleted"], false);
+
+    assert_eq!(rows[1]["seq"], 2, "the tombstone lost its place");
+    assert_eq!(rows[1]["body"], "[removed]");
+    assert_eq!(rows[1]["deleted"], true);
+
+    assert_eq!(rows[2]["seq"], 3);
+    assert_eq!(rows[2]["body"], "third");
+
+    // Deleting twice is not an error worth inventing state for, but it must not
+    // report success either — the row no longer matches.
+    let again = homeowner
+        .delete(&format!(
+            "/v1/conversations/{conversation}/messages/{second}"
+        ))
+        .await;
+    assert_eq!(again.status, StatusCode::NOT_FOUND);
+}

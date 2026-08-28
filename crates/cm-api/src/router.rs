@@ -74,6 +74,10 @@ pub fn build(state: AppState) -> Router {
             get(handlers::messaging::poll).post(handlers::messaging::send),
         )
         .route(
+            "/v1/conversations/{conversation_id}/messages/{message_id}",
+            axum::routing::delete(handlers::messaging::delete_message),
+        )
+        .route(
             "/v1/conversations/{conversation_id}/read",
             post(handlers::messaging::mark_read),
         )

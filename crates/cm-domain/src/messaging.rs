@@ -183,6 +183,42 @@ pub async fn poll(
     .await
 }
 
+/// Remove a message you sent.
+///
+/// Soft, always. The row keeps its `seq` and its body becomes `[removed]`, for
+/// two reasons: a hole in the sequence would make the poll cursor ambiguous —
+/// a client could not tell "message 7 was deleted" from "message 7 has not
+/// arrived yet" — and a report is investigated against the conversation, so a
+/// hard delete would let someone erase the evidence against them after the
+/// other party had already reported it.
+///
+/// Only the sender. Not the recipient, and not a moderator: taking somebody
+/// else's words off the record is a different action from retracting your own,
+/// and it is not one this product offers.
+pub async fn delete_message(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    message_id: Uuid,
+    sender: Uuid,
+) -> Result<(), AppError> {
+    let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+
+    // 404 before anything else, so a non-participant cannot probe for the
+    // existence of a conversation by trying to delete out of it.
+    if !messaging::is_participant(&mut conn, conversation_id, sender).await? {
+        return Err(AppError::NotFound);
+    }
+
+    // The repo puts sender and conversation in the WHERE clause, so a
+    // participant deleting somebody else's message matches no row and is told
+    // the same thing as a stranger.
+    if !messaging::soft_delete(&mut conn, conversation_id, message_id, sender).await? {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(())
+}
+
 pub async fn mark_read(
     pool: &PgPool,
     conversation_id: Uuid,

@@ -114,6 +114,18 @@ pub async fn send(
     Ok((StatusCode::CREATED, Json(message)))
 }
 
+/// Retract a message you sent. Soft — the sequence keeps its place.
+pub async fn delete_message(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path((conversation_id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    cm_domain::messaging::delete_message(&state.pool, conversation_id, message_id, caller.user.id)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReadRequest {
     pub up_to_seq: i64,
