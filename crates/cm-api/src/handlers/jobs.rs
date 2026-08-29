@@ -287,6 +287,17 @@ pub async fn mine(
     Ok(Json(jobs::for_poster(&mut conn, caller.user.id).await?))
 }
 
+/// Put a closed job back on the board. 409 for a cancelled one.
+pub async fn reopen(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    cm_domain::jobs::reopen(&state.pool, caller.user.id, id, context.request_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CloseRequest {
     /// "closed" (the work is handled) or "cancelled" (never mind).

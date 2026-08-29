@@ -787,3 +787,97 @@ async fn cancelling_a_job_removes_its_photos(pool: PgPool) {
         .expect("count");
     assert_eq!(kept, 1, "a completed job keeps its record");
 }
+
+/// A closed job can be put back on the board; a cancelled one cannot.
+///
+/// The asymmetry is the point. Closing takes nothing away, so it is safe to
+/// undo — a poster who closed in haste, or whose contractor fell through, gets
+/// their listing back. Cancelling deletes the photos from the object store, and
+/// nothing can undelete them, so reopening would republish a job quietly
+/// missing the pictures a contractor was meant to see.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_closed_job_can_be_reopened_but_a_cancelled_one_cannot(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("reopen@example.test").await;
+
+    let job = homeowner.post("/v1/jobs", a_job()).await.json["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // Closed, then off the public board.
+    let closed = homeowner
+        .post(
+            &format!("/v1/jobs/{job}/close"),
+            json!({ "status": "closed" }),
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT, "{:?}", closed.json);
+    assert_eq!(
+        Client::new(router.clone())
+            .get(&format!("/v1/jobs/{job}"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "a closed job stays on the public board"
+    );
+
+    let reopened = homeowner
+        .post(&format!("/v1/jobs/{job}/reopen"), json!({}))
+        .await;
+    assert_eq!(
+        reopened.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        reopened.json
+    );
+
+    let public = Client::new(router.clone())
+        .get(&format!("/v1/jobs/{job}"))
+        .await;
+    assert_eq!(
+        public.status,
+        StatusCode::OK,
+        "reopening did not republish it"
+    );
+    assert_eq!(public.json["status"], "open");
+
+    // Reopening an already-open job changes nothing and says so.
+    let again = homeowner
+        .post(&format!("/v1/jobs/{job}/reopen"), json!({}))
+        .await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+
+    // Cancelled is a one-way door.
+    let cancelled = homeowner
+        .post(
+            &format!("/v1/jobs/{job}/close"),
+            json!({ "status": "cancelled" }),
+        )
+        .await;
+    assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
+
+    let refused = homeowner
+        .post(&format!("/v1/jobs/{job}/reopen"), json!({}))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "a cancelled job was reopened, and its photos are already gone: {:?}",
+        refused.json
+    );
+
+    // Somebody else's job is not found, not forbidden.
+    let mut other = Client::new(router);
+    other.register("nosy@example.test").await;
+    assert_eq!(
+        other
+            .post(&format!("/v1/jobs/{job}/reopen"), json!({}))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}

@@ -219,6 +219,46 @@ pub async fn post(
 /// A job that belongs to somebody else answers 404 rather than 403 — the same
 /// rule claims use, because "that is not yours" already tells a stranger the id
 /// is real.
+/// Put a closed job back on the board.
+///
+/// Only from `closed`. A cancelled job cannot come back: cancelling deletes its
+/// photos from the object store outright, and nothing here can undelete them —
+/// reopening one would republish a listing quietly missing the pictures the
+/// contractor was meant to see. The refusal says so rather than 404-ing, since
+/// the poster is looking straight at the job and knows it exists.
+pub async fn reopen(
+    pool: &PgPool,
+    poster: Uuid,
+    job_id: Uuid,
+    request_id: Option<String>,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::internal)?;
+
+    match jobs::poster_of(&mut tx, job_id).await? {
+        Some(owner) if owner == poster => {}
+        _ => return Err(AppError::NotFound),
+    }
+
+    if !jobs::reopen(&mut tx, job_id, poster).await? {
+        return Err(AppError::conflict(
+            "Only a closed job can be reopened. A cancelled job had its photos \
+             deleted, so it cannot be put back — post it again instead.",
+        ));
+    }
+
+    audit::record(
+        &mut tx,
+        AuditEvent::new("job.reopened", "jobs")
+            .actor(ActorKind::User, Some(poster))
+            .subject(job_id)
+            .request_id(request_id),
+    )
+    .await?;
+
+    tx.commit().await.map_err(AppError::internal)?;
+    Ok(())
+}
+
 pub async fn close(
     pool: &PgPool,
     store: &Store,

@@ -500,6 +500,30 @@ pub async fn close(
     Ok(result.rows_affected() == 1)
 }
 
+/// Put a closed job back on the board.
+///
+/// `status = 'closed'` in the WHERE clause, not `<> 'open'`, and that is the
+/// whole safety property: a **cancelled** job has already had its photos
+/// deleted from the object store, so reopening one would restore a listing that
+/// silently lost its pictures. Closed is reversible because closing takes
+/// nothing away; cancelled is not.
+///
+/// `closed_at` goes back to NULL so the row does not claim to be both open and
+/// closed at a time.
+pub async fn reopen(conn: &mut PgConnection, id: Uuid, poster: Uuid) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        "UPDATE jobs SET status = 'open', closed_at = NULL, updated_at = now() \
+          WHERE id = $1 AND posted_by_user_id = $2 AND status = 'closed'",
+    )
+    .bind(id)
+    .bind(poster)
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(result.rows_affected() == 1)
+}
+
 /// Who posted a job, for an ownership check that must not leak the job itself.
 pub async fn poster_of(conn: &mut PgConnection, id: Uuid) -> Result<Option<Uuid>, AppError> {
     sqlx::query_scalar("SELECT posted_by_user_id FROM jobs WHERE id = $1")
