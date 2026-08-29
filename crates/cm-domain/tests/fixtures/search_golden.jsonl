@@ -1,0 +1,23 @@
+{"query": "ibarra", "intent": "exact business name; two businesses share the surname", "relevant": {"1047382": 3, "1047383": 2}}
+{"query": "ibara", "intent": "one letter dropped; the trigram index has to carry this", "relevant": {"1047382": 3, "1047383": 2}}
+{"query": "stillwater plumbing", "intent": "full business name, two words", "relevant": {"771204": 3}}
+{"query": "meridian electric", "intent": "a name two electricians share; the better-established one should lead", "relevant": {"983311": 3, "983314": 2}}
+{"query": "reinholt", "intent": "an expired licence is still findable by name", "relevant": {"445190": 3}}
+{"query": "summit roofing", "intent": "full name", "relevant": {"445191": 3}}
+{"query": "keystone", "intent": "distinctive single word", "relevant": {"1047384": 3}}
+{"query": "verdant", "intent": "distinctive single word", "relevant": {"662010": 3}}
+{"query": "electrician", "intent": "trade word, in no business name; needs the taxonomy rather than the text", "relevant": {"983311": 3, "983312": 3, "983313": 3, "983314": 3}}
+{"query": "plumber", "intent": "trade word; 'Plumbing' appears in names but 'plumber' does not", "relevant": {"771204": 3, "771205": 3, "771206": 3}}
+{"query": "roofer", "intent": "trade word", "relevant": {"445190": 2, "445191": 3}}
+{"query": "painter", "intent": "trade word", "relevant": {"553001": 3}}
+{"query": "landscaper", "intent": "trade word", "relevant": {"662010": 3}}
+{"query": "general contractor", "intent": "trade phrase", "relevant": {"1047382": 3, "1047383": 3, "1047384": 3}}
+{"query": "water heater", "intent": "a homeowner describes the problem, not the trade; routes to plumbing", "relevant": {"771204": 3, "771205": 3, "771206": 3}}
+{"query": "rewire", "intent": "a job word that routes to electricians", "relevant": {"983311": 3, "983312": 3, "983313": 3, "983314": 3}}
+{"query": "air conditioning", "intent": "C-20 is a real CSLB class that is not a seeded trade; this is the taxonomy gap", "relevant": {"880455": 3}}
+{"query": "hvac", "intent": "the same gap, by its common abbreviation", "relevant": {"880455": 3}}
+{"query": "adu", "intent": "an accessory dwelling unit is general-contractor work", "relevant": {"1047382": 3, "1047383": 3, "1047384": 3}}
+{"query": "leaking pipe", "intent": "natural language, two words, routes to plumbing", "relevant": {"771204": 3, "771205": 3, "771206": 3}}
+{"query": "solar", "intent": "C-46, another unseeded class", "relevant": {"991777": 3}}
+{"query": "90042", "intent": "a ZIP typed into the search box rather than the ZIP filter", "relevant": {"1047382": 3, "983313": 3, "445191": 3}}
+{"query": "zzzzznotarealbusiness", "intent": "a query that should match nothing; guards against a change that makes everything match", "relevant": {}}

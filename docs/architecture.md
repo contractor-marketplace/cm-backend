@@ -379,6 +379,30 @@ trigram fallback so a near-miss on a business name still finds it. The map has a
 hard cap of 500 points and reports `truncated: true` rather than returning a
 silently partial map.
 
+The fallback is **word** similarity (`<%`), not whole-string similarity (`%`),
+and the distinction is the whole feature. `%` scores the query against the
+entire column: "ibara" against "Ibarra & Daughters Construction" scores 0.161
+against a 0.3 threshold and does not match — nor does any other typo in any
+other multi-word business name, which is nearly all of them. The fallback was
+advertised and did not work. `<%` scores against the closest word instead, gives
+0.667 on that pair, and serves from the same `contractors_name_trgm` GIN index.
+
+### Relevance is measured, not asserted
+
+`cm-domain/tests/search_quality.rs` scores a graded golden set —
+`tests/fixtures/search_golden.jsonl`, 23 queries with hand-labelled relevance
+judgements — against a 16-business corpus, and fails the build if mean NDCG@10
+or Recall@20 drops below a pinned floor. The floors are measurements: they were
+read off a run and are raised in the same commit as the change that earns them.
+It is what makes "did that ranking change help?" a number rather than an
+argument, and it is how the `%`/`<%` defect above was found and then shown
+fixed (0.468 → 0.607 NDCG@10, 0.471 → 0.623 Recall@20).
+
+Nine of the 23 queries still score zero — `plumber` before the fix, and still
+`roofer`, `water heater`, `hvac`, `adu`, `solar`. Those are the taxonomy and
+synonym gaps: only 6 of ~80 CSLB classifications are seeded as trades, so a
+licence in any other class carries no trade at all.
+
 ---
 
 ## 12. The HTTP surface
@@ -480,7 +504,7 @@ Credentials live at `/etc/cm-backend/env` (service) and
 
 ## 15. Testing
 
-225 test functions. Every database test runs against a **real PostgreSQL 16 with
+333 test functions. Every database test runs against a **real PostgreSQL 16 with
 PostGIS** — there is no mocked database anywhere in the suite, on purpose.
 
 | Area | What is covered |
@@ -494,6 +518,7 @@ PostGIS** — there is no mocked database anywhere in the suite, on purpose.
 | `cm-api/tests/jobs.rs` | Intake validation, photo upload, EXIF stripping |
 | `cm-api/tests/directory.rs` | Search, pagination, location projection |
 | `cm-domain/tests/import.rs` | CSLB import, versioning, idempotence |
+| `cm-domain/tests/search_quality.rs` | Ranking quality: NDCG@10 and Recall@20 against a graded golden set |
 | `cm-server/tests/schema_gate.rs` | `serve` refusing a stale schema |
 
 The one that matters most: **`the_stored_image_carries_no_metadata`** builds a

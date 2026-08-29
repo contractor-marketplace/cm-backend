@@ -32,7 +32,23 @@ fn options(config: &DatabaseConfig) -> Result<PgPoolOptions, AppError> {
         // A connection idle for half an hour on a box this size is memory we
         // would rather have back.
         .idle_timeout(Duration::from_secs(30 * 60))
-        .max_lifetime(Duration::from_secs(60 * 60)))
+        .max_lifetime(Duration::from_secs(60 * 60))
+        // The fuzzy-name threshold is session state that the `<%` operator
+        // reads, so it has to be set on every connection rather than once. A
+        // connection that misses this searches more strictly than the rest of
+        // the pool, which would show up as a business being findable or not
+        // depending on which connection served the request.
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query(&format!(
+                    "SET pg_trgm.word_similarity_threshold = {}",
+                    crate::repo::search::WORD_SIMILARITY_THRESHOLD
+                ))
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        }))
 }
 
 fn connect_options(config: &DatabaseConfig) -> Result<PgConnectOptions, AppError> {
