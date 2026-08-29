@@ -881,3 +881,52 @@ async fn a_closed_job_can_be_reopened_but_a_cancelled_one_cannot(pool: PgPool) {
         StatusCode::NOT_FOUND
     );
 }
+
+/// Photos reach every list, not only the detail page.
+///
+/// They did not: `detail` attached them and `list` and `mine` did not, so the
+/// board served `photos: []` for a job that had pictures. A contractor scanning
+/// the board saw a job with no photos and scrolled past it, and the poster's
+/// own list could not count them either. Nothing failed — the field was just
+/// always empty, which is the kind of bug that survives a long time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn photos_reach_the_board_and_the_posters_list(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("gallery@example.test").await;
+
+    let job = homeowner.post("/v1/jobs", a_job()).await.json["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    for _ in 0..2 {
+        let uploaded = homeowner
+            .post_file(&format!("/v1/jobs/{job}/photos"), a_tiny_png())
+            .await;
+        assert_eq!(uploaded.status, StatusCode::CREATED, "{:?}", uploaded.json);
+    }
+
+    // The public board, which is where this was broken.
+    let board = Client::new(router).get("/v1/jobs").await;
+    let listed = &board.json["jobs"][0];
+    assert_eq!(listed["id"], job);
+    assert_eq!(
+        listed["photos"].as_array().map(Vec::len),
+        Some(2),
+        "the board served a job with photos as though it had none: {:?}",
+        listed["photos"]
+    );
+    assert!(
+        listed["photos"][0]["url"]
+            .as_str()
+            .is_some_and(|u| !u.is_empty()),
+        "a photo on the board carries no URL, so it cannot render"
+    );
+
+    // And the poster's own list.
+    let mine = homeowner.get("/v1/me/jobs").await;
+    assert_eq!(mine.json[0]["photos"].as_array().map(Vec::len), Some(2));
+}

@@ -340,8 +340,11 @@ pub async fn list(
 /// would return one row per job per photo, and the keyset cursor counts rows —
 /// page two would begin in the middle of a job. `url` is built here rather than
 /// stored, so moving the bucket is a config change and not a data migration.
-pub fn attach_photos(
-    jobs: &mut [PublicJob],
+/// Takes anything that yields `&mut PublicJob` rather than a slice, so the
+/// poster's own list — `Vec<OwnerJob>`, which merely contains a `PublicJob` —
+/// can be filled in without first copying it apart.
+pub fn attach_photos<'a>(
+    jobs: impl IntoIterator<Item = &'a mut PublicJob>,
     rows: Vec<crate::repo::job_photos::PhotoRow>,
     url_for: impl Fn(&str) -> String,
 ) {

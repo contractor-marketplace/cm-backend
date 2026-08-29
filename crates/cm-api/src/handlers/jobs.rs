@@ -164,13 +164,21 @@ pub async fn list(
     };
 
     let query = cm_domain::jobs::parse(&raw, trade_ids)?;
-    let page = jobs::list(
+    let mut page = jobs::list(
         &mut conn,
         &query.filters,
         query.limit,
         query.cursor.as_ref(),
     )
     .await?;
+
+    // One query for the whole page, not one per job. Without this the board
+    // served `photos: []` for every listing while the detail page showed them,
+    // so a job with pictures looked like a job without any — which is the
+    // difference between a contractor replying and scrolling past.
+    let ids: Vec<Uuid> = page.jobs.iter().map(|job| job.id).collect();
+    let photos = job_photos::for_jobs(&mut conn, &ids).await?;
+    jobs::attach_photos(&mut page.jobs, photos, |key| state.store.url_for(key));
 
     Ok(Json(ListResponse {
         jobs: page.jobs,
@@ -284,7 +292,15 @@ pub async fn mine(
     CurrentUser(caller): CurrentUser,
 ) -> Result<Json<Vec<OwnerJob>>, AppError> {
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    Ok(Json(jobs::for_poster(&mut conn, caller.user.id).await?))
+    let mut mine = jobs::for_poster(&mut conn, caller.user.id).await?;
+
+    let ids: Vec<Uuid> = mine.iter().map(|job| job.public.id).collect();
+    let photos = job_photos::for_jobs(&mut conn, &ids).await?;
+    jobs::attach_photos(mine.iter_mut().map(|job| &mut job.public), photos, |key| {
+        state.store.url_for(key)
+    });
+
+    Ok(Json(mine))
 }
 
 /// Put a closed job back on the board. 409 for a cancelled one.
