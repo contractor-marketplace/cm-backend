@@ -509,6 +509,20 @@ pub async fn poster_of(conn: &mut PgConnection, id: Uuid) -> Result<Option<Uuid>
         .map_err(AppError::internal)
 }
 
+/// Who posted a job, but only while it is still open.
+///
+/// The status is in the WHERE clause rather than checked afterwards so a closed
+/// job is indistinguishable from one that never existed — a contractor must not
+/// be able to tell the difference by whether contacting the poster is refused
+/// or merely not found.
+pub async fn open_job_poster(conn: &mut PgConnection, id: Uuid) -> Result<Option<Uuid>, AppError> {
+    sqlx::query_scalar("SELECT posted_by_user_id FROM jobs WHERE id = $1 AND status = 'open'")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(AppError::internal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
