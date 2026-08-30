@@ -253,6 +253,9 @@ pub struct Page<T> {
 }
 
 pub const MAX_PAGE: i64 = 50;
+/// The hard ceiling on map points, matching the contractor map. A zoomed-out
+/// viewport degrades honestly rather than returning a silently partial map.
+pub const MAX_MAP_POINTS: i64 = 500;
 pub const DEFAULT_PAGE: i64 = 20;
 
 /// Which rows exist. The list and the detail query share it so they can never
@@ -285,10 +288,12 @@ const SELECT_JOB: &str = "\
       LEFT JOIN trades t ON t.id = j.trade_id \
       JOIN users u ON u.id = j.posted_by_user_id";
 
-fn bind_filters<'q>(
-    query: sqlx::query::QueryAs<'q, sqlx::Postgres, JobRow, sqlx::postgres::PgArguments>,
+/// Generic over the row, so the board and the map bind the shared predicate
+/// the same way rather than each keeping its own copy of the order.
+fn bind_filters<'q, T>(
+    query: sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments>,
     filters: &'q Filters,
-) -> sqlx::query::QueryAs<'q, sqlx::Postgres, JobRow, sqlx::postgres::PgArguments> {
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments> {
     query
         .bind(filters.near.map(|n| n.lon))
         .bind(filters.near.map(|n| n.lat))
@@ -332,6 +337,76 @@ pub async fn list(
             .collect::<Result<_, _>>()?,
         next_cursor: next,
     })
+}
+
+/// One pin on the jobs map.
+///
+/// Narrower than the board row on purpose: a map needs a position and enough
+/// to label it, and shipping the description and photo set for five hundred
+/// pins is bytes nobody reads.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobPoint {
+    pub id: Uuid,
+    pub title: String,
+    pub trade: Option<String>,
+    pub lat: f64,
+    pub lon: f64,
+    pub budget_min_cents: Option<i64>,
+    pub budget_max_cents: Option<i64>,
+}
+
+/// Map points: the same predicate as the board, a narrower projection, a cap.
+///
+/// This exists because deriving pins from the loaded page is wrong, and the
+/// contractor side already learned that: a board page holds twenty jobs and the
+/// map was drawing twenty pins however many matched, so a map of the county
+/// showed a fifth of the work available on it. The list and the map share
+/// `PREDICATE`, so they cannot disagree about which jobs exist.
+pub async fn map_points(
+    conn: &mut PgConnection,
+    filters: &Filters,
+    limit: i64,
+) -> Result<(Vec<JobPoint>, bool), AppError> {
+    let limit = limit.clamp(1, MAX_MAP_POINTS);
+
+    let sql = format!(
+        "SELECT j.id, j.title, t.slug AS trade, \
+                ST_Y(j.public_point::geometry) AS lat, \
+                ST_X(j.public_point::geometry) AS lon, \
+                j.budget_min_cents, j.budget_max_cents \
+           FROM jobs j \
+           LEFT JOIN trades t ON t.id = j.trade_id \
+          WHERE {PREDICATE} AND j.public_point IS NOT NULL \
+          ORDER BY j.created_at DESC, j.id DESC LIMIT $6"
+    );
+
+    let mut points: Vec<JobPoint> = bind_filters(sqlx::query_as(&sql), filters)
+        .bind(limit + 1)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(AppError::internal)?;
+
+    let truncated = points.len() as i64 > limit;
+    if truncated {
+        points.pop();
+    }
+
+    Ok((points, truncated))
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for JobPoint {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            id: row.try_get("id")?,
+            title: row.try_get("title")?,
+            trade: row.try_get("trade")?,
+            lat: row.try_get("lat")?,
+            lon: row.try_get("lon")?,
+            budget_min_cents: row.try_get("budget_min_cents")?,
+            budget_max_cents: row.try_get("budget_max_cents")?,
+        })
+    }
 }
 
 /// Fill in the photos for a set of jobs, in one query.

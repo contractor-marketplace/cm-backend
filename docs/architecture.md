@@ -447,6 +447,30 @@ Three findings from measuring, all of which looked like the opposite before:
   endpoint. The isolated query inlined a scalar subquery for the trade id, and
   that was enough to change the plan. The `EXISTS` stayed.
 
+### The maps
+
+Both maps have their own endpoint — `GET /v1/contractors/map` and
+`GET /v1/jobs/map` — sharing the shared predicate with the list beside them, so
+neither can disagree with its board about which rows exist. Both cap at 500
+points and report `truncated` rather than returning a silently partial map.
+
+The jobs map is new, and replaces pins derived from the loaded board page. A
+page holds twenty jobs, so a map drawn from it showed twenty pins however many
+matched: a map of the county displaying a fifth of the work on it, with nothing
+to say so. The contractor side had already learned this and solved it the same
+way.
+
+Both maps now report `ignored_filters`, which only the lists used to. Both
+surfaces parse the same query with the same function, so a ZIP rejected by one
+was rejected by both — but only one said so, which reads as the map disagreeing
+rather than as one filter being dropped.
+
+`bbox` is a real filter now rather than a plumbed-through parameter nothing
+sent: the front end reports the viewport after the person stops moving the map
+and offers to search it. Auto-fitting the map to its results is switched off
+while it is driving the search, because refetching produces new pins, refitting
+to them moves the map, and moving the map refetches.
+
 ### Pagination
 
 Keyset, never `OFFSET` — which both scans what it skips and duplicates rows when
@@ -635,7 +659,7 @@ Credentials live at `/etc/cm-backend/env` (service) and
 
 ## 15. Testing
 
-364 test functions. Every database test runs against a **real PostgreSQL 16 with
+367 test functions. Every database test runs against a **real PostgreSQL 16 with
 PostGIS** — there is no mocked database anywhere in the suite, on purpose.
 
 | Area | What is covered |

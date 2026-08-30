@@ -147,6 +147,15 @@ pub struct MapResponse {
     /// omits pins is worse than one that says it is showing a subset.
     truncated: bool,
     limit: i64,
+    /// Filters that could not be parsed and were dropped.
+    ///
+    /// The list has always reported these and the map never did, though both
+    /// parse the same query with the same function. A visitor whose ZIP was
+    /// rejected saw the note beside the results and nothing beside the map,
+    /// which reads as the map disagreeing rather than as one filter being
+    /// ignored by both.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ignored_filters: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +210,7 @@ pub async fn map(
         points,
         truncated,
         limit: search::MAX_MAP_POINTS,
+        ignored_filters: request.ignored,
     }))
 }
 

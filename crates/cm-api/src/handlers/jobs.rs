@@ -190,6 +190,57 @@ pub async fn list(
     }))
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct MapResponse {
+    pub points: Vec<cm_db::repo::jobs::JobPoint>,
+    pub truncated: bool,
+    pub limit: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_filters: Vec<String>,
+}
+
+/// Every open job that matches, as pins.
+///
+/// Separate from the board for the reason the contractor map is separate from
+/// the directory: a board page holds twenty jobs, and a map drawn from it shows
+/// twenty pins however many matched. The two share `PREDICATE`, so they cannot
+/// disagree about which jobs exist — only about how many of them fit.
+pub async fn map(
+    State(state): State<AppState>,
+    Query(raw): Query<cm_domain::jobs::RawQuery>,
+) -> Result<Json<MapResponse>, AppError> {
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+
+    let trade_ids = match raw
+        .trade
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        Some(list) => {
+            let slugs: Vec<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|slug| !slug.is_empty())
+                .map(str::to_owned)
+                .collect();
+            reference::trade_ids_for_slugs(&mut conn, &slugs).await?
+        }
+        None => Vec::new(),
+    };
+
+    let query = cm_domain::jobs::parse(&raw, trade_ids)?;
+    let (points, truncated) =
+        jobs::map_points(&mut conn, &query.filters, jobs::MAX_MAP_POINTS).await?;
+
+    Ok(Json(MapResponse {
+        points,
+        truncated,
+        limit: jobs::MAX_MAP_POINTS,
+        ignored_filters: query.ignored,
+    }))
+}
+
 pub async fn detail(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -360,5 +411,6 @@ pub async fn close(
 pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/jobs", axum::routing::get(list))
+        .route("/v1/jobs/map", axum::routing::get(map))
         .route("/v1/jobs/{id}", axum::routing::get(detail))
 }

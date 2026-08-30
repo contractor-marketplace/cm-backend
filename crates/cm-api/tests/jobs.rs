@@ -930,3 +930,88 @@ async fn photos_reach_the_board_and_the_posters_list(pool: PgPool) {
     let mine = homeowner.get("/v1/me/jobs").await;
     assert_eq!(mine.json[0]["photos"].as_array().map(Vec::len), Some(2));
 }
+
+/// The board and the map must agree about which jobs exist, and the map must
+/// show all of them rather than the page the board happens to be on.
+///
+/// Deriving pins from the loaded list is the bug this endpoint exists to fix:
+/// a board page holds twenty jobs, so a map drawn from it showed twenty pins
+/// however many matched — a map of the county displaying a fifth of the work
+/// on it, with nothing to say so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_jobs_map_shows_every_match_not_the_current_page(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("mapper@example.com").await;
+    let poster = common::user_id(&pool, "mapper@example.com").await;
+    common::seed_jobs(&pool, poster, 25, "90042").await;
+
+    let mut client = Client::new(router(pool));
+
+    // One page of the board.
+    let board = client.get("/v1/jobs?limit=5").await;
+    assert_eq!(board.status, StatusCode::OK, "{:?}", board.json);
+    assert_eq!(board.json["jobs"].as_array().expect("array").len(), 5);
+
+    let map = client.get("/v1/jobs/map").await;
+    assert_eq!(map.status, StatusCode::OK, "{:?}", map.json);
+    let points = map.json["points"].as_array().expect("array");
+    assert_eq!(points.len(), 25, "the map shows every match, not a page");
+    assert_eq!(map.json["truncated"], serde_json::json!(false));
+
+    for point in points {
+        assert!(point["lat"].is_number(), "a pin needs a position: {point}");
+        assert!(point["lon"].is_number());
+        // The board's payload is not the map's: a pin needs a label, not a
+        // description and a photo set, five hundred times over.
+        assert!(point.get("description").is_none(), "{point}");
+    }
+}
+
+/// The same predicate, so a filter narrows both surfaces identically.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_jobs_map_shares_the_boards_filters(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("filters@example.com").await;
+    let poster = common::user_id(&pool, "filters@example.com").await;
+    common::seed_jobs(&pool, poster, 6, "90042").await;
+
+    let mut client = Client::new(router(pool));
+
+    let matching = client.get("/v1/jobs/map?zip=90042").await;
+    assert_eq!(matching.json["points"].as_array().expect("array").len(), 6);
+
+    let elsewhere = client.get("/v1/jobs/map?zip=90401").await;
+    assert!(elsewhere.json["points"]
+        .as_array()
+        .expect("array")
+        .is_empty());
+}
+
+/// A dropped filter is reported on the map exactly as it is on the board.
+/// Both parse the same query with the same function, and only one of them used
+/// to say so — which reads as the map disagreeing rather than as one filter
+/// being ignored by both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn both_job_surfaces_report_a_dropped_filter(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool));
+
+    for path in ["/v1/jobs?zip=banana", "/v1/jobs/map?zip=banana"] {
+        let response = client.get(path).await;
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        let empty = Vec::new();
+        let ignored: Vec<&str> = response.json["ignored_filters"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            ignored.contains(&"zip"),
+            "{path} did not report it: {:?}",
+            response.json
+        );
+    }
+}
