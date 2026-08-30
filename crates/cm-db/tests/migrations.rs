@@ -245,7 +245,12 @@ async fn uuid_primary_keys_have_no_database_default(pool: PgPool) {
 /// rather than weakening the rule, so adding a second one is a visible change.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_table_carries_created_at_and_updated_at(pool: PgPool) {
-    const EXEMPT: &[(&str, &str)] = &[("audit_log", "updated_at")];
+    const EXEMPT: &[(&str, &str)] = &[
+        ("audit_log", "updated_at"),
+        // Append-only for the same reason: an event does not change, so the
+        // column could only ever lie about when it last did.
+        ("search_events", "updated_at"),
+    ];
 
     let missing: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, col.col \

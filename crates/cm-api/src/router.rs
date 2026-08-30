@@ -47,6 +47,9 @@ pub fn build(state: AppState) -> Router {
         // Jobs a homeowner posts. The board itself is public; these are not.
         .route("/v1/jobs", post(handlers::jobs::post_job))
         .route("/v1/me/jobs", get(handlers::jobs::mine))
+        // The board ordered for the contractor asking. Separate from the
+        // public board, which deliberately has no notion of who is asking.
+        .route("/v1/me/jobs/feed", get(handlers::jobs::feed))
         .route("/v1/jobs/{id}/close", post(handlers::jobs::close))
         .route("/v1/jobs/{id}/reopen", post(handlers::jobs::reopen))
         // Merged rather than listed inline: the upload body limit belongs to

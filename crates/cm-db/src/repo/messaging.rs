@@ -93,6 +93,12 @@ pub async fn find_or_create_dm(
     initiator: Uuid,
     recipient: Uuid,
     contractor_id: Option<Uuid>,
+    // `job_id` is the posting this conversation came from, when it came from
+    // one. Recorded so "how many contractors have replied to this posting" is
+    // answerable: it was resolved to a poster and then forgotten, which left
+    // the signal a lead feed most needs underivable — a job with nine replies
+    // is worth less to the tenth contractor than one with none.
+    job_id: Option<Uuid>,
 ) -> Result<(Conversation, bool), AppError> {
     if initiator == recipient {
         return Err(AppError::invalid(
@@ -102,8 +108,8 @@ pub async fn find_or_create_dm(
     let (lo, hi) = ordered(initiator, recipient);
 
     let inserted: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO conversations (id, kind, contractor_id, dm_lo, dm_hi, created_by) \
-         VALUES ($1, 'dm', $2, $3, $4, $5) \
+        "INSERT INTO conversations (id, kind, contractor_id, dm_lo, dm_hi, created_by, job_id) \
+         VALUES ($1, 'dm', $2, $3, $4, $5, $6) \
          ON CONFLICT DO NOTHING RETURNING id",
     )
     .bind(new_id())
@@ -111,6 +117,7 @@ pub async fn find_or_create_dm(
     .bind(lo)
     .bind(hi)
     .bind(initiator)
+    .bind(job_id)
     .fetch_optional(&mut *conn)
     .await
     .map_err(AppError::internal)?;

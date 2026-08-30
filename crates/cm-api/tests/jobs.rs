@@ -1204,3 +1204,172 @@ async fn a_junk_facet_is_dropped_and_reported(pool: PgPool) {
         );
     }
 }
+
+/// The personalised feed lives behind a session by construction, not behind a
+/// flag on the public board. The board's whole first paragraph is that it has
+/// no notion of who is asking, and a branch that served a different order to a
+/// signed-in caller would be exactly the thing it refuses to have.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lead_feed_needs_a_claimed_listing(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut anonymous = Client::new(router(pool.clone()));
+
+    // No session at all.
+    assert_eq!(
+        anonymous.get("/v1/me/jobs/feed").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // A signed-in account with no approved claim has no listing to fit work
+    // to, so there is no feed for it.
+    let mut homeowner = Client::new(router(pool.clone()));
+    homeowner.register("nobody@example.com").await;
+    assert_eq!(
+        homeowner.get("/v1/me/jobs/feed").await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // The public board is unchanged for everybody.
+    assert_eq!(anonymous.get("/v1/jobs").await.status, StatusCode::OK);
+}
+
+/// Work in the contractor's own trade comes first. It is the strongest signal
+/// there is — a plumber wants plumbing work — and the feed is worth nothing if
+/// it does not get that right.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_feed_leads_with_work_in_the_contractors_trade(pool: PgPool) {
+    common::seed_directory(&pool).await;
+
+    let mut contractor = Client::new(router(pool.clone()));
+    contractor.register_contractor("plumber@example.com").await;
+    let user = common::user_id(&pool, "plumber@example.com").await;
+    // Stillwater Plumbing is the C-36 in the seed set.
+    let listing = common::contractor_id(&pool, "771204").await;
+    common::force_claim(&pool, listing, user).await;
+
+    // Somebody else posts a spread of work.
+    let mut homeowner = Client::new(router(pool.clone()));
+    homeowner.register("poster@example.com").await;
+    let poster = common::user_id(&pool, "poster@example.com").await;
+    common::seed_jobs(&pool, poster, 6, "90042").await;
+
+    // Half of it is plumbing, and it is the older half — so ordering by
+    // anything but fit would put the other half first.
+    sqlx::query(
+        "UPDATE jobs SET trade_id = (SELECT id FROM trades WHERE slug = 'plumber'), \
+                         created_at = now() - interval '5 days' \
+          WHERE id IN (SELECT id FROM jobs ORDER BY created_at LIMIT 3)",
+    )
+    .execute(&pool)
+    .await
+    .expect("retrade");
+
+    let feed = contractor.get("/v1/me/jobs/feed?limit=6").await;
+    assert_eq!(feed.status, StatusCode::OK, "{:?}", feed.json);
+
+    let trades: Vec<&str> = feed.json["jobs"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|job| job["trade"].as_str().unwrap_or("none"))
+        .collect();
+
+    assert_eq!(
+        &trades[..3],
+        &["plumber", "plumber", "plumber"],
+        "the contractor's own trade must lead: {trades:?}"
+    );
+
+    // And the plain queue is still available, ordered by nothing but time.
+    let newest = contractor.get("/v1/me/jobs/feed?sort=newest&limit=6").await;
+    let newest_trades: Vec<&str> = newest.json["jobs"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|job| job["trade"].as_str().unwrap_or("none"))
+        .collect();
+    assert_ne!(
+        newest_trades, trades,
+        "sort=newest must not be the fit order"
+    );
+}
+
+/// Every page recorded is a page that can be judged later. A golden set says
+/// whether search finds the right things; only this says whether anybody
+/// opened them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn showing_a_page_records_what_was_on_it(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("watcher@example.com").await;
+    let poster = common::user_id(&pool, "watcher@example.com").await;
+    common::seed_jobs(&pool, poster, 4, "90042").await;
+
+    let mut client = Client::new(router(pool.clone()));
+    assert_eq!(client.get("/v1/jobs?limit=3").await.status, StatusCode::OK);
+    assert_eq!(
+        client.get("/v1/contractors?limit=2").await.status,
+        StatusCode::OK
+    );
+
+    let rows: Vec<(String, String, i32)> = sqlx::query_as(
+        "SELECT surface, kind, position FROM search_events ORDER BY surface, position",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("events");
+
+    let jobs: Vec<i32> = rows
+        .iter()
+        .filter(|(surface, _, _)| surface == "jobs")
+        .map(|(_, _, position)| *position)
+        .collect();
+    let directory: Vec<i32> = rows
+        .iter()
+        .filter(|(surface, _, _)| surface == "directory")
+        .map(|(_, _, position)| *position)
+        .collect();
+
+    // One row per result, positioned one-based: position 1 is the top of the
+    // page, which is what every rate is read against.
+    assert_eq!(jobs, vec![1, 2, 3]);
+    assert_eq!(directory, vec![1, 2]);
+    assert!(rows.iter().all(|(_, kind, _)| kind == "impression"));
+}
+
+/// A conversation started from a job records which job. It resolved the
+/// posting to its poster and then forgot it, which left "how many contractors
+/// have replied to this" — the signal the feed most needs — underivable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn replying_to_a_job_records_which_job(pool: PgPool) {
+    common::seed_directory(&pool).await;
+
+    let mut homeowner = Client::new(router(pool.clone()));
+    homeowner.register("owner@example.com").await;
+    let poster = common::user_id(&pool, "owner@example.com").await;
+    let jobs = common::seed_jobs(&pool, poster, 1, "90042").await;
+    let job = jobs[0];
+
+    let mut contractor = Client::new(router(pool.clone()));
+    contractor.register_contractor("replier@example.com").await;
+    let user = common::user_id(&pool, "replier@example.com").await;
+    let listing = common::contractor_id(&pool, "771204").await;
+    common::force_claim(&pool, listing, user).await;
+
+    let started = contractor
+        .post("/v1/conversations", serde_json::json!({ "job_id": job }))
+        .await;
+    assert_eq!(started.status, StatusCode::CREATED, "{:?}", started.json);
+
+    let recorded: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT job_id FROM conversations WHERE job_id IS NOT NULL")
+            .fetch_optional(&pool)
+            .await
+            .expect("query");
+
+    assert_eq!(
+        recorded,
+        Some(job),
+        "the conversation must remember its job"
+    );
+}

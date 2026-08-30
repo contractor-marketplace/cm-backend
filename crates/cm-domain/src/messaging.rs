@@ -92,7 +92,7 @@ pub async fn start_with_contractor(
     }
 
     let (conversation, created) =
-        messaging::find_or_create_dm(&mut tx, initiator, owner, Some(contractor_id)).await?;
+        messaging::find_or_create_dm(&mut tx, initiator, owner, Some(contractor_id), None).await?;
 
     if created {
         audit::record(
@@ -167,8 +167,14 @@ pub async fn start_with_job(
         return Err(AppError::Forbidden);
     }
 
-    let (conversation, created) =
-        messaging::find_or_create_dm(&mut tx, initiator, poster, Some(contractor_id)).await?;
+    let (conversation, created) = messaging::find_or_create_dm(
+        &mut tx,
+        initiator,
+        poster,
+        Some(contractor_id),
+        Some(job_id),
+    )
+    .await?;
 
     if created {
         audit::record(

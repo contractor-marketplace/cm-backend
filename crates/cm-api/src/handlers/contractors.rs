@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use cm_core::AppError;
 use cm_db::repo::contractors::{self, AddressVisibility, ProfileUpdate, PublicContractor};
-use cm_db::repo::{claims, reference, reviews, search, suggest};
+use cm_db::repo::{claims, reference, reviews, search, search_events, suggest};
 use cm_domain::search as search_input;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -106,8 +106,45 @@ pub struct SuggestQuery {
     pub q: Option<String>,
 }
 
+/// Record what a page showed, without letting that failure reach the page.
+///
+/// Deliberately swallows its error. An impression that does not get written is
+/// a gap in an analysis; a search that 500s because logging failed is an outage,
+/// and the two are not close enough in cost to treat the same way.
+async fn record_impressions(
+    conn: &mut sqlx::PgConnection,
+    surface: search_events::Surface,
+    subjects: impl IntoIterator<Item = Uuid>,
+    actor: Option<Uuid>,
+    had_query: bool,
+    sort: Option<String>,
+    request_id: Option<String>,
+) {
+    let events: Vec<search_events::Event> = subjects
+        .into_iter()
+        .enumerate()
+        .map(|(index, subject_id)| search_events::Event {
+            kind: search_events::Kind::Impression,
+            surface,
+            subject_id,
+            actor_user_id: actor,
+            // One-based: "position 1" is the top of the page, which is what
+            // every rate is read against.
+            position: (index + 1) as i32,
+            had_query,
+            sort: sort.clone(),
+            request_id: request_id.clone(),
+        })
+        .collect();
+
+    if let Err(error) = search_events::record(conn, &events).await {
+        tracing::warn!(%error, "could not record impressions");
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
+    Context(context): Context,
     Query(raw): Query<search_input::RawQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
     // One connection for the whole request. Resolving the trade filter, routing
@@ -132,6 +169,17 @@ pub async fn list(
     // Storage keys become URLs here, never in the row reader. Every read path
     // that serves a contractor has to do this or photos go out as bare keys.
     search::attach_photo_urls(&mut page.contractors, |key| state.store.url_for(key));
+
+    record_impressions(
+        &mut conn,
+        search_events::Surface::Directory,
+        page.contractors.iter().map(|c| c.id),
+        None,
+        request.filters.query.is_some(),
+        raw.sort.clone(),
+        context.request_id.clone(),
+    )
+    .await;
 
     Ok(Json(ListResponse {
         contractors: page.contractors,

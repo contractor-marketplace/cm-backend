@@ -16,6 +16,7 @@ pub mod rate_limit;
 pub mod reference;
 pub mod reviews;
 pub mod search;
+pub mod search_events;
 pub mod sessions;
 pub mod suggest;
 pub mod users;

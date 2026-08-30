@@ -227,6 +227,13 @@ pub struct OwnerJob {
 
 #[derive(Debug, Clone, Default)]
 pub struct Filters {
+    /// Who is looking, when the board knows.
+    ///
+    /// Set only for a signed-in contractor with an approved claim, and used by
+    /// `Sort::ForMe`. Everything else on the board is identical for everyone,
+    /// which is why this is a filter field rather than a parameter: the shared
+    /// predicate stays one predicate, and only the ordering changes.
+    pub viewer: Option<Viewer>,
     pub query: Option<String>,
     /// Trades the free-text query itself asked for, through the same alias
     /// vocabulary the directory uses: a contractor typing "water heater" is
@@ -262,6 +269,16 @@ pub struct Cursor {
     pub sort_key: Option<f64>,
 }
 
+/// The contractor looking at the board, and what is known about them.
+#[derive(Debug, Clone)]
+pub struct Viewer {
+    pub contractor_id: Uuid,
+    /// The trades their licence carries.
+    pub trade_ids: Vec<Uuid>,
+    /// Where they are, when they have a published point.
+    pub point: Option<(f64, f64)>,
+}
+
 /// How the board is ordered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
@@ -274,6 +291,8 @@ pub enum Sort {
     Budget,
     /// Nearest first, which needs a centre to measure from.
     Distance,
+    /// Fit to the contractor looking, which needs to know who that is.
+    ForMe,
 }
 
 pub struct Page<T> {
@@ -308,6 +327,12 @@ const PREDICATE_BINDS: usize = 10;
 
 /// The query-text slot, read by the predicate and by the relevance ordering.
 const QUERY_BIND: usize = 6;
+
+/// The first of the four viewer slots, which only the personalised ordering
+/// binds. They sit after the predicate's, so nothing else has to move.
+const VIEWER_TRADES_BIND: usize = PREDICATE_BINDS + 1;
+/// Trades, longitude, latitude, contractor id.
+const VIEWER_BIND_COUNT: usize = 4;
 
 /// The one browse projection.
 ///
@@ -368,6 +393,50 @@ fn distance_expression() -> String {
 /// decoding a `real` as an `f64` fails at the row reader rather than at the
 /// query — a 500 that says nothing about ranking. The same cast is on
 /// `quality_score` in the directory, for the same reason.
+/// How well a job fits the contractor looking at it.
+///
+/// Four terms, and each is a reason a person would give:
+///
+///   * **It is my trade** (1.0). The strongest signal there is — a plumber
+///     wants plumbing work — and weighted so nothing else overturns it.
+///   * **It is near me** (up to 0.6, decaying). Exponential rather than linear:
+///     the difference between five miles and fifteen matters, the difference
+///     between eighty and ninety does not.
+///   * **It is fresh** (up to 0.5, decaying over a fortnight). Speed to lead
+///     decides who wins the job, so an hour-old posting is worth more than a
+///     three-week-old one whatever else is true of it.
+///   * **Nobody has answered it yet** (minus, growing with replies). A job
+///     with nine conversations is worth less to the tenth contractor than one
+///     with none — this is the term that spreads leads across the supply side
+///     rather than piling every contractor onto the same posting.
+///
+/// The weights are reasoned, not measured, and that is the honest state of
+/// them: nothing here has been tuned against behaviour because there is no
+/// behaviour recorded yet. `search_events` starts that clock. Until it has
+/// enough in it, this is a defensible first guess and is labelled as one.
+///
+/// `$11`–`$14` are the viewer's trades, longitude, latitude and id.
+fn fit_expression() -> String {
+    let (trades, lon, lat, contractor) = (
+        VIEWER_TRADES_BIND,
+        VIEWER_TRADES_BIND + 1,
+        VIEWER_TRADES_BIND + 2,
+        VIEWER_TRADES_BIND + 3,
+    );
+    format!(
+        "(CASE WHEN ${trades}::uuid[] IS NOT NULL AND j.trade_id = ANY(${trades}) \
+               THEN 1.0 ELSE 0.0 END \
+          + CASE WHEN ${lon}::float8 IS NULL OR j.public_point IS NULL THEN 0.0 \
+                 ELSE 0.6 * exp(-ST_Distance(j.public_point, \
+                      ST_SetSRID(ST_MakePoint(${lon}, ${lat}), 4326)::geography) / 40000.0) END \
+          + 0.5 * exp(-EXTRACT(EPOCH FROM (now() - j.created_at)) / 1209600.0) \
+          - 0.25 * ln(1 + (SELECT count(*) FROM conversations c \
+                            WHERE c.job_id = j.id \
+                              AND c.contractor_id IS DISTINCT FROM ${contractor}::uuid)) \
+         )::float8"
+    )
+}
+
 fn relevance_expression() -> String {
     format!(
         "ts_rank_cd(j.search_doc, \
@@ -382,6 +451,7 @@ enum KeyField {
     Relevance,
     Budget,
     Distance,
+    Fit,
 }
 
 /// What the board leads with, and which way.
@@ -396,6 +466,13 @@ struct Ordering {
     field: Option<KeyField>,
     /// True when the leading key sorts descending, as budget and relevance do.
     descending: bool,
+    /// Extra parameters this ordering consumes before the tail's.
+    ///
+    /// Only the personalised ordering has any: the viewer's trades, position
+    /// and id. They sit between the predicate's slots and the cursor's, so the
+    /// tail has to number itself from what actually precedes it — the same
+    /// counting the key slot needs, for the same reason.
+    viewer_binds: usize,
 }
 
 impl Ordering {
@@ -419,6 +496,7 @@ fn ordering_for(sort: Sort, filters: &Filters) -> Ordering {
         key: Some(key),
         field: Some(field),
         descending,
+        viewer_binds: 0,
     };
 
     match sort {
@@ -431,10 +509,19 @@ fn ordering_for(sort: Sort, filters: &Filters) -> Ordering {
         }
         // A sort with nothing to sort on degrades to the queue rather than
         // ordering by a column that is NULL for every row.
-        Sort::Newest | Sort::Best | Sort::Distance => Ordering {
+        Sort::ForMe if filters.viewer.is_some() => Ordering {
+            key: Some(fit_expression()),
+            field: Some(KeyField::Fit),
+            descending: true,
+            viewer_binds: VIEWER_BIND_COUNT,
+        },
+        // Personalised order for somebody the board does not know is just the
+        // queue. Saying so beats inventing a fit from nothing.
+        Sort::Newest | Sort::Best | Sort::Distance | Sort::ForMe => Ordering {
             key: None,
             field: None,
             descending: true,
+            viewer_binds: 0,
         },
     }
 }
@@ -445,11 +532,15 @@ fn order_and_keyset(ordering: &Ordering) -> String {
     // parameter the statement never mentions is not harmless — Postgres counts
     // the placeholders it can see and refuses the extra — so the tail numbers
     // itself from what it is actually going to say.
-    let key = PREDICATE_BINDS + 1;
+    // What precedes the tail: the predicate's slots, then any the ordering
+    // itself consumes — the personalised one reads the viewer's four — then the
+    // key slot when there is one.
+    let after_viewer = PREDICATE_BINDS + ordering.viewer_binds;
+    let key = after_viewer + 1;
     let base = if ordering.key.is_some() {
         key
     } else {
-        PREDICATE_BINDS
+        after_viewer
     };
     let (at, id, limit) = (base + 1, base + 2, base + 3);
 
@@ -479,13 +570,31 @@ pub async fn list(
 ) -> Result<Page<PublicJob>, AppError> {
     let limit = limit.clamp(1, MAX_PAGE);
     let ordering = ordering_for(sort, filters);
+    // One ranked column, whose meaning follows the ordering: how well the text
+    // matched, or how well the job fits the contractor looking. Both are read
+    // back the same way to build the next cursor, so there is no second column
+    // that is NULL on every row of every other sort.
+    let ranked = match ordering.field {
+        Some(KeyField::Fit) => fit_expression(),
+        _ => relevance_expression(),
+    };
     let sql = format!(
-        "{SELECT_JOB}, {relevance} AS rank_score {FROM_JOBS} WHERE {PREDICATE} {tail}",
-        relevance = relevance_expression(),
+        "{SELECT_JOB}, {ranked} AS rank_score {FROM_JOBS} WHERE {PREDICATE} {tail}",
         tail = order_and_keyset(&ordering),
     );
 
     let query = bind_filters(sqlx::query_as(&sql), filters);
+
+    // The viewer's four, bound only by the ordering that mentions them.
+    let query = match (ordering.viewer_binds, filters.viewer.as_ref()) {
+        (0, _) | (_, None) => query,
+        (_, Some(viewer)) => query
+            .bind((!viewer.trade_ids.is_empty()).then(|| viewer.trade_ids.clone()))
+            .bind(viewer.point.map(|(lon, _)| lon))
+            .bind(viewer.point.map(|(_, lat)| lat))
+            .bind(viewer.contractor_id),
+    };
+
     // Bound only when the statement refers to it; see `order_and_keyset`.
     let query = match ordering.key {
         Some(_) => query.bind(cursor.and_then(|c| c.sort_key)),
@@ -506,7 +615,7 @@ pub async fn list(
         // Read from whichever column the ordering actually sorted by, so the
         // next page compares against the value this one stopped at.
         sort_key: match ordering.field {
-            Some(KeyField::Relevance) => r.rank_score,
+            Some(KeyField::Relevance) | Some(KeyField::Fit) => r.rank_score,
             Some(KeyField::Budget) => r.budget_max_cents.map(|cents| cents as f64),
             Some(KeyField::Distance) => r.distance_m,
             None => None,

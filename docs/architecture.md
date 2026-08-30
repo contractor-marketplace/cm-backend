@@ -7,7 +7,7 @@ Companion documents: `runbook.md` is the operational procedure (deploy order,
 imports, backups, incident response); `README.md` is how to run it locally.
 This one is the map.
 
-Accurate as of migration **0027**, 2026-08-30.
+Accurate as of migration **0028**, 2026-08-30.
 
 ---
 
@@ -103,7 +103,7 @@ cm-server      960  the binary and its subcommands
 
 ## 4. The database
 
-27 migrations, applied in order, checksummed. Editing an applied migration is
+28 migrations, applied in order, checksummed. Editing an applied migration is
 rejected — there is a test that tampers with `0001` and asserts the failure.
 
 | # | What it added |
@@ -135,6 +135,7 @@ rejected — there is a test that tampers with `0001` and asserts the failure.
 | 0025 | The words homeowners use for trades |
 | 0026 | The standing quality score the directory ranks by |
 | 0027 | A searchable, sortable, countable job board |
+| 0028 | What people did with the results, and which job a conversation is about |
 
 ### Schema invariants, enforced by tests
 
@@ -426,6 +427,36 @@ and without the flags one silently overwrites the other.
 The total is what the board never had. It could only count the rows it had
 loaded, so it said "20+ jobs" for four hundred.
 
+### The lead feed, and measuring it
+
+`GET /v1/me/jobs/feed` orders the board for the contractor asking: work in
+their trade first, then near them, then fresh, minus a term for how many
+contractors have already replied — a job with nine conversations is worth less
+to the tenth than one with none.
+
+It is a separate route rather than a flag on the public board, because that
+module's first paragraph is that the board has no notion of who is asking and
+therefore has no branch that could serve the wrong caller the wrong shape. A
+personalised order needs to know exactly that, so it lives where a session is
+required by construction.
+
+**The weights are reasoned, not measured, and that is their honest state.**
+Nothing here has been tuned against behaviour, because until now no behaviour
+was recorded. `search_events` starts that clock: one row per result shown, with
+its position, so a click-through rate per position becomes answerable. A golden
+set says whether search finds the right things; only this says whether anybody
+opens them, and a ranking whose rate is flat across positions is carrying no
+information whatever the golden set reports.
+
+Logging is best-effort by construction — every call site drops the result — on
+the grounds that a missing impression is a gap in an analysis and a search that
+500s because logging failed is an outage.
+
+Two things had to exist first. `conversations.job_id`: `start_with_job`
+resolved a posting to its poster and then forgot which posting, which left the
+competition term underivable. And `search_events` itself, which is why it ships
+in the same change as the ranking rather than after it.
+
 ### Typeahead
 
 `GET /v1/suggest?q=` answers the three things somebody can be reaching for — a
@@ -684,7 +715,7 @@ Credentials live at `/etc/cm-backend/env` (service) and
 
 ## 15. Testing
 
-371 test functions. Every database test runs against a **real PostgreSQL 16 with
+376 test functions. Every database test runs against a **real PostgreSQL 16 with
 PostGIS** — there is no mocked database anywhere in the suite, on purpose.
 
 | Area | What is covered |

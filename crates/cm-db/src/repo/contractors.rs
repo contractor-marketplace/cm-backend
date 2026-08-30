@@ -838,3 +838,36 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for RankingSignals {
         })
     }
 }
+
+/// The contractor looking at the job board, and the two things a lead feed
+/// needs to know about them: what they are licensed for, and where they are.
+///
+/// One query rather than three, because it runs on every board request from a
+/// signed-in contractor.
+pub async fn viewer_for(
+    conn: &mut PgConnection,
+    contractor_id: Uuid,
+) -> Result<Option<crate::repo::jobs::Viewer>, AppError> {
+    let row: Option<(Vec<Uuid>, Option<f64>, Option<f64>)> = sqlx::query_as(
+        "SELECT COALESCE(( \
+                    SELECT array_agg(ct.trade_id) \
+                      FROM contractor_trades ct \
+                     WHERE ct.contractor_id = c.id), '{}') AS trade_ids, \
+                ST_X(c.public_point::geometry) AS lon, \
+                ST_Y(c.public_point::geometry) AS lat \
+           FROM contractors c \
+          WHERE c.id = $1",
+    )
+    .bind(contractor_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(row.map(|(trade_ids, lon, lat)| crate::repo::jobs::Viewer {
+        contractor_id,
+        trade_ids,
+        // The published point, never the precise one — the same rule every
+        // other read path follows.
+        point: lon.zip(lat),
+    }))
+}
