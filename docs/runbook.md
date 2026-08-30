@@ -50,7 +50,7 @@ chown root:cm /etc/cm-backend/env && chmod 0640 /etc/cm-backend/env
 cm-server check-config          # proves the file parses before anything restarts
 DATABASE_URL=postgres://cm_migrate:...@127.0.0.1/cm cm-server migrate
 cm-server seed-trades
-cm-server load-regions --file deploy/data/zcta_la_county.csv --source demo_zip_centroids
+cm-server load-regions --file deploy/data/zcta_ca.csv --source census_2020_gazetteer
 systemctl enable --now cm-server cm-geocode-worker cm-verification.timer
 ```
 

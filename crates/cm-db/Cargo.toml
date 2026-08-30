@@ -15,4 +15,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Only to read the shipped ZIP-centroid file back in a test. The loader that
+# reads it in production lives in cm-server, which has its own csv dependency.
+csv.workspace = true
 tokio.workspace = true

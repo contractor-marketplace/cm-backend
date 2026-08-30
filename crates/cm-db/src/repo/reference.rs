@@ -94,6 +94,16 @@ pub struct Region {
     pub lon: f64,
 }
 
+/// Insert or refresh a ZIP-code centroid.
+///
+/// A name equal to the code is a **placeholder**, and a placeholder never
+/// overwrites a real name. The Census gazetteer — the only complete source of
+/// ZIP centroids — publishes no names at all, so a bulk load carries the code
+/// in that column; without this rule, loading it would replace "Silver Lake"
+/// with "90026" for every ZIP anyone had bothered to name.
+///
+/// The centroid and source are always refreshed: those come from the file and
+/// the file is the authority on them.
 pub async fn upsert_zcta(
     conn: &mut PgConnection,
     code: &str,
@@ -106,7 +116,9 @@ pub async fn upsert_zcta(
         "INSERT INTO regions (id, kind, code, name, centroid, source) \
          VALUES ($1, 'zcta', $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6) \
          ON CONFLICT (kind, code) DO UPDATE \
-             SET name = EXCLUDED.name, centroid = EXCLUDED.centroid, \
+             SET name = CASE WHEN EXCLUDED.name = EXCLUDED.code \
+                             THEN regions.name ELSE EXCLUDED.name END, \
+                 centroid = EXCLUDED.centroid, \
                  source = EXCLUDED.source, updated_at = now()",
     )
     .bind(new_id())

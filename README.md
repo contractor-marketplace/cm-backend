@@ -216,7 +216,7 @@ cm-server admin grant-role  --email person@example.com --role admin
 cm-server admin revoke-role --email person@example.com --role admin
 
 cm-server import-cslb --file ./LicenseMaster.csv --county "LOS ANGELES" [--dry-run]
-cm-server load-regions --file deploy/data/zcta_la_county.csv --source census
+cm-server load-regions --file deploy/data/zcta_ca.csv --source census_2020_gazetteer
 cm-server seed-trades
 cm-server recompute-verification
 cm-server geocode-worker [--once]
