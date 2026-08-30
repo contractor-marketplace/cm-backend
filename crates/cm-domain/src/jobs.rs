@@ -12,8 +12,8 @@ use cm_auth::ratelimit;
 use cm_core::{new_id, AppError, Secret};
 use cm_db::repo::audit::{self, ActorKind, AuditEvent};
 use cm_db::repo::jobs::{
-    self, BuildType, Cursor, Filters, JobStatus, JobTimeline, Near, NewJob, OwnerJob, DEFAULT_PAGE,
-    MAX_PAGE,
+    self, BuildType, Cursor, Filters, JobStatus, JobTimeline, Near, NewJob, OwnerJob, Sort,
+    DEFAULT_PAGE, MAX_PAGE,
 };
 use cm_db::repo::{job_photos, reference};
 use cm_db::PgPool;
@@ -458,6 +458,11 @@ pub async fn remove_photo(
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct RawQuery {
+    pub q: Option<String>,
+    pub sort: Option<String>,
+    pub timeline: Option<String>,
+    pub build_type: Option<String>,
+    pub budget_min: Option<String>,
     pub trade: Option<String>,
     pub zip: Option<String>,
     pub lat: Option<String>,
@@ -468,6 +473,7 @@ pub struct RawQuery {
 }
 
 pub struct JobQuery {
+    pub sort: Sort,
     pub filters: Filters,
     pub limit: i64,
     pub cursor: Option<Cursor>,
@@ -484,6 +490,52 @@ pub fn parse(raw: &RawQuery, trade_ids: Vec<Uuid>) -> Result<JobQuery, AppError>
 
     if !trade_ids.is_empty() {
         filters.trade_ids = Some(trade_ids);
+    }
+
+    filters.query = raw
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        // Bounded so a pathological query cannot become a pathological tsquery.
+        .map(|q| q.chars().take(200).collect());
+
+    // Facet filters. Optional, so a value nobody offers is dropped and named
+    // rather than 400-ing a page somebody reached from a shared link.
+    if let Some(value) = raw
+        .timeline
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        match JobTimeline::parse_request(value) {
+            Ok(timeline) => filters.timeline = Some(timeline),
+            Err(_) => ignored.push("timeline".to_owned()),
+        }
+    }
+
+    if let Some(value) = raw
+        .build_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        match BuildType::parse_request(value) {
+            Ok(build_type) => filters.build_type = Some(build_type),
+            Err(_) => ignored.push("build_type".to_owned()),
+        }
+    }
+
+    if let Some(value) = raw
+        .budget_min
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        match value.parse::<i64>() {
+            Ok(cents) if cents >= 0 => filters.budget_min_cents = Some(cents),
+            _ => ignored.push("budget_min".to_owned()),
+        }
     }
 
     match raw.zip.as_deref().map(str::trim).filter(|z| !z.is_empty()) {
@@ -532,8 +584,30 @@ pub fn parse(raw: &RawQuery, trade_ids: Vec<Uuid>) -> Result<JobQuery, AppError>
         None => None,
     };
 
+    // Structural, like the page size: silently ignoring an unknown sort would
+    // return the wrong order and look like the board is broken.
+    let sort = match raw.sort.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("newest") => Sort::Newest,
+        Some("best") => Sort::Best,
+        Some("budget") => Sort::Budget,
+        Some("distance") => {
+            if filters.near.is_none() {
+                return Err(AppError::invalid(
+                    "sort=distance needs lat and lon to measure from",
+                ));
+            }
+            Sort::Distance
+        }
+        Some(other) => {
+            return Err(AppError::invalid(format!(
+                "unknown sort \"{other}\"; expected newest, best, budget or distance"
+            )))
+        }
+    };
+
     Ok(JobQuery {
         filters,
+        sort,
         limit,
         cursor,
         ignored,
@@ -551,9 +625,14 @@ fn parse_f64(value: Option<&str>) -> Option<f64> {
 /// Opaque on purpose: a client that can read the sort key starts constructing
 /// cursors, and then the encoding is a contract.
 pub fn encode_cursor(cursor: &Cursor) -> String {
+    let key = cursor
+        .sort_key
+        .map(|value| value.to_string())
+        .unwrap_or_default();
     URL_SAFE_NO_PAD.encode(format!(
-        "{}\u{0}{}",
+        "{}\u{0}{}\u{0}{}",
         cursor.id,
+        key,
         cursor.created_at.to_rfc3339()
     ))
 }
@@ -563,10 +642,26 @@ pub fn decode_cursor(value: &str) -> Result<Cursor, AppError> {
 
     let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| invalid())?;
     let text = String::from_utf8(decoded).map_err(|_| invalid())?;
-    let (id, created_at) = text.split_once('\u{0}').ok_or_else(invalid)?;
+
+    // id \0 sort key \0 posted-at. A cursor from before the board could be
+    // sorted has two fields and is refused rather than half-understood:
+    // resuming a budget ordering from a timestamp is the defect the key exists
+    // to prevent.
+    let (id, rest) = text.split_once('\u{0}').ok_or_else(invalid)?;
+    let (key, created_at) = rest.split_once('\u{0}').ok_or_else(invalid)?;
+
+    let sort_key = if key.is_empty() {
+        None
+    } else {
+        Some(key.parse::<f64>().map_err(|_| invalid())?)
+    };
+    if sort_key.is_some_and(|value| !value.is_finite()) {
+        return Err(invalid());
+    }
 
     Ok(Cursor {
         id: Uuid::parse_str(id).map_err(|_| invalid())?,
+        sort_key,
         created_at: DateTime::parse_from_rfc3339(created_at)
             .map_err(|_| invalid())?
             .with_timezone(&Utc),
@@ -633,12 +728,34 @@ mod tests {
         let cursor = Cursor {
             id: new_id(),
             created_at: Utc::now(),
+            sort_key: Some(825_000.0),
         };
         let decoded = decode_cursor(&encode_cursor(&cursor)).expect("round trip");
         assert_eq!(decoded.id, cursor.id);
+        assert_eq!(decoded.sort_key, cursor.sort_key);
         assert_eq!(
             decoded.created_at.timestamp_micros(),
             cursor.created_at.timestamp_micros()
         );
+
+        // Newest-first leads with the posting time and carries no other key.
+        let queue = Cursor {
+            id: new_id(),
+            created_at: Utc::now(),
+            sort_key: None,
+        };
+        assert_eq!(
+            decode_cursor(&encode_cursor(&queue))
+                .expect("round trip")
+                .sort_key,
+            None
+        );
+
+        // A cursor from before the board could be sorted has two fields, not
+        // three. Resuming a budget ordering from a timestamp is the defect the
+        // key exists to prevent, so the old shape is refused.
+        let previous =
+            URL_SAFE_NO_PAD.encode(format!("{}\u{0}{}", new_id(), Utc::now().to_rfc3339()));
+        assert!(decode_cursor(&previous).is_err());
     }
 }

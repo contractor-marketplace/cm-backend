@@ -227,9 +227,20 @@ pub struct OwnerJob {
 
 #[derive(Debug, Clone, Default)]
 pub struct Filters {
+    pub query: Option<String>,
+    /// Trades the free-text query itself asked for, through the same alias
+    /// vocabulary the directory uses: a contractor typing "water heater" is
+    /// looking for plumbing work, and no job is titled "C-36".
+    pub query_trade_ids: Vec<Uuid>,
     pub trade_ids: Option<Vec<Uuid>>,
     pub postal_code: Option<String>,
     pub near: Option<Near>,
+    pub timeline: Option<JobTimeline>,
+    pub build_type: Option<BuildType>,
+    /// Jobs whose upper budget reaches at least this. A job with no budget at
+    /// all is excluded by it — "I'm not sure" is not a number, and treating it
+    /// as zero would hide every one of them behind any floor.
+    pub budget_min_cents: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -245,6 +256,24 @@ pub struct Near {
 pub struct Cursor {
     pub created_at: DateTime<Utc>,
     pub id: Uuid,
+    /// The value the ordering leads with, when it leads with something other
+    /// than the posting time. Absent for the newest-first default, which
+    /// already leads with `created_at`.
+    pub sort_key: Option<f64>,
+}
+
+/// How the board is ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sort {
+    /// Newest first. The only order the board has ever had, and still the
+    /// default: a job board is a queue before it is a search result.
+    Newest,
+    /// How well the text matched, for a search rather than a browse.
+    Best,
+    /// Largest budget first, on the top of the range.
+    Budget,
+    /// Nearest first, which needs a centre to measure from.
+    Distance,
 }
 
 pub struct Page<T> {
@@ -265,7 +294,20 @@ const PREDICATE: &str = "\
     AND ($1::float8 IS NULL OR ST_DWithin(j.public_point, \
          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)) \
     AND ($4::uuid[] IS NULL OR j.trade_id = ANY($4)) \
-    AND ($5::text IS NULL OR j.postal_code = $5)";
+    AND ($5::text IS NULL OR j.postal_code = $5) \
+    AND ($6::text IS NULL \
+         OR j.search_doc @@ websearch_to_tsquery('public.english_unaccent', $6) \
+         OR ($7::uuid[] IS NOT NULL AND j.trade_id = ANY($7))) \
+    AND ($8::text IS NULL OR j.timeline = $8) \
+    AND ($9::text IS NULL OR j.build_type = $9) \
+    AND ($10::bigint IS NULL OR j.budget_max_cents >= $10)";
+
+/// How many bind slots the shared predicate occupies. Tail clauses number
+/// themselves from here rather than being written by hand at each call site.
+const PREDICATE_BINDS: usize = 10;
+
+/// The query-text slot, read by the predicate and by the relevance ordering.
+const QUERY_BIND: usize = 6;
 
 /// The one browse projection.
 ///
@@ -283,7 +325,12 @@ const SELECT_JOB: &str = "\
                 ELSE ST_Distance(j.public_point, \
                      ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) END AS distance_m, \
            j.description, \
-           split_part(btrim(u.display_name), ' ', 1) AS poster_first_name \
+           split_part(btrim(u.display_name), ' ', 1) AS poster_first_name";
+
+/// The tables the projection reads. Split from the columns so the board can
+/// append a relevance score, which is computed per query and cannot live in a
+/// constant.
+const FROM_JOBS: &str = "\
       FROM jobs j \
       LEFT JOIN trades t ON t.id = j.trade_id \
       JOIN users u ON u.id = j.posted_by_user_id";
@@ -300,24 +347,152 @@ fn bind_filters<'q, T>(
         .bind(filters.near.map(|n| n.radius_m))
         .bind(filters.trade_ids.clone())
         .bind(filters.postal_code.clone())
+        .bind(filters.query.clone())
+        .bind((!filters.query_trade_ids.is_empty()).then(|| filters.query_trade_ids.clone()))
+        .bind(filters.timeline.map(|t| t.as_str()))
+        .bind(filters.build_type.map(|b| b.as_str()))
+        .bind(filters.budget_min_cents)
 }
 
 /// Newest first. The cursor predicate is `<` because the order is DESC, and it
 /// compares the identical `(created_at, id)` tuple the ORDER BY ends on.
-const ORDER_AND_KEYSET: &str = "\
-    AND ($6::timestamptz IS NULL OR (j.created_at, j.id) < ($6, $7::uuid)) \
-    ORDER BY j.created_at DESC, j.id DESC LIMIT $8";
+/// Metres from the centre the caller supplied. Spelled out because
+/// `distance_m` is a SELECT alias and Postgres does not allow one in `WHERE`.
+fn distance_expression() -> String {
+    "ST_Distance(j.public_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography)".to_owned()
+}
+
+/// How well the text matched.
+///
+/// Cast to `float8` at the edge, because `ts_rank_cd` returns `real` and
+/// decoding a `real` as an `f64` fails at the row reader rather than at the
+/// query — a 500 that says nothing about ranking. The same cast is on
+/// `quality_score` in the directory, for the same reason.
+fn relevance_expression() -> String {
+    format!(
+        "ts_rank_cd(j.search_doc, \
+         websearch_to_tsquery('public.english_unaccent', ${QUERY_BIND}))::float8"
+    )
+}
+
+/// The leading key of an ordering, and where to read it back from to build the
+/// next cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyField {
+    Relevance,
+    Budget,
+    Distance,
+}
+
+/// What the board leads with, and which way.
+///
+/// Every ordering ends in `(created_at DESC, id DESC)`, which is the pair the
+/// cursor has always carried, so the tie-break is a total order whatever leads.
+/// The keyset is written as "past the key, or level with it and past the
+/// tie-break" rather than one row-wise comparison: a row-wise comparison
+/// applies a single direction to every column, and these orderings are mixed.
+struct Ordering {
+    key: Option<String>,
+    field: Option<KeyField>,
+    /// True when the leading key sorts descending, as budget and relevance do.
+    descending: bool,
+}
+
+impl Ordering {
+    fn order_by(&self) -> String {
+        match &self.key {
+            Some(key) => {
+                let direction = if self.descending {
+                    "DESC NULLS LAST"
+                } else {
+                    "ASC"
+                };
+                format!("{key} {direction}, j.created_at DESC, j.id DESC")
+            }
+            None => "j.created_at DESC, j.id DESC".to_owned(),
+        }
+    }
+}
+
+fn ordering_for(sort: Sort, filters: &Filters) -> Ordering {
+    let by = |key: String, field: KeyField, descending: bool| Ordering {
+        key: Some(key),
+        field: Some(field),
+        descending,
+    };
+
+    match sort {
+        Sort::Budget => by("j.budget_max_cents".to_owned(), KeyField::Budget, true),
+        Sort::Distance if filters.near.is_some() => {
+            by(distance_expression(), KeyField::Distance, false)
+        }
+        Sort::Best if filters.query.is_some() => {
+            by(relevance_expression(), KeyField::Relevance, true)
+        }
+        // A sort with nothing to sort on degrades to the queue rather than
+        // ordering by a column that is NULL for every row.
+        Sort::Newest | Sort::Best | Sort::Distance => Ordering {
+            key: None,
+            field: None,
+            descending: true,
+        },
+    }
+}
+
+/// The tail of the board query: resume where the last page stopped, order, cap.
+fn order_and_keyset(ordering: &Ordering) -> String {
+    // The key slot exists only when the ordering leads with one. Binding a
+    // parameter the statement never mentions is not harmless — Postgres counts
+    // the placeholders it can see and refuses the extra — so the tail numbers
+    // itself from what it is actually going to say.
+    let key = PREDICATE_BINDS + 1;
+    let base = if ordering.key.is_some() {
+        key
+    } else {
+        PREDICATE_BINDS
+    };
+    let (at, id, limit) = (base + 1, base + 2, base + 3);
+
+    let keyset = match &ordering.key {
+        Some(expr) => {
+            let op = if ordering.descending { "<" } else { ">" };
+            format!(
+                "AND (${at}::timestamptz IS NULL OR {expr} {op} ${key}::float8 \
+                      OR ({expr} IS NOT DISTINCT FROM ${key}::float8 \
+                          AND (j.created_at, j.id) < (${at}, ${id}::uuid)))"
+            )
+        }
+        None => format!(
+            "AND (${at}::timestamptz IS NULL OR (j.created_at, j.id) < (${at}, ${id}::uuid))"
+        ),
+    };
+
+    format!("{keyset} ORDER BY {} LIMIT ${limit}", ordering.order_by())
+}
 
 pub async fn list(
     conn: &mut PgConnection,
     filters: &Filters,
+    sort: Sort,
     limit: i64,
     cursor: Option<&Cursor>,
 ) -> Result<Page<PublicJob>, AppError> {
     let limit = limit.clamp(1, MAX_PAGE);
-    let sql = format!("{SELECT_JOB} WHERE {PREDICATE} {ORDER_AND_KEYSET}");
+    let ordering = ordering_for(sort, filters);
+    let sql = format!(
+        "{SELECT_JOB}, {relevance} AS rank_score {FROM_JOBS} WHERE {PREDICATE} {tail}",
+        relevance = relevance_expression(),
+        tail = order_and_keyset(&ordering),
+    );
 
-    let mut rows: Vec<JobRow> = bind_filters(sqlx::query_as(&sql), filters)
+    let query = bind_filters(sqlx::query_as(&sql), filters);
+    // Bound only when the statement refers to it; see `order_and_keyset`.
+    let query = match ordering.key {
+        Some(_) => query.bind(cursor.and_then(|c| c.sort_key)),
+        None => query,
+    };
+
+    let mut rows: Vec<JobRow> = query
         .bind(cursor.map(|c| c.created_at))
         .bind(cursor.map(|c| c.id))
         .bind(limit + 1)
@@ -328,6 +503,14 @@ pub async fn list(
     let next = take_next(&mut rows, limit, |r| Cursor {
         created_at: r.created_at,
         id: r.id,
+        // Read from whichever column the ordering actually sorted by, so the
+        // next page compares against the value this one stopped at.
+        sort_key: match ordering.field {
+            Some(KeyField::Relevance) => r.rank_score,
+            Some(KeyField::Budget) => r.budget_max_cents.map(|cents| cents as f64),
+            Some(KeyField::Distance) => r.distance_m,
+            None => None,
+        },
     });
 
     Ok(Page {
@@ -337,6 +520,103 @@ pub async fn list(
             .collect::<Result<_, _>>()?,
         next_cursor: next,
     })
+}
+
+/// How many jobs each choice would leave, given everything else already
+/// chosen.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Facets {
+    /// Total under the current filters, which is also the "N jobs" the board
+    /// shows. The board itself only ever knew how many rows it had loaded.
+    pub total: i64,
+    pub trade: Vec<Facet>,
+    pub timeline: Vec<Facet>,
+    pub build_type: Vec<Facet>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Facet {
+    pub value: String,
+    pub count: i64,
+}
+
+/// Count the facets under the same predicate the results use.
+///
+/// One query with `GROUPING SETS` rather than four, and under `PREDICATE`
+/// rather than a copy of it — counts that disagree with the list they sit
+/// beside are worse than no counts, because they are read as the list being
+/// wrong.
+///
+/// Note what this deliberately does not do: each count is taken with *every*
+/// current filter applied, including the facet's own. So the number beside
+/// "Roofing" is how many roofing jobs match, not how many there would be if
+/// roofing were selected instead. That is the honest reading of "what is in
+/// front of me", and it is why selecting a facet never surprises.
+pub async fn facets(conn: &mut PgConnection, filters: &Filters) -> Result<Facets, AppError> {
+    // GROUPING() says which set each row came from, and it is not optional
+    // here. `trade_id IS NULL` is the board's "Other / not listed" escape
+    // hatch, so the trade set contains a row whose slug is NULL — identical in
+    // shape to the grand-total row from the empty set. Without these flags the
+    // two are indistinguishable and one silently overwrites the other.
+    let sql = format!(
+        "SELECT GROUPING(t.slug) AS g_trade, \
+                GROUPING(j.timeline) AS g_timeline, \
+                GROUPING(j.build_type) AS g_build, \
+                t.slug AS trade, j.timeline, j.build_type, count(*) AS n \
+           FROM jobs j \
+           LEFT JOIN trades t ON t.id = j.trade_id \
+          WHERE {PREDICATE} \
+          GROUP BY GROUPING SETS ((t.slug), (j.timeline), (j.build_type), ())"
+    );
+
+    type Row = (
+        i32,
+        i32,
+        i32,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+    );
+    let rows: Vec<Row> = bind_filters(sqlx::query_as(&sql), filters)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(AppError::internal)?;
+
+    let mut facets = Facets::default();
+    for (g_trade, g_timeline, g_build, trade, timeline, build_type, count) in rows {
+        match (g_trade, g_timeline, g_build) {
+            // A grouping flag of 0 means the column is part of this row's set.
+            (0, _, _) => facets.trade.push(Facet {
+                // A job posted as "Other / not listed" has no trade slug, and
+                // saying so is more use than dropping it from the count.
+                value: trade.unwrap_or_else(|| "other".to_owned()),
+                count,
+            }),
+            (_, 0, _) => {
+                if let Some(value) = timeline {
+                    facets.timeline.push(Facet { value, count });
+                }
+            }
+            (_, _, 0) => {
+                if let Some(value) = build_type {
+                    facets.build_type.push(Facet { value, count });
+                }
+            }
+            // Every column rolled up: the grand total.
+            _ => facets.total = count,
+        }
+    }
+
+    for group in [
+        &mut facets.trade,
+        &mut facets.timeline,
+        &mut facets.build_type,
+    ] {
+        group.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+    }
+
+    Ok(facets)
 }
 
 /// One pin on the jobs map.
@@ -377,7 +657,8 @@ pub async fn map_points(
            FROM jobs j \
            LEFT JOIN trades t ON t.id = j.trade_id \
           WHERE {PREDICATE} AND j.public_point IS NOT NULL \
-          ORDER BY j.created_at DESC, j.id DESC LIMIT $6"
+          ORDER BY j.created_at DESC, j.id DESC LIMIT ${limit}",
+        limit = PREDICATE_BINDS + 1
     );
 
     let mut points: Vec<JobPoint> = bind_filters(sqlx::query_as(&sql), filters)
@@ -458,14 +739,21 @@ fn take_next<T>(rows: &mut Vec<T>, limit: i64, key: impl Fn(&T) -> Cursor) -> Op
 /// The board filters to open, and the detail page must agree: a homeowner who
 /// closes a job — and especially one who cancels it — has said take it down,
 /// not just stop listing it. The poster still sees it through `for_poster`.
+/// One job, if the board would show it.
+///
+/// Runs the shared predicate rather than restating `status = 'open'` and
+/// hand-binding a `None` per filter. That version drifted the moment the
+/// predicate grew: every parameter added to the board had to be echoed here as
+/// another `None`, and the test that claims list and detail share a projection
+/// only compares the constants — it would not have caught the miscount.
 pub async fn find(conn: &mut PgConnection, id: Uuid) -> Result<Option<PublicJob>, AppError> {
-    let sql = format!("{SELECT_JOB} WHERE j.id = $6 AND j.status = 'open'");
-    let row: Option<JobRow> = sqlx::query_as(&sql)
-        .bind(None::<f64>)
-        .bind(None::<f64>)
-        .bind(None::<f64>)
-        .bind(None::<Vec<Uuid>>)
-        .bind(None::<String>)
+    let value = PREDICATE_BINDS + 1;
+    let sql = format!(
+        "{SELECT_JOB}, NULL::float8 AS rank_score {FROM_JOBS} \
+         WHERE {PREDICATE} AND j.id = ${value}"
+    );
+
+    let row: Option<JobRow> = bind_filters(sqlx::query_as(&sql), &Filters::default())
         .bind(id)
         .fetch_optional(&mut *conn)
         .await
@@ -714,6 +1002,9 @@ mod tests {
 
 #[derive(sqlx::FromRow)]
 struct JobRow {
+    /// How well this row matched the text, present only on the board query —
+    /// the one surface that paginates and so the only one needing a cursor key.
+    rank_score: Option<f64>,
     id: Uuid,
     title: String,
     trade: Option<String>,
@@ -792,6 +1083,8 @@ impl OwnerJobRow {
             (self.posted_by_user_id, self.closed_at, self.updated_at);
 
         let public = JobRow {
+            // The owner's own list is not the board and does not rank.
+            rank_score: None,
             id: self.id,
             title: self.title,
             trade: self.trade,

@@ -1015,3 +1015,192 @@ async fn both_job_surfaces_report_a_dropped_filter(pool: PgPool) {
         );
     }
 }
+
+/// The board has never had a search box, so a contractor looking for bathroom
+/// work read the list. Text now matches the title and the description, and an
+/// everyday word reaches the trade it means through the same vocabulary the
+/// directory uses — no job is titled "C-36".
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_board_can_be_searched_by_text_and_by_meaning(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    {
+        let mut conn = pool.acquire().await.expect("connection");
+        cm_db::repo::reference::seed_trade_aliases(&mut conn)
+            .await
+            .expect("aliases");
+    }
+
+    let mut client = Client::new(router(pool.clone()));
+    client.register("searcher@example.com").await;
+    let poster = common::user_id(&pool, "searcher@example.com").await;
+    common::seed_jobs(&pool, poster, 3, "90042").await;
+
+    // A job whose title says what it is.
+    sqlx::query(
+        "UPDATE jobs SET title = 'Replace the water heater in the garage' \
+          WHERE id = (SELECT id FROM jobs ORDER BY created_at LIMIT 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("retitle");
+
+    let mut client = Client::new(router(pool));
+
+    let by_text = client.get("/v1/jobs?q=water+heater").await;
+    assert_eq!(by_text.status, StatusCode::OK, "{:?}", by_text.json);
+    let titles: Vec<&str> = by_text.json["jobs"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|j| j["title"].as_str())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.contains("water heater")),
+        "{titles:?}"
+    );
+
+    // Nonsense matches nothing, which is the guard against a change that makes
+    // everything match.
+    let nothing = client.get("/v1/jobs?q=zzzzznotarealjob").await;
+    assert!(nothing.json["jobs"].as_array().expect("array").is_empty());
+}
+
+/// Every ordering has to page correctly, for the reason the directory's did
+/// not: a cursor that carries the posting time while the ORDER BY leads with a
+/// budget resumes from the wrong place and drops rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_board_sort_pages_through_the_jobs_exactly_once(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("pager@example.com").await;
+    let poster = common::user_id(&pool, "pager@example.com").await;
+    common::seed_jobs(&pool, poster, 12, "90042").await;
+
+    // A spread of budgets, so a budget ordering has something to order.
+    sqlx::query(
+        "UPDATE jobs SET budget_min_cents = 100000, \
+                         budget_max_cents = 100000 + (extract(epoch from created_at)::bigint % 7) * 100000",
+    )
+    .execute(&pool)
+    .await
+    .expect("budgets");
+
+    let mut client = Client::new(router(pool));
+
+    for sort in ["", "&sort=newest", "&sort=budget"] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..20 {
+            let path = match &cursor {
+                Some(value) => format!("/v1/jobs?limit=3{sort}&cursor={value}"),
+                None => format!("/v1/jobs?limit=3{sort}"),
+            };
+            let page = client.get(&path).await;
+            assert_eq!(page.status, StatusCode::OK, "{path}: {:?}", page.json);
+
+            for job in page.json["jobs"].as_array().expect("array") {
+                seen.push(job["id"].as_str().expect("id").to_owned());
+            }
+            match page.json["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(
+            seen.len(),
+            unique.len(),
+            "{sort:?} repeated a job: {seen:?}"
+        );
+        assert_eq!(
+            seen.len(),
+            12,
+            "{sort:?} paged through {} of 12",
+            seen.len()
+        );
+    }
+
+    // A sort nobody offers is a 400, not a silently different order.
+    assert_eq!(
+        client.get("/v1/jobs?sort=cheapest").await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// Counts that disagree with the list beside them are worse than no counts,
+/// because they are read as the list being wrong. They come from one query
+/// under the same predicate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_facet_counts_agree_with_the_results(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("facets@example.com").await;
+    let poster = common::user_id(&pool, "facets@example.com").await;
+    common::seed_jobs(&pool, poster, 9, "90042").await;
+
+    let mut client = Client::new(router(pool));
+
+    let all = client.get("/v1/jobs?limit=50").await;
+    assert_eq!(all.status, StatusCode::OK, "{:?}", all.json);
+
+    // The total is the count of everything matching, not of what was loaded.
+    // The board could only ever count its own rows, so it said "20+".
+    let total = all.json["facets"]["total"].as_i64().expect("total");
+    assert_eq!(total, 9);
+    assert_eq!(all.json["jobs"].as_array().expect("array").len(), 9);
+
+    // Every facet count must be reproducible by applying that facet.
+    let timelines = all.json["facets"]["timeline"]
+        .as_array()
+        .expect("array")
+        .clone();
+    assert!(!timelines.is_empty(), "{:?}", all.json["facets"]);
+
+    for facet in timelines {
+        let value = facet["value"].as_str().expect("value");
+        let count = facet["count"].as_i64().expect("count");
+
+        let filtered = client
+            .get(&format!("/v1/jobs?limit=50&timeline={value}"))
+            .await;
+        assert_eq!(filtered.status, StatusCode::OK, "{:?}", filtered.json);
+        assert_eq!(
+            filtered.json["jobs"].as_array().expect("array").len() as i64,
+            count,
+            "the {value} facet promised {count}"
+        );
+        assert_eq!(
+            filtered.json["facets"]["total"].as_i64().expect("total"),
+            count
+        );
+    }
+}
+
+/// A facet value nobody offers is dropped and named, like every other optional
+/// filter, rather than failing a page somebody reached from a shared link.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_junk_facet_is_dropped_and_reported(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool));
+
+    let response = client
+        .get("/v1/jobs?timeline=eventually&build_type=knocking_it_down&budget_min=lots")
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+
+    let ignored: Vec<&str> = response.json["ignored_filters"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    for expected in ["timeline", "build_type", "budget_min"] {
+        assert!(
+            ignored.contains(&expected),
+            "{expected} not reported: {ignored:?}"
+        );
+    }
+}

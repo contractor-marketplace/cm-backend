@@ -250,12 +250,17 @@ pub struct Page {
 
 /// The list statement. Tail binds: cursor sort key, cursor name, cursor id, limit.
 fn list_sql(ordering: &Ordering) -> String {
-    let (key, name, id, limit) = (
-        PREDICATE_BINDS + 1,
-        PREDICATE_BINDS + 2,
-        PREDICATE_BINDS + 3,
-        PREDICATE_BINDS + 4,
-    );
+    // The key slot exists only when the ordering leads with one. Binding a
+    // parameter the statement never mentions is not harmless — Postgres counts
+    // the placeholders it can see and refuses the extra — so the tail numbers
+    // itself from what it is actually going to say.
+    let key = PREDICATE_BINDS + 1;
+    let base = if ordering.key.is_some() {
+        key
+    } else {
+        PREDICATE_BINDS
+    };
+    let (name, id, limit) = (base + 1, base + 2, base + 3);
     let op = ordering.direction.comparison();
     let cast = ordering.field.map(KeyField::cast).unwrap_or("float8");
 
@@ -526,8 +531,14 @@ pub async fn list(
     let ordering = ordering_for(sort, filters);
     let sql = list_sql(&ordering);
 
-    let mut contractors = bind_filters(sqlx::query_as(&sql), filters)
-        .bind(cursor.and_then(|c| c.sort_key))
+    let query = bind_filters(sqlx::query_as(&sql), filters);
+    // Bound only when the statement refers to it; see `list_sql`.
+    let query = match ordering.key {
+        Some(_) => query.bind(cursor.and_then(|c| c.sort_key)),
+        None => query,
+    };
+
+    let mut contractors = query
         .bind(cursor.map(|c| c.name.clone()))
         .bind(cursor.map(|c| c.id))
         .bind(limit + 1)

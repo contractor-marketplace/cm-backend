@@ -7,7 +7,7 @@ Companion documents: `runbook.md` is the operational procedure (deploy order,
 imports, backups, incident response); `README.md` is how to run it locally.
 This one is the map.
 
-Accurate as of migration **0026**, 2026-08-30.
+Accurate as of migration **0027**, 2026-08-30.
 
 ---
 
@@ -103,7 +103,7 @@ cm-server      960  the binary and its subcommands
 
 ## 4. The database
 
-26 migrations, applied in order, checksummed. Editing an applied migration is
+27 migrations, applied in order, checksummed. Editing an applied migration is
 rejected — there is a test that tampers with `0001` and asserts the failure.
 
 | # | What it added |
@@ -134,6 +134,7 @@ rejected — there is a test that tampers with `0001` and asserts the failure.
 | 0024 | What a contractor owns about their own listing |
 | 0025 | The words homeowners use for trades |
 | 0026 | The standing quality score the directory ranks by |
+| 0027 | A searchable, sortable, countable job board |
 
 ### Schema invariants, enforced by tests
 
@@ -401,6 +402,30 @@ see. `sort=distance` remains and says plainly what it does.
 Sorts: `best` (default), `rating`, `distance`, `name`. `relevance` is still
 accepted as the old name for `best`, so shared links keep working.
 
+### The job board
+
+The board had a trade filter, a ZIP filter, and one fixed order. It now has
+full text over title and description — title weighted above it, because someone
+writes "Replace water heater" and then three paragraphs of context — and the
+query routes through the same trade vocabulary the directory uses, so a
+contractor typing "water heater" finds plumbing work and no job has to be
+titled "C-36".
+
+Four orderings: newest (still the default, because a job board is a queue
+before it is a search result), best, budget and distance. Each has an index
+holding its whole ORDER BY tuple, and the cursor carries the key its ordering
+leads with — the same correctness the directory needed, applied before the
+board could grow the same defect.
+
+Facet counts come from one `GROUPING SETS` query under the same predicate as
+the results, so counts and list cannot disagree. `GROUPING()` is not optional
+there: `trade_id IS NULL` is the board's "Other / not listed" escape hatch, so
+the trade set contains a NULL-slug row identical in shape to the grand total,
+and without the flags one silently overwrites the other.
+
+The total is what the board never had. It could only count the rows it had
+loaded, so it said "20+ jobs" for four hundred.
+
 ### Typeahead
 
 `GET /v1/suggest?q=` answers the three things somebody can be reaching for — a
@@ -659,7 +684,7 @@ Credentials live at `/etc/cm-backend/env` (service) and
 
 ## 15. Testing
 
-367 test functions. Every database test runs against a **real PostgreSQL 16 with
+371 test functions. Every database test runs against a **real PostgreSQL 16 with
 PostGIS** — there is no mocked database anywhere in the suite, on purpose.
 
 | Area | What is covered |

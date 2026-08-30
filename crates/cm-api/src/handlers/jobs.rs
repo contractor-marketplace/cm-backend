@@ -81,6 +81,9 @@ const TRADE_OTHER: &str = "other";
 #[derive(Debug, serde::Serialize)]
 pub struct ListResponse {
     pub jobs: Vec<PublicJob>,
+    /// How many jobs match, and how they break down. The board could only ever
+    /// count the rows it had loaded, so it said "20+ jobs" for four hundred.
+    pub facets: jobs::Facets,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// Filters that were not understood and were dropped. Naming them beats a
@@ -163,10 +166,17 @@ pub async fn list(
         None => Vec::new(),
     };
 
-    let query = cm_domain::jobs::parse(&raw, trade_ids)?;
+    let mut query = cm_domain::jobs::parse(&raw, trade_ids)?;
+    // The same vocabulary the directory routes through: a contractor typing
+    // "water heater" is looking for plumbing work, and no job is titled "C-36".
+    if let Some(text) = query.filters.query.as_deref() {
+        query.filters.query_trade_ids = reference::trades_matching_text(&mut conn, text).await?;
+    }
+
     let mut page = jobs::list(
         &mut conn,
         &query.filters,
+        query.sort,
         query.limit,
         query.cursor.as_ref(),
     )
@@ -180,8 +190,11 @@ pub async fn list(
     let photos = job_photos::for_jobs(&mut conn, &ids).await?;
     jobs::attach_photos(&mut page.jobs, photos, |key| state.store.url_for(key));
 
+    let facets = jobs::facets(&mut conn, &query.filters).await?;
+
     Ok(Json(ListResponse {
         jobs: page.jobs,
+        facets,
         next_cursor: page
             .next_cursor
             .as_ref()
