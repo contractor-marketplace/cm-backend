@@ -114,6 +114,7 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/contractors", get(handlers::contractors::list))
         .route("/v1/contractors/map", get(handlers::contractors::map))
         .route("/v1/contractors/{id}", get(handlers::contractors::detail))
+        .route("/v1/suggest", get(handlers::contractors::suggest))
         .route("/v1/trades", get(handlers::contractors::trades))
         .route("/v1/regions", get(handlers::contractors::regions))
         .merge(handlers::jobs::public_routes());

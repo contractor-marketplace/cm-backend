@@ -171,6 +171,7 @@ front.
 | `GET /v1/contractors` | — | Keyset-paginated. Text, trade, ZIP, radius, bbox, verified. |
 | `GET /v1/contractors/map` | — | Same predicate, capped at 500 points, `truncated` flag. |
 | `GET /v1/contractors/{id\|slug}` | — | Detail plus the evidence behind the badge. |
+| `GET /v1/suggest` | — | Typeahead: trades, places and businesses. Rate limited per address. |
 | `GET /v1/trades`, `GET /v1/regions` | — | Filter vocabularies. |
 | `PATCH /v1/contractors/{id}` | claimant | Bio, phone, website, DM opt-in, address visibility. |
 | `POST /v1/contractors/{id}/claims` | required | Open a claim. |

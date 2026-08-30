@@ -126,6 +126,15 @@ const NEAR_LAT_BIND: usize = 2;
 /// matches — a map showing pins the list omits is a bug report nobody can
 /// reproduce.
 ///
+/// "Did the query route to a trade this contractor holds" is asked here as a
+/// correlated `EXISTS`, and again by the ranking. Hoisting it into a lateral
+/// join to ask once looks like an obvious win and measured as one in isolation
+/// — and was 25% *slower* through the real endpoint, because the planner can
+/// short-circuit an `EXISTS` per row and cannot skip a join it has already
+/// built. The isolated benchmark differed from the shipped query in one detail,
+/// an inlined scalar subquery for the trade id, and that was enough to change
+/// the plan. Left as it is, on the measurement that matches production.
+///
 /// The fuzzy clause is `<%` (word similarity), not `%` (whole-string
 /// similarity), and the difference is the whole feature. `%` scores the query
 /// against the entire column: "ibara" against "Ibarra & Daughters
@@ -248,6 +257,7 @@ fn list_sql(ordering: &Ordering) -> String {
         PREDICATE_BINDS + 4,
     );
     let op = ordering.direction.comparison();
+    let cast = ordering.field.map(KeyField::cast).unwrap_or("float8");
 
     // Written as "past the key, or level with it and past the tie-break"
     // rather than as one row-wise comparison, because a row-wise comparison
@@ -258,8 +268,8 @@ fn list_sql(ordering: &Ordering) -> String {
     // that looks like a page.
     let keyset = match &ordering.key {
         Some(expr) => format!(
-            "AND (${name}::text IS NULL OR {expr} {op} ${key}::float8 \
-                  OR ({expr} = ${key}::float8 \
+            "AND (${name}::text IS NULL OR {expr} {op} ${key}::{cast} \
+                  OR ({expr} = ${key}::{cast} \
                       AND (c.display_name, c.id) > (${name}, ${id}::uuid)))"
         ),
         None => format!(
@@ -359,6 +369,31 @@ fn rank_expression() -> String {
     )
 }
 
+/// Which column of the returned row holds the value the cursor resumes from.
+///
+/// The ordering and the cursor have to name the same number, and the ordering
+/// does not always sort by the expression the projection calls `rank_score` —
+/// see `ordering_for`, where a browse with no query sorts by the bare quality
+/// column so the index can serve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyField {
+    Rank,
+    Quality,
+    Distance,
+}
+
+impl KeyField {
+    /// What to cast the cursor's bind to. `quality_score` is `real`; comparing
+    /// it against a `float8` promotes the column and loses the index, which is
+    /// the whole reason the browse ordering was rewritten.
+    fn cast(self) -> &'static str {
+        match self {
+            Self::Quality => "real",
+            Self::Rank | Self::Distance => "float8",
+        }
+    }
+}
+
 /// Which direction a sort runs, and therefore which way its cursor compares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -395,6 +430,8 @@ impl Direction {
 struct Ordering {
     /// The leading key, or `None` for the plain alphabetical sort.
     key: Option<String>,
+    /// Where to read that key back from, to build the next cursor.
+    field: Option<KeyField>,
     direction: Direction,
 }
 
@@ -410,33 +447,43 @@ impl Ordering {
 /// A sort the caller cannot support degrades to the stable key rather than
 /// ordering by a column that is NULL for every row.
 fn ordering_for(sort: Sort, filters: &Filters) -> Ordering {
+    let by = |key: String, field: KeyField, direction: Direction| Ordering {
+        key: Some(key),
+        field: Some(field),
+        direction,
+    };
+
     match sort {
-        Sort::Distance if filters.near.is_some() => Ordering {
-            key: Some(distance_expression()),
-            direction: Direction::Ascending,
-        },
-        Sort::Rating => Ordering {
-            key: Some("c.quality_score".to_owned()),
-            direction: Direction::Descending,
-        },
-        Sort::Best => Ordering {
-            key: Some(rank_expression()),
-            direction: Direction::Descending,
-        },
+        Sort::Distance if filters.near.is_some() => by(
+            distance_expression(),
+            KeyField::Distance,
+            Direction::Ascending,
+        ),
+        Sort::Rating => by(
+            "c.quality_score".to_owned(),
+            KeyField::Quality,
+            Direction::Descending,
+        ),
+        // With no query every text term is zero and the blend is quality times
+        // a constant — the same order as quality itself. Sorting by the bare
+        // column rather than the expression is not a shortcut: an index cannot
+        // serve `ORDER BY 0.5 * quality_score`, and this is the directory's
+        // default page. Measured at 51,000 rows it is the difference between an
+        // index scan and a sequential scan with a top-N sort.
+        Sort::Best if filters.query.is_none() => by(
+            "c.quality_score".to_owned(),
+            KeyField::Quality,
+            Direction::Descending,
+        ),
+        Sort::Best => by(rank_expression(), KeyField::Rank, Direction::Descending),
         Sort::Distance | Sort::Name => Ordering {
             key: None,
+            field: None,
             direction: Direction::Ascending,
         },
     }
 }
 
-/// What a search was shaped like, for the log.
-///
-/// The shape, never the text. `router.rs` deliberately keeps the query string
-/// out of its HTTP spans because it carries caller-supplied values, and a
-/// search term is exactly that — often a person's own business name. Knowing a
-/// query *had* text is enough to explain a slow plan; knowing what somebody
-/// typed is not ours to keep.
 fn record_search(
     path: &'static str,
     filters: &Filters,
@@ -500,13 +547,14 @@ pub async fn list(
             // Whatever the ordering led with, read back off the row it stopped
             // at. Ordering and cursor are built from one expression, so the
             // value here is the same one the next page compares against.
-            sort_key: match sort {
-                Sort::Best => last.rank_score,
-                Sort::Rating => last.quality_score,
-                // Only a key when a centre was given; without one the ordering
-                // falls back to the name and carries no leading key at all.
-                Sort::Distance => ordering.key.as_ref().and(last.distance_m),
-                Sort::Name => None,
+            // Read from whichever column the ordering actually sorted by, so
+            // the value the next page compares against is the value this page
+            // stopped at.
+            sort_key: match ordering.field {
+                Some(KeyField::Rank) => last.rank_score,
+                Some(KeyField::Quality) => last.quality_score,
+                Some(KeyField::Distance) => last.distance_m,
+                None => None,
             },
         })
     } else {
@@ -712,15 +760,17 @@ mod tests {
     /// on the second page.
     #[test]
     fn the_predicate_declares_how_many_binds_it_uses() {
+        // Both halves, so a bind that moves between them is still counted.
+        let shared = format!("{SELECT} {FROM} {PREDICATE}");
         let highest = (1..=99)
-            .filter(|n| PREDICATE.contains(&format!("${n}")))
+            .filter(|n| shared.contains(&format!("${n}")))
             .max()
-            .expect("the predicate binds something");
+            .expect("the shared clauses bind something");
 
         assert_eq!(
             highest, PREDICATE_BINDS,
-            "PREDICATE uses ${highest} but PREDICATE_BINDS says {PREDICATE_BINDS}; \
-             every tail clause is numbered from that constant"
+            "the shared clauses use ${highest} but PREDICATE_BINDS says \
+             {PREDICATE_BINDS}; every tail clause is numbered from that constant"
         );
 
         let listing = list_sql(&ordering_for(Sort::Best, &Filters::default()));

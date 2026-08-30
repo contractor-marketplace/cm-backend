@@ -32,6 +32,17 @@ pub fn register_per_ip() -> Policy {
     }
 }
 
+/// Typeahead is public and fires per keystroke, so the ceiling is high enough
+/// that a person typing fast never meets it and low enough that the endpoint
+/// cannot be used to walk the directory a letter at a time.
+pub fn suggest_per_ip() -> Policy {
+    Policy {
+        name: "suggest:ip",
+        limit: 600,
+        window: ChronoDuration::minutes(5),
+    }
+}
+
 /// Guards the whole login endpoint against an address working through a list of
 /// accounts. Per-account lockout handles the other direction — one account,
 /// many guesses — and the two are deliberately separate: an attacker with a

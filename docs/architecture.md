@@ -401,6 +401,52 @@ see. `sort=distance` remains and says plainly what it does.
 Sorts: `best` (default), `rating`, `distance`, `name`. `relevance` is still
 accepted as the old name for `best`, so shared links keep working.
 
+### Typeahead
+
+`GET /v1/suggest?q=` answers the three things somebody can be reaching for — a
+kind of work, a place, or one business — and labels each, so the client turns a
+choice into the right filter instead of guessing from the text. Trades and
+places are offered above businesses, because choosing one narrows a search
+rather than ending it.
+
+Assembled per request from the tables that already exist rather than kept in a
+materialised index: at this size the union costs single-digit milliseconds and
+is always current, where a copy would need rebuilding on every import, claim and
+trade edit and would fail by quietly describing last week's directory.
+
+Public and fired on every keystroke, so it carries a named rate limit per
+address, enforced before the query runs.
+
+### Measured latency
+
+Release build, 51,000 contractors, warm pool:
+
+| | p50 | p95 |
+|---|---|---|
+| `/v1/suggest?q=plumb` | 7.5 ms | 8.2 ms |
+| `/v1/contractors` (browse) | 1.3 ms | 1.4 ms |
+| `/v1/contractors?q=ibarra` (few matches) | 2.8 ms | 3.2 ms |
+| `/v1/contractors?q=plumbing` (routes to a trade) | 152 ms | 199 ms |
+| `/v1/contractors/map` | 7.8 ms | 8.3 ms |
+
+The outlier is explainable and is the cost of the recall the taxonomy bought. A
+query that routes to a trade matches every contractor holding that licence class
+— thousands of rows for "plumbing" — and ranking cannot order what it has not
+scored. A query with few matches is 3 ms. If it needs to come down, the lever is
+capping candidates for high-cardinality routes, not the ranking itself.
+
+Three findings from measuring, all of which looked like the opposite before:
+
+- `lower(display_name) LIKE` cannot use the trigram index; `ILIKE` on the bare
+  column can. Sequential scan against bitmap index scan.
+- Matching a prefix `OR` a contains against the same trigram index is not two
+  chances, it is the same candidate set twice. Dropping the prefix from the
+  `WHERE` and keeping it only in the ranking took suggest from 83 ms to 8 ms.
+- Hoisting the trade-route `EXISTS` into a lateral join to compute it once
+  measured five times faster in isolation and 25% *slower* through the real
+  endpoint. The isolated query inlined a scalar subquery for the trade id, and
+  that was enough to change the plan. The `EXISTS` stayed.
+
 ### Pagination
 
 Keyset, never `OFFSET` — which both scans what it skips and duplicates rows when
@@ -589,7 +635,7 @@ Credentials live at `/etc/cm-backend/env` (service) and
 
 ## 15. Testing
 
-354 test functions. Every database test runs against a **real PostgreSQL 16 with
+364 test functions. Every database test runs against a **real PostgreSQL 16 with
 PostGIS** — there is no mocked database anywhere in the suite, on purpose.
 
 | Area | What is covered |

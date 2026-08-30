@@ -1,12 +1,12 @@
 //! The public contractor directory, and the claimant's own edit surface.
 
-use crate::extract::{CurrentUser, Json as ValidJson};
+use crate::extract::{Context, CurrentUser, Json as ValidJson};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use cm_core::AppError;
 use cm_db::repo::contractors::{self, AddressVisibility, ProfileUpdate, PublicContractor};
-use cm_db::repo::{claims, reference, reviews, search};
+use cm_db::repo::{claims, reference, reviews, search, suggest};
 use cm_domain::search as search_input;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -23,7 +23,10 @@ pub struct ListResponse {
     ignored_filters: Vec<String>,
 }
 
-async fn trade_ids(state: &AppState, trade: Option<&str>) -> Result<Vec<Uuid>, AppError> {
+async fn trade_ids(
+    conn: &mut sqlx::PgConnection,
+    trade: Option<&str>,
+) -> Result<Vec<Uuid>, AppError> {
     let Some(trade) = trade else {
         return Ok(Vec::new());
     };
@@ -38,8 +41,7 @@ async fn trade_ids(state: &AppState, trade: Option<&str>) -> Result<Vec<Uuid>, A
         return Ok(Vec::new());
     }
 
-    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    reference::trade_ids_for_slugs(&mut conn, &slugs).await
+    reference::trade_ids_for_slugs(conn, &slugs).await
 }
 
 /// The trades a free-text query is asking for.
@@ -60,14 +62,62 @@ async fn query_trades(
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct SuggestResponse {
+    suggestions: Vec<suggest::Suggestion>,
+}
+
+/// What the person might mean, while they are still typing.
+///
+/// Public, and the only endpoint here that fires on every keystroke, so it is
+/// rate limited per address — high enough that nobody typing meets it, low
+/// enough that it cannot be used to walk the directory a letter at a time.
+/// Enforced before the query runs, so a caller over the limit costs a bucket
+/// read rather than a search.
+///
+/// A query too short to mean anything returns an empty list rather than an
+/// error: the client asks as the box fills, and the first character is not a
+/// mistake worth reporting.
+pub async fn suggest(
+    State(state): State<AppState>,
+    Context(context): Context,
+    Query(raw): Query<SuggestQuery>,
+) -> Result<Json<SuggestResponse>, AppError> {
+    if let Some(client) = context.client_ip.as_deref() {
+        cm_auth::ratelimit::enforce(
+            &state.pool,
+            state.auth.pepper(),
+            cm_auth::ratelimit::suggest_per_ip(),
+            client,
+            chrono::Utc::now(),
+        )
+        .await?;
+    }
+
+    let query = raw.q.unwrap_or_default();
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+    let suggestions = suggest::suggest(&mut conn, &query).await?;
+
+    Ok(Json(SuggestResponse { suggestions }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SuggestQuery {
+    pub q: Option<String>,
+}
+
 pub async fn list(
     State(state): State<AppState>,
     Query(raw): Query<search_input::RawQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
-    let ids = trade_ids(&state, raw.trade.as_deref()).await?;
-    let mut request = search_input::parse(&raw, ids)?;
-
+    // One connection for the whole request. Resolving the trade filter, routing
+    // the query through the alias vocabulary and running the search are one
+    // unit of work, and taking a connection from the pool three times to do it
+    // costs three acquisitions and three statement caches to warm.
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+
+    let ids = trade_ids(&mut conn, raw.trade.as_deref()).await?;
+    let mut request = search_input::parse(&raw, ids)?;
     request.filters.query_trade_ids =
         query_trades(&mut conn, request.filters.query.as_deref()).await?;
     let mut page = search::list(
@@ -117,10 +167,14 @@ pub async fn map(
     State(state): State<AppState>,
     Query(raw): Query<search_input::RawQuery>,
 ) -> Result<Json<MapResponse>, AppError> {
-    let ids = trade_ids(&state, raw.trade.as_deref()).await?;
-    let mut request = search_input::parse(&raw, ids)?;
-
+    // One connection for the whole request. Resolving the trade filter, routing
+    // the query through the alias vocabulary and running the search are one
+    // unit of work, and taking a connection from the pool three times to do it
+    // costs three acquisitions and three statement caches to warm.
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+
+    let ids = trade_ids(&mut conn, raw.trade.as_deref()).await?;
+    let mut request = search_input::parse(&raw, ids)?;
     request.filters.query_trade_ids =
         query_trades(&mut conn, request.filters.query.as_deref()).await?;
     let (found, truncated) =

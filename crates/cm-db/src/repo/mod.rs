@@ -17,4 +17,5 @@ pub mod reference;
 pub mod reviews;
 pub mod search;
 pub mod sessions;
+pub mod suggest;
 pub mod users;
