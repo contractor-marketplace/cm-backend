@@ -123,7 +123,7 @@ mod tests {
         let versions: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
         assert_eq!(
             versions,
-            (1..=24).collect::<Vec<i64>>(),
+            (1..=25).collect::<Vec<i64>>(),
             "extensions and reference data, then accounts, credentials, sessions, \
              audit, rate limits, federated identity, the licence register, \
              contractors, geocoding, claims, profiles, messaging, safety, \
@@ -131,10 +131,10 @@ mod tests {
              intake with photos, publishing the licence address, the \
              contractor data-source marker, Facebook as a second federated \
              provider, the Google reviews read path, a link back to the \
-             Google listing they came from, and the profile fields a claimant \
-             owns"
+             Google listing they came from, the profile fields a claimant \
+             owns, and the words homeowners use for trades"
         );
-        assert_eq!(embedded_version(), 24);
+        assert_eq!(embedded_version(), 25);
     }
 
     #[test]

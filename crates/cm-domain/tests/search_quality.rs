@@ -60,17 +60,29 @@ use std::path::Path;
  *      above "Ibarra & Daughters" (4.5 stars, 95 reviews, verified). This is
  *      exactly what blended ranking is for.
  *
- *   3. Every trade word and every natural-language query scores zero: plumber,
- *      roofer, painter, water heater, rewire, hvac, adu, solar. Nine of the
- *      twenty-three golden queries return no rows at all. That is the taxonomy
- *      and synonym gap, and it is the largest single number on the table.
+ *   3. FIXED. Every trade word and every natural-language query scored zero:
+ *      water heater, rewire, hvac, adu, leaking pipe, solar. Nine of the
+ *      twenty-three golden queries returned no rows at all, which was by some
+ *      distance the largest number on the table.
+ *
+ *      Two causes, and only the second was the obvious one. The taxonomy held
+ *      six of ~80 CSLB classifications, so a C-20 licence carried no trade to
+ *      match; that is now 75, covering 98.9% of the register. But expanding it
+ *      fixed the `?trade=` filter and changed the search box not at all,
+ *      because free text is compared against a business name and a bio and no
+ *      business is called "hvac". The gap was vocabulary, not retrieval:
+ *      `trade_aliases` maps how a person describes a problem to how a licence
+ *      is classified, and the query resolves through it before the search runs.
+ *      Together: 0.644/0.667 -> 0.971/1.000.
  */
 
-/// Mean NDCG@10 across the golden set. Measured: 0.644 (0.468 before the
-/// word-similarity operator, 0.607 before the threshold).
-const NDCG_FLOOR: f64 = 0.62;
-/// Mean Recall@20 across the golden set. Measured: 0.667 (0.471, then 0.623).
-const RECALL_FLOOR: f64 = 0.64;
+/// Mean NDCG@10 across the golden set. Measured: 0.971. The road here was
+/// 0.468 at the start, 0.607 with word similarity, 0.644 at the measured
+/// threshold, 0.971 once queries routed through the trade vocabulary.
+const NDCG_FLOOR: f64 = 0.95;
+/// Mean Recall@20. Measured: 1.000 — every golden query now finds everything it
+/// should. Pinned just under, so a single lost result fails the build.
+const RECALL_FLOOR: f64 = 0.98;
 /// Looking a business up by name is what search already does well, so it is
 /// pinned separately and tightly — a change that chases recall and quietly
 /// costs plain lookup fails here while the mean still looks healthy.
@@ -285,6 +297,9 @@ async fn seed_corpus(pool: &PgPool) {
     cm_db::repo::reference::seed_trades(&mut conn)
         .await
         .expect("trades");
+    cm_db::repo::reference::seed_trade_aliases(&mut conn)
+        .await
+        .expect("aliases");
 
     for (code, name, lat, lon) in ZIPS {
         cm_db::repo::reference::upsert_zcta(&mut conn, code, name, *lat, *lon, "test")
@@ -423,8 +438,16 @@ async fn score_golden_set(pool: &PgPool) -> Vec<Scored> {
     let mut scored = Vec::new();
 
     for entry in golden_set() {
+        // Routed through the alias vocabulary first, the way the handler does
+        // it. Skipping that here would measure a search the product does not
+        // ship.
+        let query_trade_ids = cm_db::repo::reference::trades_matching_text(&mut conn, &entry.query)
+            .await
+            .expect("trade routing");
+
         let filters = Filters {
             query: Some(entry.query.clone()),
+            query_trade_ids,
             ..Filters::default()
         };
 

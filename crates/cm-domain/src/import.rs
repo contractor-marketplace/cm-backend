@@ -416,9 +416,12 @@ pub async fn run(pool: &PgPool, options: &ImportOptions) -> Result<RunCounts, Ap
         ));
     }
 
+    // Every trade, not just the featured ones: a licence classified C-11 must
+    // still import as an elevator contractor even though the directory does not
+    // offer "Elevator" as a filter.
     let trades = {
         let mut conn = pool.acquire().await.map_err(AppError::internal)?;
-        reference::all_trades(&mut conn).await?
+        reference::all_trades_for_import(&mut conn).await?
     };
     let trade_by_classification: HashMap<String, uuid::Uuid> = trades
         .iter()
@@ -493,6 +496,7 @@ async fn import_rows<R: std::io::Read>(
         .as_ref()
         .map(|c| c.trim().to_ascii_uppercase());
     let mut counts = RunCounts::default();
+    let mut unmapped: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     let mut batch: Vec<LicenseRecord> = Vec::with_capacity(options.batch_size);
 
     for row in reader.records() {
@@ -535,6 +539,7 @@ async fn import_rows<R: std::io::Read>(
                 &mut batch,
                 trade_by_classification,
                 &mut counts,
+                &mut unmapped,
             )
             .await?;
         }
@@ -548,8 +553,31 @@ async fn import_rows<R: std::io::Read>(
             &mut batch,
             trade_by_classification,
             &mut counts,
+            &mut unmapped,
         )
         .await?;
+    }
+
+    // Say what was dropped. A classification with no trade means those
+    // contractors match no trade filter at all, and the only way that was ever
+    // visible before was to go looking for it.
+    if !unmapped.is_empty() {
+        let total: u32 = unmapped.values().sum();
+        let mut worst: Vec<(&String, &u32)> = unmapped.iter().collect();
+        worst.sort_by(|a, b| b.1.cmp(a.1));
+        let sample: Vec<String> = worst
+            .iter()
+            .take(10)
+            .map(|(code, count)| format!("{code}={count}"))
+            .collect();
+
+        tracing::warn!(
+            distinct = unmapped.len(),
+            occurrences = total,
+            top = %sample.join(" "),
+            "classifications with no matching trade; those contractors match no trade filter. \
+             Add them to CANONICAL_TRADES if they should be searchable."
+        );
     }
 
     Ok(counts)
@@ -563,6 +591,7 @@ async fn flush(
     batch: &mut Vec<LicenseRecord>,
     trade_by_classification: &HashMap<String, uuid::Uuid>,
     counts: &mut RunCounts,
+    unmapped: &mut std::collections::BTreeMap<String, u32>,
 ) -> Result<(), AppError> {
     if options.dry_run {
         counts.inserted += batch.len() as i32;
@@ -612,15 +641,17 @@ async fn flush(
         )
         .await?;
 
-        let trade_ids: Vec<uuid::Uuid> = record
-            .classifications
-            .iter()
-            .filter_map(|classification| {
-                trade_by_classification
-                    .get(&normalise_classification(classification))
-                    .copied()
-            })
-            .collect();
+        // A classification with no trade is counted, not discarded. The
+        // silent version of this line is how six seeded trades came to cover
+        // 61% of the register without anything ever saying so.
+        let mut trade_ids: Vec<uuid::Uuid> = Vec::new();
+        for classification in &record.classifications {
+            let normalised = normalise_classification(classification);
+            match trade_by_classification.get(&normalised) {
+                Some(id) => trade_ids.push(*id),
+                None => *unmapped.entry(normalised).or_insert(0) += 1,
+            }
+        }
         contractors::replace_cslb_trades(&mut tx, upserted.id, &trade_ids).await?;
 
         // Publish a point immediately, so a contractor is searchable before any

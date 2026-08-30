@@ -144,3 +144,130 @@ async fn the_shipped_centroid_file_covers_the_county(pool: PgPool) {
         );
     }
 }
+
+/// The alias vocabulary is what makes the search box work for people who
+/// describe a problem instead of naming a trade. "hvac" appears in no business
+/// name and never will, so without this it matches nothing however good the
+/// text search is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_problem_description_routes_to_the_right_trade(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("connection");
+    reference::seed_trades(&mut conn).await.expect("trades");
+    reference::seed_trade_aliases(&mut conn)
+        .await
+        .expect("aliases");
+
+    let slug_of = |trades: &[cm_db::repo::reference::Trade], id: uuid::Uuid| {
+        trades
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.slug.clone())
+            .expect("known trade")
+    };
+    let all = reference::all_trades_for_import(&mut conn)
+        .await
+        .expect("trades");
+
+    for (query, expected) in [
+        ("hvac", "hvac"),
+        ("air conditioning", "hvac"),
+        ("water heater", "plumber"),
+        ("rewire", "electrician"),
+        ("adu", "general-contractor"),
+        ("tree removal", "tree-service"),
+        ("solar panels", "solar"),
+        // The trade's own name is seeded as an alias, so the obvious word works.
+        ("plumber", "plumber"),
+    ] {
+        let ids = reference::trades_matching_text(&mut conn, query)
+            .await
+            .expect("routing");
+        let slugs: Vec<String> = ids.iter().map(|id| slug_of(&all, *id)).collect();
+        assert!(
+            slugs.iter().any(|slug| slug == expected),
+            "{query:?} should route to {expected}, got {slugs:?}"
+        );
+    }
+}
+
+/// Routing has to stay narrow, and one shared common word is not an intent.
+///
+/// "tree removal" once routed to construction cleanup, because it scored 0.615
+/// against the alias "junk removal" — over the 0.5 bar that is right for
+/// business names and badly wrong for short curated phrases, where "removal"
+/// alone carries the match. Tree work came back as janitorial companies.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_business_name_does_not_route_to_a_trade(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("connection");
+    reference::seed_trades(&mut conn).await.expect("trades");
+    reference::seed_trade_aliases(&mut conn)
+        .await
+        .expect("aliases");
+
+    for query in ["ibarra", "keystone", "verdant", "zzzzznotarealbusiness"] {
+        let ids = reference::trades_matching_text(&mut conn, query)
+            .await
+            .expect("routing");
+        assert!(
+            ids.is_empty(),
+            "{query:?} is a name, not a trade, but routed to {} trade(s)",
+            ids.len()
+        );
+    }
+
+    // Shares a word with several aliases, and means exactly one of them.
+    let all = reference::all_trades_for_import(&mut conn)
+        .await
+        .expect("trades");
+    let routed: Vec<String> = reference::trades_matching_text(&mut conn, "tree removal")
+        .await
+        .expect("routing")
+        .iter()
+        .map(|id| {
+            all.iter()
+                .find(|t| t.id == *id)
+                .map(|t| t.slug.clone())
+                .expect("known trade")
+        })
+        .collect();
+    assert_eq!(routed, vec!["tree-service".to_owned()], "{routed:?}");
+}
+
+/// The vocabulary is a projection of the constant, so a deleted alias has to
+/// actually disappear rather than linger and keep routing searches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reseeding_aliases_removes_what_the_constant_no_longer_says(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("connection");
+    reference::seed_trades(&mut conn).await.expect("trades");
+    reference::seed_trade_aliases(&mut conn)
+        .await
+        .expect("aliases");
+
+    sqlx::query(
+        "INSERT INTO trade_aliases (id, trade_id, alias) \
+         SELECT $1, id, 'a stale mapping' FROM trades WHERE slug = 'plumber'",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .execute(&mut *conn)
+    .await
+    .expect("stale row");
+
+    assert!(
+        !reference::trades_matching_text(&mut conn, "a stale mapping")
+            .await
+            .expect("routing")
+            .is_empty()
+    );
+
+    reference::seed_trade_aliases(&mut conn)
+        .await
+        .expect("reseed");
+
+    assert!(
+        reference::trades_matching_text(&mut conn, "a stale mapping")
+            .await
+            .expect("routing")
+            .is_empty(),
+        "a reseed must clear what the constant no longer says"
+    );
+}

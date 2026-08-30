@@ -503,11 +503,21 @@ async fn load_regions_inner(
 async fn seed_trades(config: Config) -> Result<(), cm_core::AppError> {
     let pool = cm_db::connect(&config.database).await?;
     let mut conn = pool.acquire().await.map_err(cm_core::AppError::internal)?;
-    let inserted = cm_db::repo::reference::seed_trades(&mut conn).await;
+    let (written, total) = cm_db::repo::reference::seed_trades(&mut conn).await?;
+
+    // Seeding the taxonomy is only half of it: contractors already imported
+    // carry whatever trades the taxonomy held when they were imported, and
+    // re-importing will not revisit them because an unchanged licence
+    // short-circuits. Deriving here is what makes a taxonomy change reach the
+    // directory.
+    let aliases = cm_db::repo::reference::seed_trade_aliases(&mut conn).await?;
+    let rederived = cm_db::repo::reference::rederive_cslb_trades(&mut conn).await;
     drop(conn);
     pool.close().await;
 
-    println!("inserted {} trade(s)", inserted?);
+    let (added, removed) = rederived?;
+    println!("wrote {written} of {total} trade(s), {aliases} alias(es)");
+    println!("re-derived contractor trades: {added} added, {removed} removed");
     Ok(())
 }
 

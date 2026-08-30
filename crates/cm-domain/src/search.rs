@@ -65,6 +65,23 @@ pub fn parse(raw: &RawQuery, trade_ids: Vec<Uuid>) -> Result<SearchRequest, AppE
 
     filters.verified_only = matches!(raw.verified.as_deref(), Some("1" | "true" | "yes"));
 
+    // A trade nobody offers is a dropped filter and has to say so. The caller
+    // resolves slugs to ids; slugs that match no trade simply do not come back,
+    // and an empty set reads downstream as "no trade filter" — so `?trade=banana`
+    // widened the search to every contractor in the county and reported nothing,
+    // the one filter with no such reporting. Only a wholly unresolved parameter
+    // is reported: `?trade=plumber,banana` still filters by plumber, and saying
+    // "trade" there would make the client clear a control that is working.
+    if raw
+        .trade
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|trade| !trade.is_empty())
+        && filters.trade_ids.is_empty()
+    {
+        ignored.push("trade".to_owned());
+    }
+
     match raw.zip.as_deref().map(str::trim).filter(|z| !z.is_empty()) {
         Some(zip) if zip.len() == 5 && zip.chars().all(|c| c.is_ascii_digit()) => {
             filters.postal_code = Some(zip.to_owned());

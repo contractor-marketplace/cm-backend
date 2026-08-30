@@ -42,14 +42,34 @@ async fn trade_ids(state: &AppState, trade: Option<&str>) -> Result<Vec<Uuid>, A
     reference::trade_ids_for_slugs(&mut conn, &slugs).await
 }
 
+/// The trades a free-text query is asking for.
+///
+/// "hvac" is not a business name and never will be, so matching it against
+/// names and bios finds nothing however well that matching works. Resolving it
+/// through the alias vocabulary first turns a hopeless text query into an
+/// indexed semi-join. Applied to the list and the map alike, or the two would
+/// disagree about what matches — which is the one thing the shared predicate
+/// exists to prevent.
+async fn query_trades(
+    conn: &mut sqlx::PgConnection,
+    query: Option<&str>,
+) -> Result<Vec<Uuid>, AppError> {
+    match query {
+        Some(query) => reference::trades_matching_text(conn, query).await,
+        None => Ok(Vec::new()),
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
     Query(raw): Query<search_input::RawQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
     let ids = trade_ids(&state, raw.trade.as_deref()).await?;
-    let request = search_input::parse(&raw, ids)?;
+    let mut request = search_input::parse(&raw, ids)?;
 
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+    request.filters.query_trade_ids =
+        query_trades(&mut conn, request.filters.query.as_deref()).await?;
     let mut page = search::list(
         &mut conn,
         &request.filters,
@@ -98,9 +118,11 @@ pub async fn map(
     Query(raw): Query<search_input::RawQuery>,
 ) -> Result<Json<MapResponse>, AppError> {
     let ids = trade_ids(&state, raw.trade.as_deref()).await?;
-    let request = search_input::parse(&raw, ids)?;
+    let mut request = search_input::parse(&raw, ids)?;
 
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+    request.filters.query_trade_ids =
+        query_trades(&mut conn, request.filters.query.as_deref()).await?;
     let (found, truncated) =
         search::map_points(&mut conn, &request.filters, search::MAX_MAP_POINTS).await?;
 

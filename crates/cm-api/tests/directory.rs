@@ -346,6 +346,90 @@ async fn only_the_claimant_may_edit_a_listing_and_never_its_badge(pool: PgPool) 
         .contains("computed"));
 }
 
+/// A trade filter nobody offers must say so, because the alternative is worse
+/// than an error: an unresolved slug leaves an empty id set, which every layer
+/// below reads as "no trade filter", so `?trade=banana` used to return every
+/// contractor in the county while reporting nothing. Of all the optional
+/// filters it was the only one that could not explain itself.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unknown_trade_reports_itself_instead_of_widening_the_search(pool: PgPool) {
+    seed_directory(&pool).await;
+    let mut client = Client::new(router(pool));
+
+    let response = client.get("/v1/contractors?trade=banana").await;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let ignored: Vec<&str> = response.json["ignored_filters"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        ignored.contains(&"trade"),
+        "an unresolved trade must be reported: {:?}",
+        response.json
+    );
+
+    // A filter that partly resolves is still doing its job, and saying "trade"
+    // there would make the client clear a control that is working.
+    let mixed = client.get("/v1/contractors?trade=plumber,banana").await;
+    assert_eq!(mixed.status, StatusCode::OK);
+    let names: Vec<&str> = mixed.json["contractors"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["display_name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["Stillwater Plumbing"], "{names:?}");
+    assert!(
+        !mixed.json["ignored_filters"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v.as_str() == Some("trade")))
+            .unwrap_or(false),
+        "a partly resolved trade filter is not an ignored one: {:?}",
+        mixed.json
+    );
+}
+
+/// A licence in a class the picker does not offer still carries that trade.
+/// The importer reads every trade; only the directory's filter list is
+/// shortened. Getting this backwards would mean a C-20 licence imports with no
+/// trade purely because "Heating & Air Conditioning" was not in a dropdown.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unfeatured_classification_is_still_imported_as_a_trade(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("connection");
+    cm_db::repo::reference::seed_trades(&mut conn)
+        .await
+        .expect("trades");
+
+    let offered = cm_db::repo::reference::all_trades(&mut conn)
+        .await
+        .expect("offered");
+    let importable = cm_db::repo::reference::all_trades_for_import(&mut conn)
+        .await
+        .expect("importable");
+
+    assert!(
+        importable.len() > offered.len(),
+        "the import set must be the wider one: {} vs {}",
+        importable.len(),
+        offered.len()
+    );
+    assert!(
+        importable
+            .iter()
+            .any(|trade| trade.cslb_classification.as_deref() == Some("C-11")),
+        "an unfeatured classification is missing from the import set"
+    );
+    assert!(
+        !offered
+            .iter()
+            .any(|trade| trade.cslb_classification.as_deref() == Some("C-11")),
+        "an unfeatured classification must not reach the picker"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn reference_data_is_public(pool: PgPool) {
     seed_directory(&pool).await;
@@ -353,7 +437,34 @@ async fn reference_data_is_public(pool: PgPool) {
 
     let trades = client.get("/v1/trades").await;
     assert_eq!(trades.status, StatusCode::OK);
-    assert_eq!(trades.json.as_array().expect("array").len(), 6);
+
+    // The picker offers the featured trades, not the whole classification set:
+    // a homeowner choosing between 75 entries that open with "Air and Water
+    // Balancing" is reading a haystack. Everything unfeatured is still matched
+    // on import — see `all_trades_for_import`.
+    let offered = trades.json.as_array().expect("array");
+    let featured = cm_db::repo::reference::CANONICAL_TRADES
+        .iter()
+        .filter(|trade| trade.featured)
+        .count();
+    assert_eq!(offered.len(), featured);
+
+    let slugs: Vec<&str> = offered
+        .iter()
+        .filter_map(|trade| trade["slug"].as_str())
+        .collect();
+    assert_eq!(
+        slugs.first(),
+        Some(&"general-contractor"),
+        "the picker leads with what is searched most: {slugs:?}"
+    );
+    for expected in ["plumber", "electrician", "hvac", "roofer"] {
+        assert!(slugs.contains(&expected), "{expected} is not offered");
+    }
+    assert!(
+        !slugs.contains(&"wood-tanks"),
+        "an unfeatured trade must not reach the picker: {slugs:?}"
+    );
 
     let regions = client.get("/v1/regions").await;
     assert_eq!(regions.status, StatusCode::OK);

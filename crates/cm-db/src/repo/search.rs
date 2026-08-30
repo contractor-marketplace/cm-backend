@@ -53,6 +53,14 @@ pub struct Filters {
     pub postal_code: Option<String>,
     pub near: Option<Near>,
     pub bbox: Option<BoundingBox>,
+    /// Trades the free-text query itself asked for.
+    ///
+    /// Distinct from `trade_ids`, which is the filter a caller set explicitly.
+    /// These come from resolving `query` through the alias vocabulary, and they
+    /// widen the text match rather than narrowing the result set: "hvac" should
+    /// find heating contractors *as well as* anything named "HVAC", not
+    /// intersect the two.
+    pub query_trade_ids: Vec<Uuid>,
 }
 
 /// The similarity a query word must reach against a business name for the
@@ -89,7 +97,7 @@ pub const MAX_MAP_POINTS: i64 = 500;
 /// New filters append: `$1`–`$11` keep their meanings, which is what lets
 /// `SELECT` reference the centre as `$1`/`$2` and the relevance ordering
 /// reference the query text as `$4` without either of them moving.
-const PREDICATE_BINDS: usize = 11;
+const PREDICATE_BINDS: usize = 12;
 
 /// The query-text slot. Referenced by the predicate and, separately, by the
 /// relevance ordering — a coupling `the_relevance_ordering_reads_the_query_bind`
@@ -111,8 +119,12 @@ const QUERY_BIND: usize = 4;
 const PREDICATE: &str = "\
     ($1::float8 IS NULL OR ST_DWithin(c.public_point, \
         ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)) \
-    AND ($4::text IS NULL OR c.search_doc @@ websearch_to_tsquery('public.english_unaccent', $4) \
-         OR $4 <% c.display_name) \
+    AND ($4::text IS NULL \
+         OR c.search_doc @@ websearch_to_tsquery('public.english_unaccent', $4) \
+         OR $4 <% c.display_name \
+         OR ($12::uuid[] IS NOT NULL AND EXISTS ( \
+                SELECT 1 FROM contractor_trades qt \
+                 WHERE qt.contractor_id = c.id AND qt.trade_id = ANY($12)))) \
     AND (NOT $5::bool OR c.verified) \
     AND ($6::uuid[] IS NULL OR EXISTS ( \
             SELECT 1 FROM contractor_trades ct \
@@ -137,6 +149,7 @@ fn bind_filters<'q>(
         .bind(filters.bbox.map(|b| b.min_lat))
         .bind(filters.bbox.map(|b| b.max_lon))
         .bind(filters.bbox.map(|b| b.max_lat))
+        .bind((!filters.query_trade_ids.is_empty()).then(|| filters.query_trade_ids.clone()))
 }
 
 /// The projection. `precise_point` is absent by construction.

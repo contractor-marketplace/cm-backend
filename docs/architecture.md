@@ -7,7 +7,7 @@ Companion documents: `runbook.md` is the operational procedure (deploy order,
 imports, backups, incident response); `README.md` is how to run it locally.
 This one is the map.
 
-Accurate as of migration **0024**, 2026-08-27.
+Accurate as of migration **0025**, 2026-08-30.
 
 ---
 
@@ -103,7 +103,7 @@ cm-server      960  the binary and its subcommands
 
 ## 4. The database
 
-24 migrations, applied in order, checksummed. Editing an applied migration is
+25 migrations, applied in order, checksummed. Editing an applied migration is
 rejected — there is a test that tampers with `0001` and asserts the failure.
 
 | # | What it added |
@@ -132,6 +132,7 @@ rejected — there is a test that tampers with `0001` and asserts the failure.
 | 0022 | Publishing the Google reviews the enrichment load collected |
 | 0023 | A link back to the Google listing the reviews came from |
 | 0024 | What a contractor owns about their own listing |
+| 0025 | The words homeowners use for trades |
 
 ### Schema invariants, enforced by tests
 
@@ -398,10 +399,47 @@ It is what makes "did that ranking change help?" a number rather than an
 argument, and it is how the `%`/`<%` defect above was found and then shown
 fixed (0.468 → 0.607 NDCG@10, 0.471 → 0.623 Recall@20).
 
-Nine of the 23 queries still score zero — `plumber` before the fix, and still
-`roofer`, `water heater`, `hvac`, `adu`, `solar`. Those are the taxonomy and
-synonym gaps: only 6 of ~80 CSLB classifications are seeded as trades, so a
-licence in any other class carries no trade at all.
+### The taxonomy, and the words people use
+
+Two layers sit between "what a homeowner typed" and "which licence class".
+
+**The classification set.** `trades` held six of the ~80 CSLB classifications,
+because v1 only filtered on a handful. The importer maps a licence through that
+table and drops what it cannot match, so a licence in any other class arrived
+with **no trade at all**: six classifications cover 61% of the 311,732
+licence-classification pairs in the real register, and 27% of a 3,000-row sample
+matched no trade filter that existed. It is now 75, covering 98.9%, and the
+importer logs what it still drops rather than discarding it silently — currently
+`HAZ` and `ASB`, which are certifications rather than classifications, and a
+handful of D-codes CSLB no longer publishes names for.
+
+`seed-trades` also re-derives every contractor's trades, because nothing else
+can: a migration runs *before* it in the deploy order, and re-importing the same
+file short-circuits on unchanged licences and never reaches the trade-writing
+line.
+
+Not every trade is offered as a filter. `active` marks the 30 a homeowner would
+plausibly pick; the other 45 are matched on import and reachable by search, but
+kept out of a picker that would otherwise open with "Air and Water Balancing".
+
+**The vocabulary.** Expanding the taxonomy fixed the `?trade=` filter and did
+nothing for the search box, because free text is matched against a business name
+and a bio and no business is called "hvac". `trade_aliases` maps how a person
+describes a problem — "water heater", "rewire", "adu", "leaking pipe" — to how a
+licence is classified, and a query resolves through it before the search runs. A
+table rather than a model: the mapping is small and knowable, and a wrong entry
+is one statement to fix.
+
+Alias matching uses a stricter similarity bar than name matching (0.70 against
+0.50), and the two are separate for a measured reason: at the name threshold
+"tree removal" matched the alias "junk removal" at 0.615 and returned janitorial
+companies for tree work. A short curated phrase is dominated by one shared common
+word in a way a business name is not.
+
+Together these took the golden set from 0.644/0.667 to **0.971 NDCG@10 and 1.000
+Recall@20**. What remains below 1.0 is a ranking problem, not a retrieval one:
+queries matching two businesses tie on `ts_rank` and fall back to alphabetical
+order, which puts a 3.8-star unclaimed listing above a 4.5-star verified one.
 
 ---
 
@@ -504,7 +542,7 @@ Credentials live at `/etc/cm-backend/env` (service) and
 
 ## 15. Testing
 
-333 test functions. Every database test runs against a **real PostgreSQL 16 with
+342 test functions. Every database test runs against a **real PostgreSQL 16 with
 PostGIS** — there is no mocked database anywhere in the suite, on purpose.
 
 | Area | What is covered |
