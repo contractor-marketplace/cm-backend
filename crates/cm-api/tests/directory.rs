@@ -430,6 +430,107 @@ async fn an_unfeatured_classification_is_still_imported_as_a_trade(pool: PgPool)
     );
 }
 
+/// Every sort has to paginate, and the reason this is asserted for all of them
+/// at once is that it used not to be true for any but one.
+///
+/// The cursor carried `(display_name, id)` whatever the ORDER BY led with, so
+/// under `sort=distance` page two filtered on a column it was not ordered by
+/// and dropped rows on the floor. The front end worked around it by refusing to
+/// paginate those sorts, capping them at fifty results with no way past.
+///
+/// Walking a page at a time and demanding every contractor exactly once is the
+/// cheapest statement of "the cursor and the ordering agree", and it fails on
+/// both halves of the old bug: a mismatched key loses rows, and a mismatched
+/// direction repeats them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_sort_pages_through_the_whole_directory_exactly_once(pool: PgPool) {
+    seed_directory(&pool).await;
+    let mut client = Client::new(router(pool));
+
+    let expected = 4;
+    for sort in [
+        "",
+        "?sort=best",
+        "?sort=rating",
+        "?sort=name",
+        "?sort=relevance",
+        "?q=co&sort=best",
+        "?lat=34.05&lon=-118.30&radius_m=200000&sort=distance",
+    ] {
+        let base = if sort.is_empty() {
+            "/v1/contractors?limit=1".to_owned()
+        } else {
+            format!("/v1/contractors{sort}&limit=1")
+        };
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..12 {
+            let path = match &cursor {
+                Some(value) => format!("{base}&cursor={value}"),
+                None => base.clone(),
+            };
+            let response = client.get(&path).await;
+            assert_eq!(
+                response.status,
+                StatusCode::OK,
+                "{path}: {:?}",
+                response.json
+            );
+
+            for contractor in response.json["contractors"].as_array().expect("array") {
+                seen.push(contractor["id"].as_str().expect("id").to_owned());
+            }
+            match response.json["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(
+            seen.len(),
+            unique.len(),
+            "{sort:?} returned a contractor twice: {seen:?}"
+        );
+
+        // `?q=co` is a filter, so it is allowed to match fewer than everything;
+        // what it may not do is lose or repeat one while paging.
+        if !sort.contains("q=") {
+            assert_eq!(
+                seen.len(),
+                expected,
+                "{sort:?} paged through {} of {expected} contractors",
+                seen.len()
+            );
+        }
+    }
+}
+
+/// A cursor issued before the sort key joined it is refused rather than
+/// half-understood. Resuming a scored ordering from a name is the defect the
+/// key was added to fix, so accepting the old shape would reintroduce it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cursor_from_the_previous_shape_is_refused(pool: PgPool) {
+    seed_directory(&pool).await;
+    let mut client = Client::new(router(pool));
+
+    use base64::Engine;
+    let old_shape = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(format!("{}\u{0}Ibarra & Daughters", uuid::Uuid::now_v7()));
+
+    let response = client
+        .get(&format!("/v1/contractors?cursor={old_shape}"))
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        response.json
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn reference_data_is_public(pool: PgPool) {
     seed_directory(&pool).await;

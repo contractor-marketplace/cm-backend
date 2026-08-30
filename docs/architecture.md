@@ -7,7 +7,7 @@ Companion documents: `runbook.md` is the operational procedure (deploy order,
 imports, backups, incident response); `README.md` is how to run it locally.
 This one is the map.
 
-Accurate as of migration **0025**, 2026-08-30.
+Accurate as of migration **0026**, 2026-08-30.
 
 ---
 
@@ -103,7 +103,7 @@ cm-server      960  the binary and its subcommands
 
 ## 4. The database
 
-25 migrations, applied in order, checksummed. Editing an applied migration is
+26 migrations, applied in order, checksummed. Editing an applied migration is
 rejected — there is a test that tampers with `0001` and asserts the failure.
 
 | # | What it added |
@@ -133,6 +133,7 @@ rejected — there is a test that tampers with `0001` and asserts the failure.
 | 0023 | A link back to the Google listing the reviews came from |
 | 0024 | What a contractor owns about their own listing |
 | 0025 | The words homeowners use for trades |
+| 0026 | The standing quality score the directory ranks by |
 
 ### Schema invariants, enforced by tests
 
@@ -368,8 +369,54 @@ form.
 
 ## 11. Search
 
-Keyset pagination on `(display_name, id)`, never `OFFSET` — which both scans
-what it skips and duplicates rows when the data shifts between pages.
+### What the directory ranks by
+
+Four terms, ordered by how much each actually tells you: **the text matched**
+(1.0), **this is that kind of contractor** (0.75, the query resolved through the
+trade vocabulary and the listing holds the licence class), **the name is close**
+(0.5, a typo), and then `ts_rank_cd` to separate text matches from each other
+plus a standing `quality_score` to order equals.
+
+That order was measured, not assumed. A trade match sits above a fuzzy name
+match because "solar" is one letter from "Polar", and an actual solar contractor
+should outrank an air-conditioning company whose name nearly rhymes — which is
+exactly what the golden set caught.
+
+`quality_score` is one number per contractor, recomputed nightly beside the
+badge: a Bayesian-adjusted rating so a lone five-star review does not outrank a
+4.7 across three hundred, a log-scaled review count that saturates, and boosts
+for verified, claimed and a filled-in page. The weights are configuration
+(`CM_RANK_W_*`), because ranking is tuned by looking at results and a weight
+that needs a redeploy does not get tuned.
+
+With no query the text terms are zero and the whole thing is quality, which is
+what turned the first page from "whoever is called A..." into best-first. That
+is `docs/architecture.md` open item #2, now closed.
+
+Distance is deliberately not a term. Everything inside a radius filter is
+already near enough, and blending distance in would mean a slightly closer,
+slightly worse contractor outranks a better one for reasons the visitor cannot
+see. `sort=distance` remains and says plainly what it does.
+
+Sorts: `best` (default), `rating`, `distance`, `name`. `relevance` is still
+accepted as the old name for `best`, so shared links keep working.
+
+### Pagination
+
+Keyset, never `OFFSET` — which both scans what it skips and duplicates rows when
+the data shifts between pages.
+
+The cursor carries the key its ordering leads with, not just `(display_name,
+id)`. It did not, and that was a real defect: under `sort=distance` page two
+filtered on a column it was not ordered by and silently dropped rows, which the
+front end worked around by refusing to paginate that sort at all and capping it
+at fifty results.
+
+The comparison is written as "past the key, or level with it and past the
+tie-break" rather than as one row-wise `(a, b, c) < (x, y, z)`, because a
+row-wise comparison applies a single direction to every column while the
+ordering is `key DESC, display_name ASC, id ASC`. Getting that wrong returns a
+short page that looks like a page.
 
 **One shared `WHERE` clause** backs the list and the map, so they can never
 disagree about what matches. A map showing pins the list omits is a bug report
@@ -542,7 +589,7 @@ Credentials live at `/etc/cm-backend/env` (service) and
 
 ## 15. Testing
 
-342 test functions. Every database test runs against a **real PostgreSQL 16 with
+354 test functions. Every database test runs against a **real PostgreSQL 16 with
 PostGIS** — there is no mocked database anywhere in the suite, on purpose.
 
 | Area | What is covered |

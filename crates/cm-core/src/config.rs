@@ -269,6 +269,36 @@ pub struct Config {
     /// `Config::production_gaps`, which is what stops an unset variable from
     /// quietly downgrading a live server to storage that vanishes on restart.
     pub job_photo_bucket: Option<String>,
+    /// How much each signal counts when the directory ranks a listing.
+    ///
+    /// Configurable because ranking is the one thing here that is tuned by
+    /// looking at results rather than reasoned to in advance, and a weight that
+    /// needs a redeploy to change does not get changed. Every value is a
+    /// fraction; they do not have to sum to anything, because the score
+    /// normalises by their total.
+    pub ranking: RankingConfig,
+}
+
+/// The ranking weights, one per reason a listing might rank well.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankingConfig {
+    pub rating: f32,
+    pub reviews: f32,
+    pub verified: f32,
+    pub claimed: f32,
+    pub completeness: f32,
+}
+
+impl Default for RankingConfig {
+    fn default() -> Self {
+        Self {
+            rating: 0.40,
+            reviews: 0.25,
+            verified: 0.20,
+            claimed: 0.05,
+            completeness: 0.10,
+        }
+    }
 }
 
 /// One thing wrong with the environment.
@@ -389,6 +419,25 @@ impl Config {
                 Some(Environment::Development) | None => LogFormat::Pretty,
                 Some(_) => LogFormat::Json,
             }),
+        };
+
+        let defaults = RankingConfig::default();
+        let ranking = RankingConfig {
+            rating: weight(&source, "CM_RANK_W_RATING", defaults.rating, &mut errors),
+            reviews: weight(&source, "CM_RANK_W_REVIEWS", defaults.reviews, &mut errors),
+            verified: weight(
+                &source,
+                "CM_RANK_W_VERIFIED",
+                defaults.verified,
+                &mut errors,
+            ),
+            claimed: weight(&source, "CM_RANK_W_CLAIMED", defaults.claimed, &mut errors),
+            completeness: weight(
+                &source,
+                "CM_RANK_W_COMPLETENESS",
+                defaults.completeness,
+                &mut errors,
+            ),
         };
 
         let max_connections = bounded_or_default::<u32>(
@@ -556,6 +605,7 @@ impl Config {
         // Every `expect` below is unreachable: a `None` pushed an error, and a
         // non-empty error list returned above.
         Ok(Self {
+            ranking,
             environment: environment.expect("environment validated"),
             bind_addr: bind_addr.expect("bind_addr validated"),
             site_origin: site_origin.expect("site_origin validated"),
@@ -723,6 +773,45 @@ where
                 reason: expected.to_owned(),
             });
             None
+        }
+    }
+}
+
+/// A ranking weight: a fraction, bounded so a mistyped value cannot silently
+/// dominate every other signal.
+///
+/// Zero is allowed and means "this reason does not count", which is a real
+/// thing an operator might want. Negative is not: a weight that subtracts would
+/// rank a well-reviewed listing below an unreviewed one, and there is no
+/// reading of the scoring rule where that is intended rather than a typo.
+fn weight(
+    source: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: f32,
+    errors: &mut Vec<ConfigError>,
+) -> f32 {
+    let Some(raw) = source(key).map(|value| value.trim().to_owned()) else {
+        return default;
+    };
+    if raw.is_empty() {
+        return default;
+    }
+
+    match raw.parse::<f32>() {
+        Ok(value) if value.is_finite() && (0.0..=1.0).contains(&value) => value,
+        Ok(_) => {
+            errors.push(ConfigError::Invalid {
+                key,
+                reason: "must be a number between 0 and 1".to_owned(),
+            });
+            default
+        }
+        Err(_) => {
+            errors.push(ConfigError::Invalid {
+                key,
+                reason: "must be a number between 0 and 1".to_owned(),
+            });
+            default
         }
     }
 }

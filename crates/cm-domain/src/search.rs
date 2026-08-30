@@ -117,7 +117,10 @@ pub fn parse(raw: &RawQuery, trade_ids: Vec<Uuid>) -> Result<SearchRequest, AppE
     }
 
     let sort = match raw.sort.as_deref() {
-        None | Some("relevance") => Sort::Relevance,
+        // "relevance" is the name the previous release used for the default and
+        // is still accepted, so a shared or bookmarked link keeps working.
+        None | Some("best") | Some("relevance") => Sort::Best,
+        Some("rating") => Sort::Rating,
         Some("distance") => {
             if filters.near.is_none() {
                 // Sorting by distance from nowhere is meaningless; say so
@@ -131,7 +134,7 @@ pub fn parse(raw: &RawQuery, trade_ids: Vec<Uuid>) -> Result<SearchRequest, AppE
         Some("name") => Sort::Name,
         Some(other) => {
             return Err(AppError::invalid(format!(
-                "unknown sort \"{other}\"; expected relevance, distance or name"
+                "unknown sort \"{other}\"; expected best, rating, distance or name"
             )))
         }
     };
@@ -202,23 +205,47 @@ fn parse_bbox(value: &str) -> Option<BoundingBox> {
 
 /// Cursors are opaque: the client should not construct one, and encoding the
 /// sort key in the clear invites exactly that.
+/// Opaque by encoding, and versioned by shape.
+///
+/// The payload gained a third field when the cursor learned to carry the key
+/// its ordering leads with. A cursor from the previous release has two, fails
+/// the shape check in `decode_cursor`, and comes back as a 400 that says the
+/// page cursor is not valid — which is the right answer. The alternative was to
+/// accept it and resume a scored ordering from a name, which is the bug this
+/// replaced.
 pub fn encode_cursor(cursor: &Cursor) -> String {
-    URL_SAFE_NO_PAD.encode(format!("{}\u{0}{}", cursor.id, cursor.name))
+    let key = cursor
+        .sort_key
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    URL_SAFE_NO_PAD.encode(format!("{}\u{0}{}\u{0}{}", cursor.id, key, cursor.name))
 }
 
 fn decode_cursor(value: &str) -> Result<Cursor, AppError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| AppError::invalid("that page cursor is not valid"))?;
-    let text =
-        String::from_utf8(bytes).map_err(|_| AppError::invalid("that page cursor is not valid"))?;
-    let (id, name) = text
-        .split_once('\u{0}')
-        .ok_or_else(|| AppError::invalid("that page cursor is not valid"))?;
+    let invalid = || AppError::invalid("that page cursor is not valid");
+
+    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| invalid())?;
+    let text = String::from_utf8(bytes).map_err(|_| invalid())?;
+
+    // id \0 sort key \0 name. The name is last because it is the only field
+    // that may itself contain anything, and splitting from the left twice
+    // leaves the remainder intact however it is spelled.
+    let (id, rest) = text.split_once('\u{0}').ok_or_else(invalid)?;
+    let (key, name) = rest.split_once('\u{0}').ok_or_else(invalid)?;
+
+    let sort_key = if key.is_empty() {
+        None
+    } else {
+        Some(key.parse::<f64>().map_err(|_| invalid())?)
+    };
+    if sort_key.is_some_and(|value| !value.is_finite()) {
+        return Err(invalid());
+    }
 
     Ok(Cursor {
-        id: Uuid::parse_str(id).map_err(|_| AppError::invalid("that page cursor is not valid"))?,
+        id: Uuid::parse_str(id).map_err(|_| invalid())?,
         name: name.to_owned(),
+        sort_key,
     })
 }
 
@@ -310,6 +337,34 @@ mod tests {
         assert_eq!(request.filters.near.expect("near").radius_m, MAX_RADIUS_M);
     }
 
+    /// The wire names the API accepts, including the one it used to use.
+    #[test]
+    fn the_sort_vocabulary_is_stable_and_named() {
+        let sorted = |value: Option<&str>| {
+            parse(
+                &RawQuery {
+                    sort: value.map(str::to_owned),
+                    ..raw()
+                },
+                vec![],
+            )
+            .map(|request| request.sort)
+        };
+
+        assert_eq!(sorted(None).expect("default"), Sort::Best);
+        assert_eq!(sorted(Some("best")).expect("best"), Sort::Best);
+        // Still accepted, so a link shared before the rename keeps working.
+        assert_eq!(sorted(Some("relevance")).expect("relevance"), Sort::Best);
+        assert_eq!(sorted(Some("rating")).expect("rating"), Sort::Rating);
+        assert_eq!(sorted(Some("name")).expect("name"), Sort::Name);
+
+        let refused = sorted(Some("cheapest")).expect_err("unknown sort");
+        assert!(
+            refused.to_string().contains("best"),
+            "the error should name what is accepted: {refused}"
+        );
+    }
+
     #[test]
     fn sorting_by_distance_without_a_centre_is_refused() {
         assert!(parse(
@@ -359,12 +414,39 @@ mod tests {
         let cursor = Cursor {
             name: "Ibarra & Daughters".to_owned(),
             id: Uuid::now_v7(),
+            sort_key: Some(0.8125),
         };
         let encoded = encode_cursor(&cursor);
         let decoded = decode_cursor(&encoded).expect("round trip");
 
         assert_eq!(decoded.name, cursor.name);
         assert_eq!(decoded.id, cursor.id);
+        assert_eq!(decoded.sort_key, cursor.sort_key);
+
+        // The alphabetical sort leads with the name and carries no other key.
+        let keyless = Cursor {
+            name: "Stillwater Plumbing".to_owned(),
+            id: Uuid::now_v7(),
+            sort_key: None,
+        };
+        assert_eq!(
+            decode_cursor(&encode_cursor(&keyless))
+                .expect("round trip")
+                .sort_key,
+            None
+        );
+
+        // A cursor from the previous release carried two fields, not three.
+        // Resuming a scored ordering from a name is the defect this replaced,
+        // so the old shape is refused rather than half-understood.
+        let previous = URL_SAFE_NO_PAD.encode(format!("{}\u{0}Ibarra", Uuid::now_v7()));
+        assert!(decode_cursor(&previous).is_err());
+
+        // A key that is not a number, and one that is not finite.
+        let bad_key = URL_SAFE_NO_PAD.encode(format!("{}\u{0}banana\u{0}Ibarra", Uuid::now_v7()));
+        assert!(decode_cursor(&bad_key).is_err());
+        let infinite = URL_SAFE_NO_PAD.encode(format!("{}\u{0}inf\u{0}Ibarra", Uuid::now_v7()));
+        assert!(decode_cursor(&infinite).is_err());
 
         assert!(decode_cursor("not base64!").is_err());
         assert!(

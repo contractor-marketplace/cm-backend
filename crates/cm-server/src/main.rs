@@ -523,10 +523,28 @@ async fn seed_trades(config: Config) -> Result<(), cm_core::AppError> {
 
 async fn recompute_verification(config: Config) -> Result<(), cm_core::AppError> {
     let pool = cm_db::connect(&config.database).await?;
-    let processed = cm_domain::verification::recompute_all(&pool, 500).await;
+    let outcome = cm_domain::verification::recompute_all(&pool, 500).await;
+
+    // Ranking is re-derived on the same pass, from the same source data. Both
+    // answer "what does the register say about this business today", and both
+    // go stale the same way, so running them apart would only create a window
+    // where the badge and the order disagree.
+    let ranked = match &outcome {
+        Ok(_) => Some(cm_domain::quality::recompute_all(&pool, &config.ranking.into()).await),
+        Err(_) => None,
+    };
+
     pool.close().await;
 
-    println!("recomputed {} contractor(s)", processed?);
+    let changed = outcome?;
+    println!("recomputed verification for {changed} contractor(s)");
+    if let Some(ranked) = ranked {
+        let ranked = ranked?;
+        println!(
+            "recomputed quality scores: {} scanned, {} changed",
+            ranked.scanned, ranked.changed
+        );
+    }
     Ok(())
 }
 

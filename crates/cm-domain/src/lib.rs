@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod location;
 pub mod maintenance;
 pub mod messaging;
+pub mod quality;
 pub mod search;
 pub mod verification;
 

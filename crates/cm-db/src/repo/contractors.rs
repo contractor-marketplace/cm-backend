@@ -654,6 +654,15 @@ pub async fn messaging_target(
 /// search and map can never disagree about where somebody is.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PublicContractor {
+    /// What this row scored for the query that returned it, and its standing
+    /// quality. Read to build the next page's cursor and never serialised: a
+    /// score is an internal ordering detail, and publishing one invites a
+    /// client to sort by it and disagree with the server about the order.
+    #[serde(skip)]
+    pub rank_score: Option<f64>,
+    #[serde(skip)]
+    pub quality_score: Option<f64>,
+
     pub id: Uuid,
     pub slug: String,
     pub display_name: String,
@@ -720,4 +729,112 @@ pub struct PublicContractor {
     pub photo_url: Option<String>,
     pub photo_width: Option<i32>,
     pub photo_height: Option<i32>,
+}
+
+/* ── Ranking signals ───────────────────────────────────────────────────────
+ * Read here, scored in cm-domain, written back here. The formula does not live
+ * in SQL on purpose: it is a business rule, it wants unit tests that do not
+ * need a database, and an `ORDER BY` is a bad place to keep one.
+ */
+
+/// What the ranking score is computed from, for one contractor.
+#[derive(Debug, Clone)]
+pub struct RankingSignals {
+    pub id: Uuid,
+    pub rating: Option<f64>,
+    pub review_count: Option<i32>,
+    pub verified: bool,
+    pub claimed: bool,
+    pub has_bio: bool,
+    pub has_photo: bool,
+    pub has_phone: bool,
+    pub has_website: bool,
+}
+
+/// The directory's average rating, across listings that have one.
+///
+/// The value an unrated listing is assumed to hold, so that having no reviews
+/// is not itself a penalty. `None` when nothing is rated yet, which on a fresh
+/// import is every row.
+pub async fn mean_rating(conn: &mut PgConnection) -> Result<Option<f64>, AppError> {
+    sqlx::query_scalar("SELECT avg(google_rating)::float8 FROM contractors")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(AppError::internal)
+}
+
+/// A page of contractors to score, ordered by id so paging is stable.
+pub async fn ranking_signals_after(
+    conn: &mut PgConnection,
+    after: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<RankingSignals>, AppError> {
+    sqlx::query_as(
+        "SELECT id, \
+                google_rating::float8 AS rating, \
+                google_review_count AS review_count, \
+                verified, \
+                (claimed_by_user_id IS NOT NULL) AS claimed, \
+                (btrim(coalesce(bio, '')) <> '') AS has_bio, \
+                (photo_storage_key IS NOT NULL) AS has_photo, \
+                (btrim(coalesce(public_phone, '')) <> '') AS has_phone, \
+                (btrim(coalesce(website_url, '')) <> '') AS has_website \
+           FROM contractors \
+          WHERE $1::uuid IS NULL OR id > $1 \
+          ORDER BY id \
+          LIMIT $2",
+    )
+    .bind(after)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(AppError::internal)
+}
+
+/// Write a batch of scores in one statement.
+///
+/// Unnested arrays rather than a statement per row: this runs over every
+/// contractor on a nightly timer, and fifty thousand round trips is a different
+/// kind of job from fifty.
+pub async fn set_quality_scores(
+    conn: &mut PgConnection,
+    scored: &[(Uuid, f32)],
+) -> Result<u64, AppError> {
+    if scored.is_empty() {
+        return Ok(0);
+    }
+
+    let ids: Vec<Uuid> = scored.iter().map(|(id, _)| *id).collect();
+    let scores: Vec<f32> = scored.iter().map(|(_, score)| *score).collect();
+
+    let result = sqlx::query(
+        "UPDATE contractors c \
+            SET quality_score = s.score, updated_at = now() \
+           FROM unnest($1::uuid[], $2::real[]) AS s(id, score) \
+          WHERE c.id = s.id AND c.quality_score IS DISTINCT FROM s.score",
+    )
+    .bind(&ids)
+    .bind(&scores)
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(result.rows_affected())
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for RankingSignals {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            id: row.try_get("id")?,
+            rating: row.try_get("rating")?,
+            review_count: row.try_get("review_count")?,
+            verified: row.try_get("verified")?,
+            claimed: row.try_get("claimed")?,
+            has_bio: row.try_get("has_bio")?,
+            has_photo: row.try_get("has_photo")?,
+            has_phone: row.try_get("has_phone")?,
+            has_website: row.try_get("has_website")?,
+        })
+    }
 }

@@ -53,12 +53,19 @@ use std::path::Path;
  *      ranks last and will fall below the real match once `solar` routes to
  *      C-46 through the taxonomy, which is the actual fix for that row.
  *
- *   2. `ibarra` and `meridian electric` both score 0.834 rather than 1.0. Both
- *      queries match two businesses, `ts_rank` ties them, and the tiebreak is
- *      alphabetical — which under the database's collation ignores punctuation
- *      and case, putting "Ibarra Brothers" (3.8 stars, 20 reviews, unclaimed)
- *      above "Ibarra & Daughters" (4.5 stars, 95 reviews, verified). This is
- *      exactly what blended ranking is for.
+ *   2. FIXED. `ibarra` and `meridian electric` scored 0.834 rather than 1.0.
+ *      Both queries match two businesses, `ts_rank` tied them, and the tiebreak
+ *      was alphabetical — which under the database collation ignores
+ *      punctuation and case, putting "Ibarra Brothers" (3.8 stars, 20 reviews,
+ *      unclaimed) above "Ibarra & Daughters" (4.5 stars, 95 reviews, verified).
+ *
+ *      Ranking now blends text relevance with a standing quality score, and the
+ *      order of the terms is the whole design: naming a business beats being
+ *      that kind of contractor, which beats having a name one letter away from
+ *      the word typed, and quality orders whatever is left level. That last
+ *      ordering was itself measured — "solar" returned "Polar Air Heating"
+ *      above an actual solar contractor until a trade match was scored above a
+ *      fuzzy name match.
  *
  *   3. FIXED. Every trade word and every natural-language query scored zero:
  *      water heater, rewire, hvac, adu, leaking pipe, solar. Nine of the
@@ -76,18 +83,27 @@ use std::path::Path;
  *      Together: 0.644/0.667 -> 0.971/1.000.
  */
 
-/// Mean NDCG@10 across the golden set. Measured: 0.971. The road here was
-/// 0.468 at the start, 0.607 with word similarity, 0.644 at the measured
-/// threshold, 0.971 once queries routed through the trade vocabulary.
-const NDCG_FLOOR: f64 = 0.95;
-/// Mean Recall@20. Measured: 1.000 — every golden query now finds everything it
+/// Mean NDCG@10 across the golden set. Measured: 1.000.
+///
+/// The road: 0.468 at the start, 0.607 with word similarity, 0.644 at the
+/// measured threshold, 0.971 once queries routed through the trade vocabulary,
+/// 1.000 once ranking blended standing quality with text relevance.
+///
+/// **This set is now exhausted as a guide.** At 1.000 it can only detect
+/// regression, not improvement — every remaining ranking change will measure as
+/// "no worse", which is not the same as "no better". Adding harder cases is the
+/// price of using it to steer the next phase: queries with more plausible
+/// wrong answers, ambiguous intent, and businesses that differ only in
+/// reputation.
+const NDCG_FLOOR: f64 = 0.99;
+/// Mean Recall@20. Measured: 1.000 — every golden query finds everything it
 /// should. Pinned just under, so a single lost result fails the build.
-const RECALL_FLOOR: f64 = 0.98;
-/// Looking a business up by name is what search already does well, so it is
+const RECALL_FLOOR: f64 = 0.99;
+/// Looking a business up by name is what search already did well, so it is
 /// pinned separately and tightly — a change that chases recall and quietly
 /// costs plain lookup fails here while the mean still looks healthy.
-/// Measured: 0.938 (was 0.833), held short of 1.0 by defect 2 above.
-const NAME_QUERY_NDCG_FLOOR: f64 = 0.90;
+/// Measured: 1.000 (0.833 before ranking resolved the ties).
+const NAME_QUERY_NDCG_FLOOR: f64 = 0.99;
 
 /// Golden-set entries reachable from the business name alone. Everything else
 /// needs the taxonomy, a synonym, or a field not yet in the search document.
@@ -406,6 +422,21 @@ async fn seed_corpus(pool: &PgPool) {
         .await
         .expect("signals");
     }
+
+    drop(conn);
+    score_the_corpus(pool).await;
+}
+
+/// Derive the standing quality scores the ranking orders by.
+///
+/// The seeder writes ratings, review counts and badges directly; this turns
+/// them into the single number `sort=best` reads. Without it every listing
+/// scores zero, the blend collapses to text relevance alone, and the gate would
+/// measure a search with its ranking switched off.
+async fn score_the_corpus(pool: &PgPool) {
+    cm_domain::quality::recompute_all(pool, &cm_domain::quality::Weights::default())
+        .await
+        .expect("quality scores");
 }
 
 /// Licence number by contractor id, so a ranked page can be scored against
@@ -452,7 +483,7 @@ async fn score_golden_set(pool: &PgPool) -> Vec<Scored> {
         };
 
         // Ranked exactly as a visitor gets them: the default sort, a full page.
-        let page = search::list(&mut conn, &filters, Sort::Relevance, search::MAX_PAGE, None)
+        let page = search::list(&mut conn, &filters, Sort::Best, search::MAX_PAGE, None)
             .await
             .expect("search");
 
@@ -573,7 +604,7 @@ async fn a_query_matching_nothing_still_returns_nothing(pool: PgPool) {
             query: Some("zzzzznotarealbusiness".to_owned()),
             ..Filters::default()
         },
-        Sort::Relevance,
+        Sort::Best,
         search::MAX_PAGE,
         None,
     )

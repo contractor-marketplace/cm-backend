@@ -33,16 +33,29 @@ pub struct BoundingBox {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
-    Relevance,
+    /// Text relevance blended with standing quality. The default.
+    Best,
+    /// Standing quality alone, ignoring how well the text matched.
+    Rating,
     Distance,
     Name,
 }
 
 /// Where the previous page ended. Encoded opaquely at the edge.
+///
+/// `sort_key` is the value of whatever the ordering leads with — the blended
+/// rank, the quality score, the distance — and is absent only for the plain
+/// alphabetical sort, which leads with the name already.
+///
+/// It has to be here. The previous cursor carried only `(name, id)` while the
+/// ORDER BY led with distance or relevance, so page two filtered on a column it
+/// was not ordered by and silently dropped rows. The front end worked around it
+/// by refusing to paginate those sorts at all.
 #[derive(Debug, Clone)]
 pub struct Cursor {
     pub name: String,
     pub id: Uuid,
+    pub sort_key: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,6 +116,11 @@ const PREDICATE_BINDS: usize = 12;
 /// relevance ordering — a coupling `the_relevance_ordering_reads_the_query_bind`
 /// pins so the two cannot drift apart.
 const QUERY_BIND: usize = 4;
+
+/// The centre the caller measures from. Read by the projection's distance
+/// column and by the distance ordering, which have to agree.
+const NEAR_LON_BIND: usize = 1;
+const NEAR_LAT_BIND: usize = 2;
 
 /// One shared WHERE clause, so list and map can never disagree about what
 /// matches — a map showing pins the list omits is a bug report nobody can
@@ -184,7 +202,11 @@ const SELECT: &str = "\
                 ELSE ST_Distance(c.public_point, \
                      ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) END AS distance_m, \
            c.google_rating::float8 AS google_rating, c.google_review_count, \
-           c.google_place_url \
+           c.google_place_url, c.quality_score::float8 AS quality_score";
+
+/// The tables the projection reads. Split from the columns so a caller can add
+/// one — the blended rank is computed per query and cannot live in a constant.
+const FROM: &str = "\
       FROM contractors c \
       LEFT JOIN license_records l ON l.id = c.license_record_id";
 
@@ -217,17 +239,39 @@ pub struct Page {
  * convention, and it is where the tail bind numbers come from.
  */
 
-/// The list statement. Tail binds: cursor name, cursor id, limit.
-fn list_sql(order: &str) -> String {
-    let (name, id, limit) = (
+/// The list statement. Tail binds: cursor sort key, cursor name, cursor id, limit.
+fn list_sql(ordering: &Ordering) -> String {
+    let (key, name, id, limit) = (
         PREDICATE_BINDS + 1,
         PREDICATE_BINDS + 2,
         PREDICATE_BINDS + 3,
+        PREDICATE_BINDS + 4,
     );
+    let op = ordering.direction.comparison();
+
+    // Written as "past the key, or level with it and past the tie-break"
+    // rather than as one row-wise comparison, because a row-wise comparison
+    // applies a single direction to every column. The ordering is
+    // `key DESC, display_name ASC, id ASC` — mixed — and
+    // `(key, name, id) < (…)` would silently mean `name DESC` too, excluding
+    // every row alphabetically after the cursor. That returns a short page
+    // that looks like a page.
+    let keyset = match &ordering.key {
+        Some(expr) => format!(
+            "AND (${name}::text IS NULL OR {expr} {op} ${key}::float8 \
+                  OR ({expr} = ${key}::float8 \
+                      AND (c.display_name, c.id) > (${name}, ${id}::uuid)))"
+        ),
+        None => format!(
+            "AND (${name}::text IS NULL OR (c.display_name, c.id) > (${name}, ${id}::uuid))"
+        ),
+    };
+
     format!(
-        "{SELECT} WHERE {PREDICATE} \
-           AND (${name}::text IS NULL OR (c.display_name, c.id) > (${name}, ${id}::uuid)) \
-         ORDER BY {order} LIMIT ${limit}"
+        "{SELECT}, {rank} AS rank_score {FROM} \
+         WHERE {PREDICATE} {keyset} ORDER BY {order} LIMIT ${limit}",
+        rank = rank_expression(),
+        order = ordering.order_by(),
     )
 }
 
@@ -235,8 +279,8 @@ fn list_sql(order: &str) -> String {
 fn map_sql() -> String {
     let limit = PREDICATE_BINDS + 1;
     format!(
-        "{SELECT} WHERE {PREDICATE} AND c.public_point IS NOT NULL \
-         ORDER BY c.verified DESC, c.display_name, c.id LIMIT ${limit}"
+        "{SELECT} {FROM} WHERE {PREDICATE} AND c.public_point IS NOT NULL \
+         ORDER BY c.quality_score DESC, c.display_name, c.id LIMIT ${limit}"
     )
 }
 
@@ -247,26 +291,142 @@ fn map_sql() -> String {
 /// reachable by guessing its slug.
 fn find_sql(column: &str) -> String {
     let value = PREDICATE_BINDS + 1;
-    format!("{SELECT} WHERE {PREDICATE} AND c.{column} = ${value}")
+    format!("{SELECT} {FROM} WHERE {PREDICATE} AND c.{column} = ${value}")
 }
 
-/// The ordering for a sort, given what the caller actually supplied.
+/// Metres from the centre the caller supplied.
 ///
-/// Keyset pagination is only well-defined over a total order, so every sort
-/// ends in (display_name, id) and the cursor is that pair. Distance and
-/// relevance order the first page; ties and subsequent pages fall back to the
-/// stable key rather than drifting.
-fn order_for(sort: Sort, filters: &Filters) -> String {
-    match sort {
-        Sort::Distance if filters.near.is_some() => {
-            "distance_m ASC NULLS LAST, display_name, id".to_owned()
+/// Spelled out rather than referred to as `distance_m`, because that is a
+/// SELECT alias and Postgres does not allow one in `WHERE` — the keyset needs
+/// the expression itself. It is the same arithmetic the projection does, minus
+/// the null guard, since distance is only ever the sort key when a centre was
+/// given.
+fn distance_expression() -> String {
+    format!(
+        "ST_Distance(c.public_point, \
+         ST_SetSRID(ST_MakePoint(${NEAR_LON_BIND}, ${NEAR_LAT_BIND}), 4326)::geography)"
+    )
+}
+
+/// How much the standing quality score counts against text relevance.
+///
+/// Small on purpose. A text match scores at least 1.0 from the match bonus
+/// below, so quality can reorder listings that matched but can never lift one
+/// that did not above one that did: somebody searching "ibarra" wants Ibarra,
+/// not the best-rated builder in the county.
+const QUALITY_WEIGHT: f64 = 0.5;
+
+/// What the directory ranks by, as SQL.
+///
+/// Four terms, ordered by how much they actually tell you:
+///
+///   * **The text matched** — 1.0. Somebody who types a business name wants
+///     that business, and nothing below should outrank it.
+///   * **This is that kind of contractor** — 0.75. The query resolved through
+///     the trade vocabulary and this listing holds the licence class. Weaker
+///     than naming the business, stronger than anything else, because it is a
+///     fact about the licence rather than a coincidence about the spelling.
+///   * **The name is close** — 0.5. Enough to surface a typo, and deliberately
+///     ranked below both of the above: "solar" is one letter from "Polar", and
+///     an actual solar contractor should beat an air-conditioning company whose
+///     name nearly rhymes.
+///   * **How well, and how good** — `ts_rank_cd` separates text matches from
+///     each other, and the standing quality score orders equals.
+///
+/// With no query the first four are zero and the whole thing is quality, which
+/// is what turns browsing from alphabetical into best-first.
+///
+/// Distance is deliberately not a term. Every result inside a radius filter is
+/// already near enough; mixing distance into the blend would mean a slightly
+/// closer, slightly worse contractor outranks a better one for reasons the
+/// visitor cannot see. `sort=distance` remains available and says plainly what
+/// it does.
+fn rank_expression() -> String {
+    format!(
+        "(CASE WHEN ${QUERY_BIND}::text IS NULL THEN 0.0 ELSE \
+             ts_rank_cd(c.search_doc, \
+                 websearch_to_tsquery('public.english_unaccent', ${QUERY_BIND})) \
+             + CASE WHEN c.search_doc @@ \
+                 websearch_to_tsquery('public.english_unaccent', ${QUERY_BIND}) \
+                    THEN 1.0 ELSE 0.0 END \
+             + CASE WHEN ${PREDICATE_BINDS}::uuid[] IS NOT NULL AND EXISTS ( \
+                     SELECT 1 FROM contractor_trades rt \
+                      WHERE rt.contractor_id = c.id \
+                        AND rt.trade_id = ANY(${PREDICATE_BINDS})) \
+                    THEN 0.75 ELSE 0.0 END \
+             + CASE WHEN ${QUERY_BIND} <% c.display_name THEN 0.5 ELSE 0.0 END \
+         END + {QUALITY_WEIGHT} * c.quality_score)::float8"
+    )
+}
+
+/// Which direction a sort runs, and therefore which way its cursor compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// Best first: the cursor takes rows strictly *below* where it stopped.
+    Descending,
+    /// Nearest or first alphabetically: strictly *above*.
+    Ascending,
+}
+
+impl Direction {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Descending => "DESC",
+            Self::Ascending => "ASC",
         }
-        Sort::Relevance if filters.query.is_some() => format!(
-            "ts_rank(c.search_doc, \
-             websearch_to_tsquery('public.english_unaccent', ${QUERY_BIND})) DESC, \
-             display_name, id"
-        ),
-        _ => "display_name, id".to_owned(),
+    }
+
+    fn comparison(self) -> &'static str {
+        match self {
+            Self::Descending => "<",
+            Self::Ascending => ">",
+        }
+    }
+}
+
+/// The complete ordering for a sort: what it leads with, which way, and the
+/// expression a cursor has to compare against to resume it.
+///
+/// Keyset pagination is only well-defined over a total order, so every ordering
+/// ends in `(display_name, id)` and every cursor carries that pair. What
+/// changes is the leading key, and the whole point of returning it here is that
+/// the ORDER BY and the cursor comparison are built from the *same* string and
+/// cannot disagree — which is exactly how page two used to lose rows.
+struct Ordering {
+    /// The leading key, or `None` for the plain alphabetical sort.
+    key: Option<String>,
+    direction: Direction,
+}
+
+impl Ordering {
+    fn order_by(&self) -> String {
+        match &self.key {
+            Some(key) => format!("{key} {}, c.display_name, c.id", self.direction.sql()),
+            None => "c.display_name, c.id".to_owned(),
+        }
+    }
+}
+
+/// A sort the caller cannot support degrades to the stable key rather than
+/// ordering by a column that is NULL for every row.
+fn ordering_for(sort: Sort, filters: &Filters) -> Ordering {
+    match sort {
+        Sort::Distance if filters.near.is_some() => Ordering {
+            key: Some(distance_expression()),
+            direction: Direction::Ascending,
+        },
+        Sort::Rating => Ordering {
+            key: Some("c.quality_score".to_owned()),
+            direction: Direction::Descending,
+        },
+        Sort::Best => Ordering {
+            key: Some(rank_expression()),
+            direction: Direction::Descending,
+        },
+        Sort::Distance | Sort::Name => Ordering {
+            key: None,
+            direction: Direction::Ascending,
+        },
     }
 }
 
@@ -287,11 +447,13 @@ fn record_search(
     tracing::debug!(
         path,
         sort = sort.map(|s| match s {
-            Sort::Relevance => "relevance",
+            Sort::Best => "best",
+            Sort::Rating => "rating",
             Sort::Distance => "distance",
             Sort::Name => "name",
         }),
         has_query = filters.query.is_some(),
+        routed_trades = filters.query_trade_ids.len(),
         trades = filters.trade_ids.len(),
         verified_only = filters.verified_only,
         has_postal_code = filters.postal_code.is_some(),
@@ -314,9 +476,11 @@ pub async fn list(
     let limit = limit.clamp(1, MAX_PAGE);
     let started = std::time::Instant::now();
 
-    let sql = list_sql(&order_for(sort, filters));
+    let ordering = ordering_for(sort, filters);
+    let sql = list_sql(&ordering);
 
     let mut contractors = bind_filters(sqlx::query_as(&sql), filters)
+        .bind(cursor.and_then(|c| c.sort_key))
         .bind(cursor.map(|c| c.name.clone()))
         .bind(cursor.map(|c| c.id))
         .bind(limit + 1)
@@ -333,6 +497,17 @@ pub async fn list(
         contractors.last().map(|last| Cursor {
             name: last.display_name.clone(),
             id: last.id,
+            // Whatever the ordering led with, read back off the row it stopped
+            // at. Ordering and cursor are built from one expression, so the
+            // value here is the same one the next page compares against.
+            sort_key: match sort {
+                Sort::Best => last.rank_score,
+                Sort::Rating => last.quality_score,
+                // Only a key when a centre was given; without one the ordering
+                // falls back to the name and carries no leading key at all.
+                Sort::Distance => ordering.key.as_ref().and(last.distance_m),
+                Sort::Name => None,
+            },
         })
     } else {
         None
@@ -447,6 +622,10 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PublicContractor {
             photo_url: row.try_get("photo_storage_key")?,
             photo_width: row.try_get("photo_width")?,
             photo_height: row.try_get("photo_height")?,
+            // Present only on the list query, which is the only one that
+            // paginates and so the only one that needs a cursor key.
+            rank_score: row.try_get("rank_score").ok().flatten(),
+            quality_score: row.try_get("quality_score").ok().flatten(),
         })
     }
 }
@@ -455,31 +634,40 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PublicContractor {
 mod tests {
     use super::*;
 
-    /// Every statement this module can produce, so a new read path cannot be
-    /// added without deciding what it does about the invariants below.
-    fn every_statement() -> Vec<(&'static str, String)> {
-        let near = Filters {
+    fn near() -> Filters {
+        Filters {
             near: Some(Near {
                 lat: 34.0,
                 lon: -118.0,
                 radius_m: 25_000.0,
             }),
             ..Filters::default()
-        };
-        let text = Filters {
+        }
+    }
+
+    fn text() -> Filters {
+        Filters {
             query: Some("ibarra".to_owned()),
             ..Filters::default()
-        };
+        }
+    }
 
+    /// Every statement this module can produce, so a new read path cannot be
+    /// added without deciding what it does about the invariants below.
+    fn every_statement() -> Vec<(&'static str, String)> {
         vec![
             (
-                "list",
-                list_sql(&order_for(Sort::Name, &Filters::default())),
+                "list/best",
+                list_sql(&ordering_for(Sort::Best, &Filters::default())),
             ),
-            ("list/distance", list_sql(&order_for(Sort::Distance, &near))),
             (
-                "list/relevance",
-                list_sql(&order_for(Sort::Relevance, &text)),
+                "list/rating",
+                list_sql(&ordering_for(Sort::Rating, &text())),
+            ),
+            ("list/name", list_sql(&ordering_for(Sort::Name, &text()))),
+            (
+                "list/distance",
+                list_sql(&ordering_for(Sort::Distance, &near())),
             ),
             ("map", map_sql()),
             ("detail/id", find_sql("id")),
@@ -491,10 +679,6 @@ mod tests {
     /// geocoded and never published: if distance search ran against it while
     /// the map published a centroid, the radius filter could be binary-searched
     /// to recover the address the centroid was protecting.
-    ///
-    /// `cm-api/tests/directory.rs` proves this behaviourally against a real
-    /// database, which is the stronger check because it would catch a leak
-    /// through a join. This one names the mistake at the point of making it.
     #[test]
     fn no_statement_reads_the_precise_point() {
         for (name, sql) in every_statement() {
@@ -539,30 +723,30 @@ mod tests {
              every tail clause is numbered from that constant"
         );
 
-        // The tail binds land immediately after the predicate's, with no gap
-        // and no collision.
-        assert!(list_sql("display_name, id").contains(&format!("${}", PREDICATE_BINDS + 1)));
-        assert!(list_sql("display_name, id").contains(&format!("${}", PREDICATE_BINDS + 3)));
+        let listing = list_sql(&ordering_for(Sort::Best, &Filters::default()));
+        for offset in 1..=4 {
+            assert!(
+                listing.contains(&format!("${}", PREDICATE_BINDS + offset)),
+                "the list tail should bind ${}",
+                PREDICATE_BINDS + offset
+            );
+        }
         assert!(map_sql().contains(&format!("${}", PREDICATE_BINDS + 1)));
     }
 
-    /// The relevance ordering ranks by the same tsquery the predicate matched
-    /// on, by referring to its bind slot. Renumbering the predicate without
-    /// moving `QUERY_BIND` would rank by a radius.
+    /// The ranking reads the same tsquery the predicate matched on, by
+    /// referring to its bind slot. Renumbering the predicate without moving
+    /// `QUERY_BIND` would rank by a radius.
     #[test]
-    fn the_relevance_ordering_reads_the_query_bind() {
-        let filters = Filters {
-            query: Some("ibarra".to_owned()),
-            ..Filters::default()
-        };
-        let order = order_for(Sort::Relevance, &filters);
+    fn the_ranking_reads_the_query_bind() {
+        let rank = rank_expression();
 
-        assert!(order.contains(&format!("${QUERY_BIND}")), "{order}");
+        assert!(rank.contains(&format!("${QUERY_BIND}")), "{rank}");
         assert!(
             PREDICATE.contains(&format!(
                 "websearch_to_tsquery('public.english_unaccent', ${QUERY_BIND})"
             )),
-            "the predicate and the ordering must read the same slot"
+            "the predicate and the ranking must read the same slot"
         );
     }
 
@@ -572,37 +756,87 @@ mod tests {
     fn a_sort_without_its_input_falls_back_to_the_stable_key() {
         let empty = Filters::default();
 
-        assert_eq!(order_for(Sort::Distance, &empty), "display_name, id");
-        assert_eq!(order_for(Sort::Relevance, &empty), "display_name, id");
-        assert_eq!(order_for(Sort::Name, &empty), "display_name, id");
+        assert!(ordering_for(Sort::Distance, &empty).key.is_none());
+        assert_eq!(
+            ordering_for(Sort::Distance, &empty).order_by(),
+            "c.display_name, c.id"
+        );
+        assert_eq!(
+            ordering_for(Sort::Name, &empty).order_by(),
+            "c.display_name, c.id"
+        );
     }
 
     /// Keyset pagination is only well-defined over a total order.
     #[test]
     fn every_ordering_ends_in_the_keyset_tuple() {
-        let near = Filters {
-            near: Some(Near {
-                lat: 34.0,
-                lon: -118.0,
-                radius_m: 1.0,
-            }),
-            ..Filters::default()
-        };
-        let text = Filters {
-            query: Some("q".to_owned()),
-            ..Filters::default()
-        };
-
         for (sort, filters) in [
-            (Sort::Name, &Filters::default()),
-            (Sort::Distance, &near),
-            (Sort::Relevance, &text),
+            (Sort::Best, Filters::default()),
+            (Sort::Rating, Filters::default()),
+            (Sort::Name, Filters::default()),
+            (Sort::Distance, near()),
+            (Sort::Distance, Filters::default()),
         ] {
-            let order = order_for(sort, filters);
+            let order = ordering_for(sort, &filters).order_by();
             assert!(
-                order.ends_with("display_name, id"),
+                order.ends_with("c.display_name, c.id"),
                 "{order} does not end in the cursor's tuple"
             );
         }
+    }
+
+    /// The defect this cursor rework exists to fix. Page two used to filter on
+    /// `(display_name, id)` whatever the ORDER BY led with, so a distance or
+    /// relevance sort silently dropped rows — and the front end stopped
+    /// paginating those sorts rather than showing the wrong page.
+    ///
+    /// The comparison and the ordering are now built from one expression, and
+    /// they have to point the same way: descending sorts take rows below where
+    /// the page stopped, ascending ones above.
+    #[test]
+    fn the_cursor_compares_the_same_key_the_ordering_sorts_by() {
+        for (sort, filters, expected) in [
+            (Sort::Best, Filters::default(), "<"),
+            (Sort::Rating, Filters::default(), "<"),
+            (Sort::Distance, near(), ">"),
+        ] {
+            let ordering = ordering_for(sort, &filters);
+            let key = ordering.key.clone().expect("a leading key");
+            let sql = list_sql(&ordering);
+
+            assert!(
+                sql.contains(&format!("{key} {expected} $")),
+                "{sort:?} must compare its own key with {expected}: {sql}"
+            );
+            assert!(
+                sql.contains("AND (c.display_name, c.id) > ("),
+                "{sort:?} must break ties on the ascending stable key: {sql}"
+            );
+            assert!(
+                sql.contains(&format!("ORDER BY {key} {}", ordering.direction.sql())),
+                "{sort:?} must order by the key it compares: {sql}"
+            );
+        }
+    }
+
+    /// With no query the ranking is quality alone, which is what turns browsing
+    /// from alphabetical into best-first. With one, a text match always
+    /// outweighs the quality term: somebody searching a business name wants
+    /// that business, not the best-rated builder in the county.
+    #[test]
+    fn quality_orders_equals_and_never_overturns_a_text_match() {
+        const _: () = assert!(
+            QUALITY_WEIGHT < 1.0,
+            "the match bonus is 1.0; a quality weight at or above it would let \
+             an unmatched listing outrank a matched one"
+        );
+
+        let rank = rank_expression();
+        assert!(rank.contains("c.quality_score"));
+        assert!(rank.contains("ts_rank_cd"));
+        assert!(
+            rank.contains(&format!("${QUERY_BIND}::text IS NULL THEN 0.0")),
+            "with no query the text terms must contribute nothing: {rank}"
+        );
     }
 }
