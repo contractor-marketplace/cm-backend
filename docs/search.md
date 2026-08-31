@@ -366,7 +366,7 @@ query that routes to a trade matches every contractor holding that licence class
 scored. A query with few matches is 3 ms. If it needs to come down, the lever is
 capping candidates for high-cardinality routes, not the ranking.
 
-### Four findings about Postgres worth keeping
+### Five findings about Postgres worth keeping
 
 Each of these looked like the opposite before it was measured.
 
@@ -390,6 +390,22 @@ isolation and slower through the real endpoint: the planner can short-circuit an
 `EXISTS` per row and cannot skip a join it has already built. The isolated
 benchmark inlined a scalar subquery that the shipped query passes as a
 parameter, and that one difference changed the plan.
+
+**A subquery on the other side of an `OR` costs the index on the first side.**
+Service-area matching first shipped as
+`ST_DWithin(...) OR EXISTS (SELECT ... WHERE sa.contractor_id = c.id ...)`,
+which is a faithful reading of "in the area, or says they serve it". Because a
+correlated subquery cannot be answered from a GiST index, the planner stopped
+using `contractors_public_point_gix` for the spatial half too and sequentially
+scanned all 49,774 rows: **478 ms against 94 ms**, measured on production data
+for a 25 km search. Resolving the service-area half first — one small query over
+`contractor_service_areas`, whose result is passed in as an id array — restores
+the index. The `IS NOT NULL` guard around the array matters as much as the
+rewrite: without it the `= ANY(NULL)` still costs a scan.
+
+The general shape: an `OR` is only as index-servable as its *least* servable
+branch. Two branches that each have an index still need splitting — either into
+a pre-query, as here, or into a `UNION`.
 
 ---
 

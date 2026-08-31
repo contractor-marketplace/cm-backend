@@ -1,0 +1,40 @@
+[Unit]
+Description=Encrypted logical backup of the cm database, copied off the host
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+
+# Runs as postgres so pg_dump reaches every table over the unix socket under
+# peer auth. The application role owns none of the reference tables and a dump
+# taken as `cm` would be quietly partial.
+User=postgres
+Group=postgres
+
+# Its own directory, not /etc/cm-backend: that one is root:cm 0750 because it
+# holds the application's database password, and postgres reading the backup
+# identity out of it would mean handing it the app's credentials too.
+EnvironmentFile=/etc/cm-backup/env
+
+ExecStart=/usr/local/bin/backup.sh
+
+# The second half of "a backup on the same disk is not a backup". backup.sh
+# deliberately stops at the local file and says so; this is what carries it
+# off the host. rsync rather than cp so a re-run after a partial upload does
+# not re-send what already landed, and -d so local retention expiring a file
+# expires it in the bucket too.
+# /usr/bin, never /snap/bin: the snap build cannot start under
+# NoNewPrivileges=true — snap-confine needs cap_dac_override and exits 1
+# before it transfers anything. The apt build has no such requirement.
+ExecStart=/usr/bin/gcloud storage rsync --delete-unmatched-destination-objects --quiet /var/backups/cm gs://cm-db-backups-6b1e669f/daily
+
+NoNewPrivileges=true
+ProtectHome=true
+# Not ProtectSystem=strict: this writes to /var/backups and reads the identity
+# under /etc, and it needs the postgres socket.
+ProtectSystem=full
+ReadWritePaths=/var/backups/cm
+
+[Install]
+WantedBy=multi-user.target

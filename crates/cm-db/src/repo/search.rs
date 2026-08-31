@@ -110,7 +110,7 @@ pub const MAX_MAP_POINTS: i64 = 500;
 /// New filters append: `$1`–`$11` keep their meanings, which is what lets
 /// `SELECT` reference the centre as `$1`/`$2` and the relevance ordering
 /// reference the query text as `$4` without either of them moving.
-const PREDICATE_BINDS: usize = 12;
+const PREDICATE_BINDS: usize = 13;
 
 /// The query-text slot. Referenced by the predicate and, separately, by the
 /// relevance ordering — a coupling `the_relevance_ordering_reads_the_query_bind`
@@ -121,6 +121,18 @@ const QUERY_BIND: usize = 4;
 /// column and by the distance ordering, which have to agree.
 const NEAR_LON_BIND: usize = 1;
 const NEAR_LAT_BIND: usize = 2;
+
+/// The trades the query text routed to. Like `QUERY_BIND`, this is read twice —
+/// once by the predicate to widen what matches, once by the ranking to pay the
+/// trade-route bonus — so it needs a name of its own.
+///
+/// It had one for a while, spelled `PREDICATE_BINDS`, on the reasoning that it
+/// was the last bind. That held until a bind was appended after it, at which
+/// point the ranking silently began reading the new parameter instead: the
+/// +0.75 stopped being paid, "solar" and "general contractor" fell out of order,
+/// and nothing failed except the golden set. A slot referred to by its position
+/// in a list is a slot that moves when the list grows.
+const QUERY_TRADES_BIND: usize = 12;
 
 /// One shared WHERE clause, so list and map can never disagree about what
 /// matches — a map showing pins the list omits is a bug report nobody can
@@ -137,15 +149,26 @@ const NEAR_LAT_BIND: usize = 2;
 ///
 /// A contractor matches a place either by being in it or by saying they serve
 /// it. Being in it is the licence address; saying so is
-/// `contractor_service_areas`, which has two kinds of row and both are checked
-/// here — a radius from the contractor's own point, and a named ZIP matched
-/// against `approx_radius_m`, the equal-area circle standing in for a boundary
-/// that has never been loaded (see 0029).
+/// `contractor_service_areas`, which has two kinds of row — a radius from the
+/// contractor's own point, and a named ZIP matched against `approx_radius_m`,
+/// the equal-area circle standing in for a boundary that has never been loaded
+/// (see 0029).
 ///
 /// It widens rather than narrows: a listing already inside the radius still
 /// matches whether or not it has declared anything, which matters because
 /// almost none of the directory has — service areas are set by a claimant, and
 /// the great majority of listings are unclaimed.
+///
+/// **The service-area half is resolved before this statement runs**, by
+/// `contractors_serving`, and arrives as an id array. Asking it here as a
+/// correlated `OR EXISTS` reads better and cost 5× on the real directory: an
+/// `OR` between a spatial predicate and a subquery is not index-servable, so
+/// the planner abandoned `contractors_public_point_gix` and sequentially
+/// scanned all 49,774 rows — 478ms against 94ms, measured on production data
+/// for a 25km search. The `IS NOT NULL` guard is what keeps the fast plan when
+/// nothing was found, which is the common case and is every case until
+/// claimants start declaring areas; without it the bare `= ANY(NULL)` still
+/// costs a scan.
 ///
 /// The fuzzy clause is `<%` (word similarity), not `%` (whole-string
 /// similarity), and the difference is the whole feature. `%` scores the query
@@ -158,14 +181,7 @@ const NEAR_LAT_BIND: usize = 2;
 const PREDICATE: &str = "\
     ($1::float8 IS NULL OR ST_DWithin(c.public_point, \
         ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3) \
-        OR EXISTS (SELECT 1 FROM contractor_service_areas sa \
-                    LEFT JOIN regions sr ON sr.id = sa.region_id \
-                   WHERE sa.contractor_id = c.id \
-                     AND (ST_DWithin(c.public_point, \
-                              ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, sa.radius_m) \
-                          OR ST_DWithin(sr.centroid, \
-                              ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, \
-                              COALESCE(sr.approx_radius_m, 0))))) \
+        OR ($13::uuid[] IS NOT NULL AND c.id = ANY($13))) \
     AND ($4::text IS NULL \
          OR c.search_doc @@ websearch_to_tsquery('public.english_unaccent', $4) \
          OR $4 <% c.display_name \
@@ -183,6 +199,7 @@ const PREDICATE: &str = "\
 fn bind_filters<'q>(
     query: sqlx::query::QueryAs<'q, sqlx::Postgres, PublicContractor, sqlx::postgres::PgArguments>,
     filters: &'q Filters,
+    serving: &'q Serving,
 ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, PublicContractor, sqlx::postgres::PgArguments> {
     query
         .bind(filters.near.map(|near| near.lon))
@@ -197,6 +214,50 @@ fn bind_filters<'q>(
         .bind(filters.bbox.map(|b| b.max_lon))
         .bind(filters.bbox.map(|b| b.max_lat))
         .bind((!filters.query_trade_ids.is_empty()).then(|| filters.query_trade_ids.clone()))
+        .bind(serving.0.clone())
+}
+
+/// Contractors whose declared service area covers the centre of the search.
+///
+/// `None` rather than an empty vector when nothing matches, because the two
+/// bind differently and only `NULL` keeps the spatial index in play — see
+/// `PREDICATE`. It is also the honest distinction: no centre was given, versus
+/// a centre nobody serves.
+#[derive(Debug, Default, Clone)]
+pub struct Serving(Option<Vec<Uuid>>);
+
+/// Resolved once per search, ahead of the statement that uses it.
+///
+/// Scans `contractor_service_areas` rather than the directory, which is the
+/// point: the table holds one row per area a claimant has declared, so this
+/// stays small long after `contractors` does not. Returns early when no centre
+/// was given, so a plain browse pays nothing.
+async fn contractors_serving(
+    conn: &mut PgConnection,
+    near: Option<Near>,
+) -> Result<Serving, AppError> {
+    let Some(near) = near else {
+        return Ok(Serving(None));
+    };
+
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT sa.contractor_id \
+           FROM contractor_service_areas sa \
+           JOIN contractors sc ON sc.id = sa.contractor_id \
+           LEFT JOIN regions sr ON sr.id = sa.region_id \
+          WHERE ST_DWithin(sc.public_point, \
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, sa.radius_m) \
+             OR ST_DWithin(sr.centroid, \
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, \
+                    COALESCE(sr.approx_radius_m, 0))",
+    )
+    .bind(near.lon)
+    .bind(near.lat)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(Serving((!ids.is_empty()).then_some(ids)))
 }
 
 /// The projection. `precise_point` is absent by construction.
@@ -384,10 +445,10 @@ fn rank_expression() -> String {
              + CASE WHEN c.search_doc @@ \
                  websearch_to_tsquery('public.english_unaccent', ${QUERY_BIND}) \
                     THEN 1.0 ELSE 0.0 END \
-             + CASE WHEN ${PREDICATE_BINDS}::uuid[] IS NOT NULL AND EXISTS ( \
+             + CASE WHEN ${QUERY_TRADES_BIND}::uuid[] IS NOT NULL AND EXISTS ( \
                      SELECT 1 FROM contractor_trades rt \
                       WHERE rt.contractor_id = c.id \
-                        AND rt.trade_id = ANY(${PREDICATE_BINDS})) \
+                        AND rt.trade_id = ANY(${QUERY_TRADES_BIND})) \
                     THEN 0.75 ELSE 0.0 END \
              + CASE WHEN ${QUERY_BIND} <% c.display_name THEN 0.5 ELSE 0.0 END \
          END + {QUALITY_WEIGHT} * c.quality_score)::float8"
@@ -551,7 +612,8 @@ pub async fn list(
     let ordering = ordering_for(sort, filters);
     let sql = list_sql(&ordering);
 
-    let query = bind_filters(sqlx::query_as(&sql), filters);
+    let serving = contractors_serving(&mut *conn, filters.near).await?;
+    let query = bind_filters(sqlx::query_as(&sql), filters, &serving);
     // Bound only when the statement refers to it; see `list_sql`.
     let query = match ordering.key {
         Some(_) => query.bind(cursor.and_then(|c| c.sort_key)),
@@ -609,7 +671,8 @@ pub async fn map_points(
 
     let sql = map_sql();
 
-    let mut points = bind_filters(sqlx::query_as(&sql), filters)
+    let serving = contractors_serving(&mut *conn, filters.near).await?;
+    let mut points = bind_filters(sqlx::query_as(&sql), filters, &serving)
         .bind(limit + 1)
         .fetch_all(&mut *conn)
         .await
@@ -638,11 +701,17 @@ pub async fn find_public(
 ) -> Result<Option<PublicContractor>, AppError> {
     let sql = find_sql("id");
 
-    bind_filters(sqlx::query_as(&sql), &Filters::default())
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(AppError::internal)
+    // Detail has no centre, so nothing can be serving it; the lookup would only
+    // ever return `None` and is skipped rather than run.
+    bind_filters(
+        sqlx::query_as(&sql),
+        &Filters::default(),
+        &Serving::default(),
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(AppError::internal)
 }
 
 pub async fn find_public_by_slug(
@@ -651,11 +720,15 @@ pub async fn find_public_by_slug(
 ) -> Result<Option<PublicContractor>, AppError> {
     let sql = find_sql("slug");
 
-    bind_filters(sqlx::query_as(&sql), &Filters::default())
-        .bind(slug)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(AppError::internal)
+    bind_filters(
+        sqlx::query_as(&sql),
+        &Filters::default(),
+        &Serving::default(),
+    )
+    .bind(slug)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(AppError::internal)
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PublicContractor {
@@ -785,6 +858,45 @@ mod tests {
         }
     }
 
+    /// The geo test has to stay index-servable, and a subquery beside it in the
+    /// same `OR` is what takes that away.
+    ///
+    /// This is a regression, not a hypothetical. The service-area match shipped
+    /// as `ST_DWithin(...) OR EXISTS (SELECT ... WHERE sa.contractor_id = c.id
+    /// ...)`, which reads exactly like the requirement and cost 5×: an `OR`
+    /// between a spatial predicate and a correlated subquery cannot be answered
+    /// from `contractors_public_point_gix`, so the planner scanned all 49,774
+    /// rows instead — 478ms where the index does it in 94ms. The fix was to
+    /// resolve the service-area half up front, in `contractors_serving`, and
+    /// pass ids; this keeps the shape that made that necessary from coming back.
+    ///
+    /// Deliberately a string assertion rather than an `EXPLAIN` one. A seeded
+    /// test database holds a handful of rows, where Postgres correctly prefers
+    /// a sequential scan whatever the predicate says, so a plan assertion there
+    /// would prove nothing about production.
+    #[test]
+    fn the_geo_test_never_shares_its_or_with_a_correlated_subquery() {
+        assert!(
+            !PREDICATE.contains("contractor_service_areas"),
+            "the service-area match belongs in `contractors_serving`, resolved \
+             before the statement runs. Naming the table inside PREDICATE means \
+             it is being asked per row again, which drops the spatial index: \
+             {PREDICATE}"
+        );
+
+        // The narrower property the above protects: the only subqueries left in
+        // the predicate hang off `AND`, where the planner is free to answer the
+        // spatial test from the index first and check them per surviving row.
+        let geo_clause = PREDICATE
+            .split(" AND (")
+            .next()
+            .expect("the predicate leads with the geo clause");
+        assert!(
+            !geo_clause.contains("SELECT"),
+            "the geo clause must not contain a subquery: {geo_clause}"
+        );
+    }
+
     /// The tail clauses number themselves from `PREDICATE_BINDS`. If the
     /// predicate grows a parameter and the constant is not moved with it, the
     /// cursor and the limit start reading filter values — silently, and only
@@ -828,6 +940,35 @@ mod tests {
                 "websearch_to_tsquery('public.english_unaccent', ${QUERY_BIND})"
             )),
             "the predicate and the ranking must read the same slot"
+        );
+    }
+
+    /// The same coupling for the trades a query routed to, and the same failure
+    /// if it breaks: the predicate widens the match while the ranking pays the
+    /// bonus to nobody, so the results are right and the order is wrong.
+    ///
+    /// Written after that happened. The ranking referred to the slot as
+    /// `PREDICATE_BINDS` — correct only for as long as it was the last bind —
+    /// and appending one moved the ranking onto the new parameter. Nothing
+    /// failed to compile, no query errored, and the only signal was two golden
+    /// queries losing their order.
+    #[test]
+    fn the_ranking_reads_the_query_trades_bind() {
+        let rank = rank_expression();
+
+        assert!(
+            rank.contains(&format!("${QUERY_TRADES_BIND}::uuid[]")),
+            "the trade-route bonus must read ${QUERY_TRADES_BIND}: {rank}"
+        );
+        assert!(
+            PREDICATE.contains(&format!("${QUERY_TRADES_BIND}::uuid[] IS NOT NULL")),
+            "the predicate and the ranking must read the same slot"
+        );
+        assert_ne!(
+            QUERY_TRADES_BIND, PREDICATE_BINDS,
+            "a slot named by its position in the list moves when the list grows; \
+             QUERY_TRADES_BIND is a fixed slot and must not be spelled as \
+             'the last one'"
         );
     }
 
