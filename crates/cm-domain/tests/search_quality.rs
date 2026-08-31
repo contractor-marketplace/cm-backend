@@ -339,7 +339,7 @@ async fn seed_corpus(pool: &PgPool) {
         .expect("aliases");
 
     for (code, name, lat, lon) in ZIPS {
-        cm_db::repo::reference::upsert_zcta(&mut conn, code, name, *lat, *lon, "test")
+        cm_db::repo::reference::upsert_zcta(&mut conn, code, name, *lat, *lon, None, "test")
             .await
             .expect("zcta");
     }

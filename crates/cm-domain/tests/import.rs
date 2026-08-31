@@ -45,6 +45,7 @@ async fn seed(pool: &PgPool) {
             row.get(1).expect("name"),
             row.get(2).expect("lat").parse().expect("lat"),
             row.get(3).expect("lon").parse().expect("lon"),
+            None,
             "test",
         )
         .await

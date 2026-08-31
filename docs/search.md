@@ -254,6 +254,24 @@ column. `upsert_zcta` treats a name equal to the code as a placeholder and keeps
 whatever is already there — otherwise loading the file turns "Silver Lake" into
 "90026" for every ZIP anyone had curated.
 
+**Service areas.** A contractor matches a place either by being in it or by
+saying they serve it. `contractor_service_areas` holds two kinds of row — a
+named ZIP, or a travel radius from the contractor's own point — and both are
+checked by the shared predicate, so the list and the map agree.
+
+It widens rather than narrows: a listing already inside the search radius still
+matches whether or not it has declared anything. That matters because service
+areas are set by a claimant and the great majority of listings are unclaimed.
+
+Named areas are matched against `regions.approx_radius_m`, the radius of a
+circle with the same land area as the ZIP, derived from a figure already in the
+Census gazetteer. It stands in for `regions.boundary`, which has been NULL since
+0002 and needs half a gigabyte of TIGER/Line shapefiles and a loader that does
+not exist. The approximation over-covers at the corners of a ZIP and
+under-covers along a long thin one; for deciding whether somebody serves an area
+that is a reasonable trade, and the polygon column is still there for when it is
+not.
+
 **Viewport search.** `bbox` narrows both the list and the map. The front end
 reports the viewport after the person stops moving and offers to search it,
 rather than refetching on every pan. Auto-fitting the map to its results is
@@ -386,12 +404,6 @@ is answered by a table of words and two similarity directions, which leaves
 nothing for a vector index to close and nothing to justify the extension,
 embedding pipeline, provider dependency and CI image that would arrive with it.
 
-**Service-area matching.** `contractor_service_areas` exists in migration 0010
-and nowhere else — no reader, no writer, no reference from the front end, zero
-rows. Matching on it would mean first building a way for a claimant to declare
-where they work, which is a feature rather than the wiring it was scheduled as.
-See §11.
-
 **Saved searches and job alerts.** Needs a mail path, which the system
 deliberately does not have; `auth_tokens` has been waiting on the same thing
 since 0005.
@@ -404,8 +416,9 @@ the latencies in §9. The exit ramps are known and nothing above forecloses them
 
 ## 11. Open
 
-- **Service areas** are dead schema. Deciding what to do with them is a product
-  question, not a wiring task.
+- **ZIP boundaries** are still approximated by an equal-area circle.
+  `regions.boundary` remains NULL; loading TIGER/Line polygons would make
+  service-area matching exact.
 - **The golden set is saturated** at 1.000 and needs harder cases again before
   it can steer another ranking change.
 - **The feed has no interface.** `/v1/me/jobs/feed` is built and tested; the job

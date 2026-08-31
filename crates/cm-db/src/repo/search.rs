@@ -135,6 +135,18 @@ const NEAR_LAT_BIND: usize = 2;
 /// an inlined scalar subquery for the trade id, and that was enough to change
 /// the plan. Left as it is, on the measurement that matches production.
 ///
+/// A contractor matches a place either by being in it or by saying they serve
+/// it. Being in it is the licence address; saying so is
+/// `contractor_service_areas`, which has two kinds of row and both are checked
+/// here — a radius from the contractor's own point, and a named ZIP matched
+/// against `approx_radius_m`, the equal-area circle standing in for a boundary
+/// that has never been loaded (see 0029).
+///
+/// It widens rather than narrows: a listing already inside the radius still
+/// matches whether or not it has declared anything, which matters because
+/// almost none of the directory has — service areas are set by a claimant, and
+/// the great majority of listings are unclaimed.
+///
 /// The fuzzy clause is `<%` (word similarity), not `%` (whole-string
 /// similarity), and the difference is the whole feature. `%` scores the query
 /// against the entire column: "ibara" against "Ibarra & Daughters
@@ -145,7 +157,15 @@ const NEAR_LAT_BIND: usize = 2;
 /// index; the plan is a bitmap index scan either way.
 const PREDICATE: &str = "\
     ($1::float8 IS NULL OR ST_DWithin(c.public_point, \
-        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)) \
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3) \
+        OR EXISTS (SELECT 1 FROM contractor_service_areas sa \
+                    LEFT JOIN regions sr ON sr.id = sa.region_id \
+                   WHERE sa.contractor_id = c.id \
+                     AND (ST_DWithin(c.public_point, \
+                              ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, sa.radius_m) \
+                          OR ST_DWithin(sr.centroid, \
+                              ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, \
+                              COALESCE(sr.approx_radius_m, 0))))) \
     AND ($4::text IS NULL \
          OR c.search_doc @@ websearch_to_tsquery('public.english_unaccent', $4) \
          OR $4 <% c.display_name \

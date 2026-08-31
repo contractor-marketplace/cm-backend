@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use cm_core::AppError;
 use cm_db::repo::contractors::{self, AddressVisibility, ProfileUpdate, PublicContractor};
-use cm_db::repo::{claims, reference, reviews, search, search_events, suggest};
+use cm_db::repo::{claims, reference, reviews, search, search_events, service_areas, suggest};
 use cm_domain::search as search_input;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -606,6 +606,117 @@ pub async fn remove_photo(
 const MAX_PHOTO_BYTES: usize = 8 * 1024 * 1024;
 
 /// The photo routes, with the upload limit attached to them and nowhere else.
+#[derive(Debug, Serialize)]
+pub struct ServiceAreasResponse {
+    areas: Vec<service_areas::Area>,
+    /// ZIPs that were sent and could not be stored, because the Census draws no
+    /// area around them — PO-box and business-only codes. Named rather than
+    /// silently dropped, so a claimant can see which of their list did not take.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unknown: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetServiceAreas {
+    areas: Vec<ServiceAreaInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ServiceAreaInput {
+    Region { code: String },
+    Radius { radius_m: i32 },
+}
+
+/// Where this contractor says they work.
+pub async fn service_areas_get(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+) -> Result<Json<ServiceAreasResponse>, AppError> {
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+    require_claimant(&mut conn, &caller, contractor_id).await?;
+
+    Ok(Json(ServiceAreasResponse {
+        areas: service_areas::for_contractor(&mut conn, contractor_id).await?,
+        unknown: Vec::new(),
+    }))
+}
+
+/// Replace where this contractor says they work.
+///
+/// The whole set, because that is what a list of checkboxes produces, and
+/// reconciling a set against itself buys nothing at forty rows.
+pub async fn service_areas_put(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+    ValidJson(body): ValidJson<SetServiceAreas>,
+) -> Result<Json<ServiceAreasResponse>, AppError> {
+    if body.areas.len() > service_areas::MAX_AREAS {
+        return Err(AppError::invalid(format!(
+            "A listing may declare at most {} service areas.",
+            service_areas::MAX_AREAS
+        )));
+    }
+
+    let mut areas = Vec::with_capacity(body.areas.len());
+    let mut radii = 0;
+    for input in body.areas {
+        match input {
+            ServiceAreaInput::Region { code } => {
+                let code = code.trim().to_owned();
+                if code.len() != 5 || !code.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(AppError::invalid(format!(
+                        "\"{code}\" is not a five-digit ZIP code."
+                    )));
+                }
+                areas.push(service_areas::Area::Region { code });
+            }
+            ServiceAreaInput::Radius { radius_m } => {
+                // One radius is a statement about reach; several are a
+                // contradiction, and the largest would win silently.
+                radii += 1;
+                if radii > 1 {
+                    return Err(AppError::invalid(
+                        "A listing may set one travel radius, not several.",
+                    ));
+                }
+                if !(1..=service_areas::MAX_RADIUS_M).contains(&radius_m) {
+                    return Err(AppError::invalid(format!(
+                        "A travel radius must be between 1 and {} metres.",
+                        service_areas::MAX_RADIUS_M
+                    )));
+                }
+                areas.push(service_areas::Area::Radius { radius_m });
+            }
+        }
+    }
+
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+    require_claimant(&mut conn, &caller, contractor_id).await?;
+
+    let unknown = service_areas::replace(&mut conn, contractor_id, &areas).await?;
+
+    Ok(Json(ServiceAreasResponse {
+        areas: service_areas::for_contractor(&mut conn, contractor_id).await?,
+        unknown,
+    }))
+}
+
+/// Only the claimant edits their own listing. The same check the profile
+/// editor makes, in one place rather than two.
+async fn require_claimant(
+    conn: &mut sqlx::PgConnection,
+    caller: &cm_auth::Authenticated,
+    contractor_id: Uuid,
+) -> Result<(), AppError> {
+    match contractors::claimed_by(conn, caller.user.id).await? {
+        Some(owned) if owned == contractor_id => Ok(()),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
 pub fn photo_routes() -> axum::Router<AppState> {
     axum::Router::new().route(
         "/v1/contractors/{id}/photo",

@@ -397,7 +397,7 @@ pub async fn seed_directory(pool: &PgPool) {
         .expect("trades");
 
     for (code, name, lat, lon) in LA_ZIPS {
-        cm_db::repo::reference::upsert_zcta(&mut conn, code, name, *lat, *lon, "test")
+        cm_db::repo::reference::upsert_zcta(&mut conn, code, name, *lat, *lon, None, "test")
             .await
             .expect("zcta");
     }

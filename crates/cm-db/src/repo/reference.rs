@@ -941,15 +941,17 @@ pub async fn upsert_zcta(
     name: &str,
     lat: f64,
     lon: f64,
+    approx_radius_m: Option<i32>,
     source: &str,
 ) -> Result<bool, AppError> {
     let result = sqlx::query(
-        "INSERT INTO regions (id, kind, code, name, centroid, source) \
-         VALUES ($1, 'zcta', $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6) \
+        "INSERT INTO regions (id, kind, code, name, centroid, approx_radius_m, source) \
+         VALUES ($1, 'zcta', $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6, $7) \
          ON CONFLICT (kind, code) DO UPDATE \
              SET name = CASE WHEN EXCLUDED.name = EXCLUDED.code \
                              THEN regions.name ELSE EXCLUDED.name END, \
                  centroid = EXCLUDED.centroid, \
+                 approx_radius_m = COALESCE(EXCLUDED.approx_radius_m, regions.approx_radius_m), \
                  source = EXCLUDED.source, updated_at = now()",
     )
     .bind(new_id())
@@ -957,6 +959,7 @@ pub async fn upsert_zcta(
     .bind(name)
     .bind(lon)
     .bind(lat)
+    .bind(approx_radius_m)
     .bind(source)
     .execute(&mut *conn)
     .await

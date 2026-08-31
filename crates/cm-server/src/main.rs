@@ -472,6 +472,10 @@ async fn load_regions_inner(
         name: String,
         lat: f64,
         lon: f64,
+        /// The equal-area radius standing in for a boundary. Optional, so a
+        /// file written before 0029 still loads.
+        #[serde(default)]
+        radius_m: Option<i32>,
     }
 
     let handle = std::fs::File::open(file)
@@ -490,7 +494,13 @@ async fn load_regions_inner(
             )));
         }
         cm_db::repo::reference::upsert_zcta(
-            &mut tx, &row.code, &row.name, row.lat, row.lon, source,
+            &mut tx,
+            &row.code,
+            &row.name,
+            row.lat,
+            row.lon,
+            row.radius_m,
+            source,
         )
         .await?;
         loaded += 1;

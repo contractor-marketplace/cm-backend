@@ -67,6 +67,12 @@ pub fn build(state: AppState) -> Router {
             "/v1/contractors/{id}",
             patch(handlers::contractors::update_profile),
         )
+        // Where the listing works, as opposed to where its licence says it is.
+        .route(
+            "/v1/contractors/{id}/service-areas",
+            get(handlers::contractors::service_areas_get)
+                .put(handlers::contractors::service_areas_put),
+        )
         // Merged for the same reason the job photo routes are: the upload body
         // limit belongs to the route, not to the whole router.
         .merge(handlers::contractors::photo_routes())

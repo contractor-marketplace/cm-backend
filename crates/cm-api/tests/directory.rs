@@ -612,3 +612,182 @@ async fn the_directory_publishes_the_address_on_the_licence(pool: PgPool) {
         map.json
     );
 }
+
+/// The point of the whole feature: a contractor is findable where they work,
+/// not only where their licence says they are.
+///
+/// The directory has always matched a search against the address on a licence,
+/// which is a poor proxy — a business that covers the west side is invisible to
+/// somebody searching the next ZIP over, and a sole trader whose licence
+/// carries their home address is placed at their house rather than their patch.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_contractor_is_found_in_an_area_they_serve_but_are_not_in(pool: PgPool) {
+    seed_directory(&pool).await;
+
+    // Give the ZIPs an area-equivalent radius, which is what stands in for a
+    // boundary until polygons are loaded.
+    sqlx::query("UPDATE regions SET approx_radius_m = 3000 WHERE kind = 'zcta'")
+        .execute(&pool)
+        .await
+        .expect("radii");
+
+    // Stillwater Plumbing is in Santa Monica (90401).
+    let stillwater = contractor_id(&pool, "771204").await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register_contractor("stillwater@example.com").await;
+    let user = user_id(&pool, "stillwater@example.com").await;
+    force_claim(&pool, stillwater, user).await;
+
+    // Silver Lake, twenty-odd miles away. Nothing of theirs is there.
+    let silver_lake = (34.0781, -118.2606);
+    let nearby = |lat: f64, lon: f64| format!("/v1/contractors?lat={lat}&lon={lon}&radius_m=2000");
+
+    let before = client.get(&nearby(silver_lake.0, silver_lake.1)).await;
+    let names: Vec<&str> = before.json["contractors"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["display_name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Stillwater Plumbing"),
+        "not there yet: {names:?}"
+    );
+
+    // They say they cover it.
+    let saved = client
+        .send(
+            http::Method::PUT,
+            &format!("/v1/contractors/{stillwater}/service-areas"),
+            Some(serde_json::json!({ "areas": [{ "kind": "region", "code": "90026" }] })),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.json);
+
+    let after = client.get(&nearby(silver_lake.0, silver_lake.1)).await;
+    let names: Vec<&str> = after.json["contractors"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["display_name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"Stillwater Plumbing"),
+        "declaring the area must make them findable in it: {names:?}"
+    );
+
+    // And the map agrees, because it runs the same predicate.
+    let map = client
+        .get("/v1/contractors/map?lat=34.0781&lon=-118.2606&radius_m=2000")
+        .await;
+    let mapped: Vec<&str> = map.json["points"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|p| p["display_name"].as_str())
+        .collect();
+    assert!(mapped.contains(&"Stillwater Plumbing"), "{mapped:?}");
+}
+
+/// A travel radius is the other kind of area: everywhere within N metres of
+/// where the contractor is, rather than a list of named places.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_travel_radius_widens_the_area_a_contractor_matches(pool: PgPool) {
+    seed_directory(&pool).await;
+
+    let stillwater = contractor_id(&pool, "771204").await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register_contractor("radius@example.com").await;
+    let user = user_id(&pool, "radius@example.com").await;
+    force_claim(&pool, stillwater, user).await;
+
+    let saved = client
+        .send(
+            http::Method::PUT,
+            &format!("/v1/contractors/{stillwater}/service-areas"),
+            Some(serde_json::json!({ "areas": [{ "kind": "radius", "radius_m": 50000 }] })),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.json);
+
+    let found = client
+        .get("/v1/contractors?lat=34.0781&lon=-118.2606&radius_m=1000")
+        .await;
+    let names: Vec<&str> = found.json["contractors"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["display_name"].as_str())
+        .collect();
+    assert!(names.contains(&"Stillwater Plumbing"), "{names:?}");
+}
+
+/// Only the claimant sets where their listing works, and the input is bounded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn service_areas_belong_to_the_claimant_and_are_bounded(pool: PgPool) {
+    seed_directory(&pool).await;
+    let stillwater = contractor_id(&pool, "771204").await;
+    let path = format!("/v1/contractors/{stillwater}/service-areas");
+
+    // A stranger, signed in but owning nothing.
+    let mut stranger = Client::new(router(pool.clone()));
+    stranger.register("stranger@example.com").await;
+    assert_eq!(stranger.get(&path).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        stranger
+            .send(
+                http::Method::PUT,
+                &path,
+                Some(serde_json::json!({ "areas": [] })),
+            )
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // No session at all.
+    let mut anonymous = Client::new(router(pool.clone()));
+    anonymous.clear_jar();
+    assert_eq!(anonymous.get(&path).await.status, StatusCode::UNAUTHORIZED);
+
+    let mut owner = Client::new(router(pool.clone()));
+    owner.register_contractor("owner@example.com").await;
+    let user = user_id(&pool, "owner@example.com").await;
+    force_claim(&pool, stillwater, user).await;
+
+    // Two radii is a contradiction, and the larger would win silently.
+    let two = owner
+        .send(
+            http::Method::PUT,
+            &path,
+            Some(serde_json::json!({ "areas": [
+                { "kind": "radius", "radius_m": 10000 },
+                { "kind": "radius", "radius_m": 90000 }
+            ]})),
+        )
+        .await;
+    assert_eq!(two.status, StatusCode::BAD_REQUEST, "{:?}", two.json);
+
+    // A ZIP the Census draws no area around is reported, not refused: the
+    // gazetteer covers populated places, and a PO-box code a contractor really
+    // uses has no centroid to match against.
+    let mixed = owner
+        .send(
+            http::Method::PUT,
+            &path,
+            Some(serde_json::json!({ "areas": [
+                { "kind": "region", "code": "90026" },
+                { "kind": "region", "code": "90209" }
+            ]})),
+        )
+        .await;
+    assert_eq!(mixed.status, StatusCode::OK, "{:?}", mixed.json);
+    let unknown: Vec<&str> = mixed.json["unknown"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(unknown, vec!["90209"]);
+    assert_eq!(mixed.json["areas"].as_array().expect("array").len(), 1);
+}

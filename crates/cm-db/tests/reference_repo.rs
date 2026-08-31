@@ -18,6 +18,7 @@ async fn a_placeholder_name_never_overwrites_a_real_one(pool: PgPool) {
         "Silver Lake",
         34.0781,
         -118.2606,
+        None,
         "curated",
     )
     .await
@@ -30,6 +31,7 @@ async fn a_placeholder_name_never_overwrites_a_real_one(pool: PgPool) {
         "90026",
         34.080017,
         -118.262643,
+        None,
         "census",
     )
     .await
@@ -55,9 +57,11 @@ async fn a_placeholder_name_never_overwrites_a_real_one(pool: PgPool) {
 async fn an_unnamed_zip_is_stored_under_its_code(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("connection");
 
-    reference::upsert_zcta(&mut conn, "90001", "90001", 33.974026, -118.24951, "census")
-        .await
-        .expect("insert");
+    reference::upsert_zcta(
+        &mut conn, "90001", "90001", 33.974026, -118.24951, None, "census",
+    )
+    .await
+    .expect("insert");
 
     let region = reference::find_zcta(&mut conn, "90001")
         .await
@@ -73,15 +77,18 @@ async fn an_unnamed_zip_is_stored_under_its_code(pool: PgPool) {
 async fn a_real_name_still_updates(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("connection");
 
-    reference::upsert_zcta(&mut conn, "90042", "90042", 34.1156, -118.1926, "census")
-        .await
-        .expect("insert");
+    reference::upsert_zcta(
+        &mut conn, "90042", "90042", 34.1156, -118.1926, None, "census",
+    )
+    .await
+    .expect("insert");
     reference::upsert_zcta(
         &mut conn,
         "90042",
         "Highland Park",
         34.1156,
         -118.1926,
+        None,
         "curated",
     )
     .await
@@ -106,6 +113,8 @@ async fn the_shipped_centroid_file_covers_the_county(pool: PgPool) {
         name: String,
         lat: f64,
         lon: f64,
+        #[serde(default)]
+        radius_m: Option<i32>,
     }
 
     let path =
@@ -122,9 +131,17 @@ async fn the_shipped_centroid_file_covers_the_county(pool: PgPool) {
             "{} has an impossible centroid",
             row.code
         );
-        reference::upsert_zcta(&mut conn, &row.code, &row.name, row.lat, row.lon, "test")
-            .await
-            .expect("upsert");
+        reference::upsert_zcta(
+            &mut conn,
+            &row.code,
+            &row.name,
+            row.lat,
+            row.lon,
+            row.radius_m,
+            "test",
+        )
+        .await
+        .expect("upsert");
         loaded += 1;
     }
 
