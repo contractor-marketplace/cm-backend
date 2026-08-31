@@ -44,7 +44,6 @@ pub struct SearchRequest {
 /// The largest radius a single query may ask for: about 125 miles, comfortably
 /// more than the launch county and small enough that the index stays useful.
 pub const MAX_RADIUS_M: f64 = 200_000.0;
-const DEFAULT_RADIUS_M: f64 = 25_000.0;
 const DEFAULT_LIMIT: i64 = 20;
 
 pub fn parse(raw: &RawQuery, trade_ids: Vec<Uuid>) -> Result<SearchRequest, AppError> {
@@ -100,10 +99,15 @@ pub fn parse(raw: &RawQuery, trade_ids: Vec<Uuid>) -> Result<SearchRequest, AppE
         (Some(lat), Some(lon), radius)
             if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) =>
         {
+            // No radius means no narrowing, not a default one. A location on
+            // its own asks "who travels here", which coverage answers; a radius
+            // is the separate, rarer request to see only the closest of them.
+            // Defaulting it would silently hide every contractor who covers the
+            // address from further away, which is most of the point.
             filters.near = Some(Near {
                 lat,
                 lon,
-                radius_m: radius.unwrap_or(DEFAULT_RADIUS_M).clamp(1.0, MAX_RADIUS_M),
+                radius_m: radius.map(|r| r.clamp(1.0, MAX_RADIUS_M)),
             });
         }
         (None, None, None) => {}
@@ -334,7 +338,35 @@ mod tests {
         )
         .expect("parse");
 
-        assert_eq!(request.filters.near.expect("near").radius_m, MAX_RADIUS_M);
+        assert_eq!(
+            request.filters.near.expect("near").radius_m,
+            Some(MAX_RADIUS_M)
+        );
+    }
+
+    /// A location with no radius asks who covers it, which is the ordinary
+    /// case. Filling in a default here would quietly narrow the search to a
+    /// circle nobody asked for, hiding every contractor who travels further —
+    /// and travelling further is what the coverage model exists to express.
+    #[test]
+    fn a_location_without_a_radius_does_not_acquire_one() {
+        let request = parse(
+            &RawQuery {
+                lat: Some("34.1".into()),
+                lon: Some("-118.2".into()),
+                radius_m: None,
+                ..raw()
+            },
+            vec![],
+        )
+        .expect("parse");
+
+        let near = request.filters.near.expect("near");
+        assert_eq!(
+            near.radius_m, None,
+            "a centre alone must not imply a radius"
+        );
+        assert!(request.ignored.is_empty(), "{:?}", request.ignored);
     }
 
     /// The wire names the API accepts, including the one it used to use.

@@ -14,12 +14,18 @@ use uuid::Uuid;
 
 use super::contractors::{PublicContractor, PublicPointSource};
 
-/// A geographic centre and radius, in metres.
+/// Where the person searching is.
+///
+/// The radius is optional, and its absence is the normal case. Coverage decides
+/// what matches — "who travels to this address" — and a radius narrows that
+/// afterwards for somebody who wants only the closest. Requiring one would put
+/// a second, unrelated distance in front of a question that already has an
+/// answer.
 #[derive(Debug, Clone, Copy)]
 pub struct Near {
     pub lat: f64,
     pub lon: f64,
-    pub radius_m: f64,
+    pub radius_m: Option<f64>,
 }
 
 /// A viewport.
@@ -110,7 +116,22 @@ pub const MAX_MAP_POINTS: i64 = 500;
 /// New filters append: `$1`–`$11` keep their meanings, which is what lets
 /// `SELECT` reference the centre as `$1`/`$2` and the relevance ordering
 /// reference the query text as `$4` without either of them moving.
-const PREDICATE_BINDS: usize = 13;
+const PREDICATE_BINDS: usize = 14;
+
+/// How far a contractor travels when they have not said otherwise: 25 miles.
+///
+/// Every listing has this, including the unclaimed majority, which is what
+/// makes "who covers this address" answerable for the whole directory rather
+/// than for the handful of claimants who have filled a form in. It is a product
+/// decision — a licensed contractor is presumed willing to travel a normal
+/// metropolitan distance — not a number derived from the data.
+///
+/// It appears in three places that must agree: the column default in 0030, that
+/// migration's partial index, and here. `the_default_radius_matches_the_schema`
+/// and `the_custom_radius_index_matches_the_default` fail if any drifts, and
+/// the index one matters most: an index whose predicate no longer matches the
+/// query's stops being used silently rather than failing.
+pub const DEFAULT_SERVICE_RADIUS_M: i32 = 40_234;
 
 /// The query-text slot. Referenced by the predicate and, separately, by the
 /// relevance ordering — a coupling `the_relevance_ordering_reads_the_query_bind`
@@ -159,16 +180,32 @@ const QUERY_TRADES_BIND: usize = 12;
 /// almost none of the directory has — service areas are set by a claimant, and
 /// the great majority of listings are unclaimed.
 ///
-/// **The service-area half is resolved before this statement runs**, by
-/// `contractors_serving`, and arrives as an id array. Asking it here as a
-/// correlated `OR EXISTS` reads better and cost 5× on the real directory: an
-/// `OR` between a spatial predicate and a subquery is not index-servable, so
-/// the planner abandoned `contractors_public_point_gix` and sequentially
-/// scanned all 49,774 rows — 478ms against 94ms, measured on production data
-/// for a 25km search. The `IS NOT NULL` guard is what keeps the fast plan when
-/// nothing was found, which is the common case and is every case until
-/// claimants start declaring areas; without it the bare `= ANY(NULL)` still
-/// costs a scan.
+/// **The geo test asks about coverage, not proximity.** "Is the searcher inside
+/// this contractor's circle", rather than "is this contractor near the
+/// searcher". Those differ exactly where it matters: a roofer eight miles out
+/// with a fifty-mile radius covers you, and a sole trader two miles away who
+/// only works their own neighbourhood does not.
+///
+/// Said in full it is `ST_DWithin(c.public_point, me, c.service_radius_m)` — a
+/// per-row distance, which no spatial index can answer. That is the fault that
+/// cost 5× in 0029's predicate, and it would return here in a worse form,
+/// because a per-row radius defeats the index for *every* search rather than
+/// only those with a centre.
+///
+/// So it is split by whether the contractor kept the default. Those who did —
+/// the overwhelming majority, and every unclaimed listing — are matched with a
+/// constant radius the index serves directly. Those who changed it, in either
+/// direction, are resolved ahead of the statement by `contractors_serving` and
+/// arrive as ids. The equality on `service_radius_m` in the first branch is
+/// what makes the split sound: without it a contractor who narrowed their
+/// radius to five miles would still be matched at twenty by the constant.
+///
+/// The `IS NOT NULL` guard keeps the fast plan when the id list is empty, which
+/// is the common case; a bare `= ANY(NULL)` still costs a scan.
+///
+/// `$3` is the searcher's own radius, and it narrows rather than selects. It is
+/// a separate `AND` because it answers a different question — "only show me the
+/// closest" — and most searches will not carry one.
 ///
 /// The fuzzy clause is `<%` (word similarity), not `%` (whole-string
 /// similarity), and the difference is the whole feature. `%` scores the query
@@ -179,9 +216,12 @@ const QUERY_TRADES_BIND: usize = 12;
 /// gives 0.667, so it does. Both use the same `contractors_name_trgm` GIN
 /// index; the plan is a bitmap index scan either way.
 const PREDICATE: &str = "\
-    ($1::float8 IS NULL OR ST_DWithin(c.public_point, \
-        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3) \
+    ($1::float8 IS NULL \
+        OR (c.service_radius_m = $14 AND ST_DWithin(c.public_point, \
+                ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $14::float8)) \
         OR ($13::uuid[] IS NOT NULL AND c.id = ANY($13))) \
+    AND ($3::float8 IS NULL OR ST_DWithin(c.public_point, \
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)) \
     AND ($4::text IS NULL \
          OR c.search_doc @@ websearch_to_tsquery('public.english_unaccent', $4) \
          OR $4 <% c.display_name \
@@ -215,9 +255,12 @@ fn bind_filters<'q>(
         .bind(filters.bbox.map(|b| b.max_lat))
         .bind((!filters.query_trade_ids.is_empty()).then(|| filters.query_trade_ids.clone()))
         .bind(serving.0.clone())
+        .bind(DEFAULT_SERVICE_RADIUS_M)
 }
 
-/// Contractors whose declared service area covers the centre of the search.
+/// Contractors who cover the searcher but are not matched by the constant
+/// branch of `PREDICATE` — everyone who changed their travel radius, plus
+/// everyone who named this place specifically.
 ///
 /// `None` rather than an empty vector when nothing matches, because the two
 /// bind differently and only `NULL` keeps the spatial index in play — see
@@ -228,10 +271,14 @@ pub struct Serving(Option<Vec<Uuid>>);
 
 /// Resolved once per search, ahead of the statement that uses it.
 ///
-/// Scans `contractor_service_areas` rather than the directory, which is the
-/// point: the table holds one row per area a claimant has declared, so this
-/// stays small long after `contractors` does not. Returns early when no centre
-/// was given, so a plain browse pays nothing.
+/// Both halves are small by construction and stay small as the directory grows.
+/// The first reads `contractors_custom_radius_gix`, a spatial index over only
+/// the contractors who overrode the default — a claimant action, so a thin
+/// slice of a register that is overwhelmingly unclaimed. The second reads
+/// `contractor_service_areas`, which holds one row per place a claimant named
+/// rather than one per contractor.
+///
+/// Returns early when no centre was given, so a plain browse pays nothing.
 async fn contractors_serving(
     conn: &mut PgConnection,
     near: Option<Near>,
@@ -241,18 +288,22 @@ async fn contractors_serving(
     };
 
     let ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT sa.contractor_id \
+        "SELECT sc.id \
+           FROM contractors sc \
+          WHERE sc.service_radius_m <> $3 \
+            AND ST_DWithin(sc.public_point, \
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, sc.service_radius_m) \
+          UNION \
+         SELECT sa.contractor_id \
            FROM contractor_service_areas sa \
-           JOIN contractors sc ON sc.id = sa.contractor_id \
-           LEFT JOIN regions sr ON sr.id = sa.region_id \
-          WHERE ST_DWithin(sc.public_point, \
-                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, sa.radius_m) \
-             OR ST_DWithin(sr.centroid, \
+           JOIN regions sr ON sr.id = sa.region_id \
+          WHERE ST_DWithin(sr.centroid, \
                     ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, \
                     COALESCE(sr.approx_radius_m, 0))",
     )
     .bind(near.lon)
     .bind(near.lat)
+    .bind(DEFAULT_SERVICE_RADIUS_M)
     .fetch_all(&mut *conn)
     .await
     .map_err(AppError::internal)?;
@@ -791,7 +842,7 @@ mod tests {
             near: Some(Near {
                 lat: 34.0,
                 lon: -118.0,
-                radius_m: 25_000.0,
+                radius_m: Some(25_000.0),
             }),
             ..Filters::default()
         }
@@ -894,6 +945,22 @@ mod tests {
         assert!(
             !geo_clause.contains("SELECT"),
             "the geo clause must not contain a subquery: {geo_clause}"
+        );
+
+        // The same fault in its other costume. Coverage is "within *this
+        // contractor's* radius", and writing that literally puts a column in
+        // the distance argument, which no spatial index can answer — for every
+        // search, not just those with a centre. It is split instead: a constant
+        // for the default, a precomputed list for everyone else.
+        assert!(
+            !geo_clause.contains("service_radius_m)"),
+            "a per-row radius in ST_DWithin drops the spatial index. The \
+             overriders belong in `contractors_serving`: {geo_clause}"
+        );
+        assert!(
+            geo_clause.contains(&format!("c.service_radius_m = ${PREDICATE_BINDS}")),
+            "the constant branch must also test equality, or a contractor who \
+             narrowed their radius is matched at the default anyway: {geo_clause}"
         );
     }
 

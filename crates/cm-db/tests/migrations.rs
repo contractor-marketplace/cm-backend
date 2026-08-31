@@ -768,6 +768,86 @@ async fn constraints_reject_invalid_rows(pool: PgPool) {
     assert!(duplicate_slug.is_err(), "trade slugs must be unique");
 }
 
+/// The default travel radius is written in three places that cannot disagree:
+/// the column default in 0030, that migration's partial index, and
+/// `DEFAULT_SERVICE_RADIUS_M` in Rust.
+///
+/// The column half of this is loud when it breaks — everyone gets the wrong
+/// coverage. The index half is silent, which is why it is pinned here: a
+/// partial index whose predicate no longer matches the query's is simply not
+/// used, so the only symptom is a search that got slower, and only under enough
+/// rows to notice.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_default_service_radius_is_the_same_number_everywhere(pool: PgPool) {
+    let column_default: String = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns \
+          WHERE table_name = 'contractors' AND column_name = 'service_radius_m'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read the column default");
+
+    let expected = cm_db::repo::search::DEFAULT_SERVICE_RADIUS_M.to_string();
+    assert!(
+        column_default.contains(&expected),
+        "the column defaults to {column_default}, Rust says {expected}"
+    );
+
+    let index: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'contractors_custom_radius_gix'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the partial index exists");
+
+    assert!(
+        index.contains(&expected),
+        "the index selects on a different number than Rust queries with. \
+         It will silently stop being used. index: {index}, Rust: {expected}"
+    );
+    assert!(
+        index.contains("service_radius_m <>"),
+        "the index must cover exactly the contractors who overrode the \
+         default, since those are the only ones the pre-query looks for: {index}"
+    );
+}
+
+/// Every listing covers somewhere, including the unclaimed majority.
+///
+/// This is the property the whole coverage model rests on: search asks "who
+/// travels to this address", and before 0030 a listing that had declared
+/// nothing answered "nowhere" — which was every listing, because service areas
+/// are set by claimants and almost nothing is claimed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_contractor_covers_somewhere_without_anybody_saying_so(pool: PgPool) {
+    let radius: i32 = sqlx::query_scalar(
+        "INSERT INTO contractors (id, slug, display_name) \
+         VALUES ($1, 'default-radius-co', 'Default Radius Co') \
+         RETURNING service_radius_m",
+    )
+    .bind(cm_core::new_id())
+    .fetch_one(&pool)
+    .await
+    .expect("insert a contractor without mentioning a radius");
+
+    assert_eq!(
+        radius,
+        cm_db::repo::search::DEFAULT_SERVICE_RADIUS_M,
+        "a contractor nobody has claimed still has to cover its own city"
+    );
+
+    // The ceiling is enforced by the database, not only by the repo that
+    // clamps: an area of a thousand miles is not a service area.
+    let absurd = sqlx::query("UPDATE contractors SET service_radius_m = 2000000 WHERE slug = $1")
+        .bind("default-radius-co")
+        .execute(&pool)
+        .await;
+    assert!(
+        absurd.is_err(),
+        "the radius ceiling must hold in the schema"
+    );
+}
+
 async fn applied_rows(pool: &PgPool) -> Vec<(i64, i64)> {
     sqlx::query_as("SELECT version, execution_time FROM _sqlx_migrations ORDER BY version")
         .fetch_all(pool)

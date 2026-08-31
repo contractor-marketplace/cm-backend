@@ -638,9 +638,22 @@ async fn a_contractor_is_found_in_an_area_they_serve_but_are_not_in(pool: PgPool
     let user = user_id(&pool, "stillwater@example.com").await;
     force_claim(&pool, stillwater, user).await;
 
-    // Silver Lake, twenty-odd miles away. Nothing of theirs is there.
+    // Well outside their own travel radius, so the only thing that can bring
+    // them back is declaring the area. Santa Monica to Silver Lake is about
+    // 22km, which 0030's 25-mile default already covers — the point of this
+    // test is the named region, so the distance has to be past that.
+    sqlx::query(
+        "UPDATE contractors \
+            SET public_point = ST_SetSRID(ST_MakePoint(-119.4, 34.0781), 4326)::geography \
+          WHERE id = $1",
+    )
+    .bind(stillwater)
+    .execute(&pool)
+    .await
+    .expect("reposition");
+
     let silver_lake = (34.0781, -118.2606);
-    let nearby = |lat: f64, lon: f64| format!("/v1/contractors?lat={lat}&lon={lon}&radius_m=2000");
+    let nearby = |lat: f64, lon: f64| format!("/v1/contractors?lat={lat}&lon={lon}");
 
     let before = client.get(&nearby(silver_lake.0, silver_lake.1)).await;
     let names: Vec<&str> = before.json["contractors"]
@@ -678,7 +691,7 @@ async fn a_contractor_is_found_in_an_area_they_serve_but_are_not_in(pool: PgPool
 
     // And the map agrees, because it runs the same predicate.
     let map = client
-        .get("/v1/contractors/map?lat=34.0781&lon=-118.2606&radius_m=2000")
+        .get("/v1/contractors/map?lat=34.0781&lon=-118.2606")
         .await;
     let mapped: Vec<&str> = map.json["points"]
         .as_array()
@@ -689,29 +702,60 @@ async fn a_contractor_is_found_in_an_area_they_serve_but_are_not_in(pool: PgPool
     assert!(mapped.contains(&"Stillwater Plumbing"), "{mapped:?}");
 }
 
-/// A travel radius is the other kind of area: everywhere within N metres of
-/// where the contractor is, rather than a list of named places.
+/// Widening the travel radius past the default reaches further than the default
+/// does.
+///
+/// The search carries no radius of its own, which is now the ordinary case: a
+/// location alone asks who covers it. An explicit `radius_m` would narrow this
+/// result rather than widen it — see
+/// `a_search_radius_narrows_coverage_rather_than_defining_it`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_travel_radius_widens_the_area_a_contractor_matches(pool: PgPool) {
     seed_directory(&pool).await;
 
     let stillwater = contractor_id(&pool, "771204").await;
+
+    // Past the 25-mile default, so only an explicit widening can reach back.
+    sqlx::query(
+        "UPDATE contractors \
+            SET public_point = ST_SetSRID(ST_MakePoint(-119.4, 34.0781), 4326)::geography \
+          WHERE id = $1",
+    )
+    .bind(stillwater)
+    .execute(&pool)
+    .await
+    .expect("reposition");
+
     let mut client = Client::new(router(pool.clone()));
     client.register_contractor("radius@example.com").await;
     let user = user_id(&pool, "radius@example.com").await;
     force_claim(&pool, stillwater, user).await;
 
+    let missing = client
+        .get("/v1/contractors?lat=34.0781&lon=-118.2606")
+        .await;
+    let before: Vec<&str> = missing.json["contractors"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["display_name"].as_str())
+        .collect();
+    assert!(
+        !before.contains(&"Stillwater Plumbing"),
+        "the default radius must not already reach: {before:?}"
+    );
+
     let saved = client
         .send(
             http::Method::PUT,
             &format!("/v1/contractors/{stillwater}/service-areas"),
-            Some(serde_json::json!({ "areas": [{ "kind": "radius", "radius_m": 50000 }] })),
+            Some(serde_json::json!({ "areas": [{ "kind": "radius", "radius_m": 150000 }] })),
         )
         .await;
     assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.json);
 
     let found = client
-        .get("/v1/contractors?lat=34.0781&lon=-118.2606&radius_m=1000")
+        .get("/v1/contractors?lat=34.0781&lon=-118.2606")
         .await;
     let names: Vec<&str> = found.json["contractors"]
         .as_array()
@@ -789,5 +833,158 @@ async fn service_areas_belong_to_the_claimant_and_are_bounded(pool: PgPool) {
         .filter_map(serde_json::Value::as_str)
         .collect();
     assert_eq!(unknown, vec!["90209"]);
-    assert_eq!(mixed.json["areas"].as_array().expect("array").len(), 1);
+
+    // Two, not one: the region that resolved, plus the travel radius, which
+    // every contractor has whether or not this request mentioned one. Sending
+    // no radius means "leave it at the default", never "I travel nowhere".
+    let areas = mixed.json["areas"].as_array().expect("array");
+    assert_eq!(areas.len(), 2, "{areas:?}");
+    assert!(
+        areas.iter().any(|a| a["kind"] == "radius"),
+        "a saved listing always reports the radius in force: {areas:?}"
+    );
+}
+
+/// Coverage, not proximity.
+///
+/// The directory used to answer "which contractors are near this address",
+/// which is a different question from the one a homeowner is asking. These
+/// three cases are where the two answers diverge, and all three have to hold
+/// together — each one alone is satisfiable by a predicate that gets the others
+/// wrong.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_search_finds_who_covers_the_address_not_who_is_near_it(pool: PgPool) {
+    seed_directory(&pool).await;
+
+    // Santa Monica. Everything below is positioned relative to this.
+    const LAT: f64 = 34.0195;
+    const LON: f64 = -118.4912;
+
+    // Roughly 60km east — outside anybody's default 25 miles (40.2km).
+    let far = |conn: &PgPool, name: &str, radius_m: i32| {
+        let name = name.to_owned();
+        let conn = conn.clone();
+        async move {
+            sqlx::query(
+                "UPDATE contractors \
+                    SET public_point = ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography, \
+                        service_radius_m = $4 \
+                  WHERE display_name = $1",
+            )
+            .bind(&name)
+            .bind(LON + 0.65)
+            .bind(LAT)
+            .bind(radius_m)
+            .execute(&conn)
+            .await
+            .expect("reposition");
+        }
+    };
+
+    // Far away, travels far: covers Santa Monica.
+    far(&pool, "Ibarra & Daughters Construction", 100_000).await;
+    // Far away, ordinary radius: does not.
+    far(&pool, "Meridian Electric Co", 40_234).await;
+
+    // Close by, but only works its own street: must not be dragged in by the
+    // constant-radius branch. This is the case the equality guard exists for —
+    // without it a narrowed radius is silently ignored.
+    sqlx::query(
+        "UPDATE contractors \
+            SET public_point = ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography, \
+                service_radius_m = 2000 \
+          WHERE display_name = $1",
+    )
+    .bind("Stillwater Plumbing")
+    .bind(LON + 0.05)
+    .bind(LAT)
+    .execute(&pool)
+    .await
+    .expect("reposition");
+
+    let mut client = Client::new(router(pool));
+    let response = client
+        .get(&format!("/v1/contractors?lat={LAT}&lon={LON}"))
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+
+    let names: Vec<&str> = response.json["contractors"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["display_name"].as_str())
+        .collect();
+
+    assert!(
+        names.contains(&"Ibarra & Daughters Construction"),
+        "a contractor 60km away who travels 100km covers this address: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Meridian Electric Co"),
+        "a contractor 60km away on the default radius does not: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Stillwater Plumbing"),
+        "a contractor who narrowed their radius to 2km must not be matched by \
+         the default-radius branch just for being close: {names:?}"
+    );
+    assert!(
+        names.contains(&"Reinholt Roofing"),
+        "a listing nobody has claimed still covers its own neighbourhood: {names:?}"
+    );
+}
+
+/// A radius on the query narrows what coverage returned; it does not replace it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_search_radius_narrows_coverage_rather_than_defining_it(pool: PgPool) {
+    seed_directory(&pool).await;
+
+    const LAT: f64 = 34.0195;
+    const LON: f64 = -118.4912;
+
+    sqlx::query(
+        "UPDATE contractors \
+            SET public_point = ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, \
+                service_radius_m = 100000 \
+          WHERE display_name = 'Ibarra & Daughters Construction'",
+    )
+    .bind(LON + 0.65)
+    .bind(LAT)
+    .execute(&pool)
+    .await
+    .expect("reposition");
+
+    let mut client = Client::new(router(pool));
+
+    let covered = client
+        .get(&format!("/v1/contractors?lat={LAT}&lon={LON}"))
+        .await;
+    let names: Vec<&str> = covered.json["contractors"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["display_name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"Ibarra & Daughters Construction"),
+        "{names:?}"
+    );
+
+    // The same search, restricted to 10km. The far contractor still covers the
+    // address, but the searcher has asked for the close ones only.
+    let narrowed = client
+        .get(&format!(
+            "/v1/contractors?lat={LAT}&lon={LON}&radius_m=10000"
+        ))
+        .await;
+    let narrowed_names: Vec<&str> = narrowed.json["contractors"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|c| c["display_name"].as_str())
+        .collect();
+    assert!(
+        !narrowed_names.contains(&"Ibarra & Daughters Construction"),
+        "an explicit radius must exclude the far coverage: {narrowed_names:?}"
+    );
 }

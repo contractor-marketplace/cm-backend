@@ -238,6 +238,43 @@ point while the map published a centroid, the radius filter could be
 binary-searched to recover the address the centroid was protecting. A
 behavioural test performs exactly that attack against every read path.
 
+### Coverage, not proximity
+
+A location filter asks **"who travels here"**, not "who is registered here".
+Those give different answers exactly where it matters: a roofer eight miles out
+with a fifty-mile radius covers you; a sole trader two miles away who only works
+their own neighbourhood does not.
+
+Every contractor has `service_radius_m`, defaulting to **25 miles** — including
+the unclaimed majority, which is what makes the question answerable for the
+whole register rather than for the handful of claimants who have filled a form
+in. Claimants can change it, and can additionally name specific ZIPs in
+`contractor_service_areas`.
+
+Said literally the test is `ST_DWithin(c.public_point, me, c.service_radius_m)`,
+a per-row distance no spatial index can answer. It is split in two instead:
+
+- contractors **at the default** are matched with a constant radius, which the
+  GiST index serves directly
+- contractors **who changed it**, in either direction, plus anyone who named
+  this place, are resolved by one small query ahead of the statement and arrive
+  as an id array
+
+The equality on `service_radius_m` in the first branch is what makes the split
+sound. Without it, somebody who narrowed their radius to five miles would still
+be matched at twenty by the constant — the filter would silently only ever
+widen.
+
+**The searcher's own `radius_m` narrows and does not select.** It is a separate
+`AND`, absent by default, for somebody who wants only the closest of the
+contractors who already cover them. Defaulting it — which the API used to do,
+at 25 km — silently hid everyone who travels further, which is most of the point
+of coverage.
+
+**`zip=` is the older, narrower filter** and matches a contractor's own postal
+code exactly. It answers "who is registered in this ZIP", which is rarely the
+question, and it is no longer reachable from the directory UI.
+
 **ZIP centroids.** `deploy/data/zcta_ca.csv` carries all 1,763 California ZCTAs
 from the 2020 Census gazetteer. It carried 25. Measured on the real register,
 that took ZIP coverage from 25 of 340 to 271 and located contractors from 9% to

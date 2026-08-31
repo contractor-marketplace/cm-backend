@@ -6,13 +6,20 @@
 //! licence carries their home address is placed at their house rather than at
 //! their patch.
 //!
-//! Two kinds of area, and a row is exactly one of them — a named region, or a
-//! radius from the contractor's own point. The CHECK in 0010 enforces that; the
-//! type here mirrors it, so an impossible pair cannot be constructed in Rust
-//! and then refused by the database.
+//! Two kinds of area, stored differently because they are differently shaped.
+//! The travel radius is `contractors.service_radius_m` — one value, always
+//! present, defaulting to 25 miles for every listing including the unclaimed
+//! majority. Named regions are rows in `contractor_service_areas` — zero or
+//! more, and only ever set by a claimant.
+//!
+//! The wire type keeps them together as one tagged enum, because to the person
+//! filling the form they are two answers to one question. 0030 moved the
+//! storage; this module is where the two shapes are reconciled.
 
 use cm_core::{new_id, AppError};
 use sqlx::PgConnection;
+
+use super::search::DEFAULT_SERVICE_RADIUS_M;
 use uuid::Uuid;
 
 /// The largest radius a contractor may claim: about 125 miles, matching the
@@ -36,31 +43,38 @@ pub enum Area {
 }
 
 /// What a contractor has declared.
+///
+/// The radius always comes back, because every contractor has one — a listing
+/// nobody has claimed still covers 25 miles. The editor therefore opens showing
+/// the radius in force rather than an empty control that implies "nowhere".
 pub async fn for_contractor(
     conn: &mut PgConnection,
     contractor_id: Uuid,
 ) -> Result<Vec<Area>, AppError> {
-    let rows: Vec<(Option<String>, Option<i32>)> = sqlx::query_as(
-        "SELECT r.code, sa.radius_m \
+    let radius_m: Option<i32> =
+        sqlx::query_scalar("SELECT service_radius_m FROM contractors WHERE id = $1")
+            .bind(contractor_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(AppError::internal)?;
+
+    let codes: Vec<String> = sqlx::query_scalar(
+        "SELECT r.code \
            FROM contractor_service_areas sa \
-           LEFT JOIN regions r ON r.id = sa.region_id \
+           JOIN regions r ON r.id = sa.region_id \
           WHERE sa.contractor_id = $1 \
-          ORDER BY sa.radius_m NULLS LAST, r.code",
+          ORDER BY r.code",
     )
     .bind(contractor_id)
     .fetch_all(&mut *conn)
     .await
     .map_err(AppError::internal)?;
 
-    Ok(rows
+    // Radius first: it is the one every listing has, and the form leads with it.
+    Ok(radius_m
+        .map(|radius_m| Area::Radius { radius_m })
         .into_iter()
-        .filter_map(|(code, radius_m)| match (code, radius_m) {
-            (Some(code), None) => Some(Area::Region { code }),
-            (None, Some(radius_m)) => Some(Area::Radius { radius_m }),
-            // The CHECK makes this unreachable; a row that reached it anyway is
-            // not something to guess about.
-            _ => None,
-        })
+        .chain(codes.into_iter().map(|code| Area::Region { code }))
         .collect())
 }
 
@@ -81,6 +95,27 @@ pub async fn replace(
 ) -> Result<Vec<String>, AppError> {
     sqlx::query("DELETE FROM contractor_service_areas WHERE contractor_id = $1")
         .bind(contractor_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(AppError::internal)?;
+
+    // A radius is never absent, only unstated. Sending no radius means "leave
+    // it at the default" rather than "I travel nowhere", so the column is reset
+    // rather than cleared — there is no such thing as a contractor with no
+    // coverage, and a form that could produce one would be a way to vanish from
+    // the directory by accident.
+    let radius = areas
+        .iter()
+        .find_map(|area| match area {
+            Area::Radius { radius_m } => Some(*radius_m),
+            Area::Region { .. } => None,
+        })
+        .unwrap_or(DEFAULT_SERVICE_RADIUS_M)
+        .clamp(1, MAX_RADIUS_M);
+
+    sqlx::query("UPDATE contractors SET service_radius_m = $2 WHERE id = $1")
+        .bind(contractor_id)
+        .bind(radius)
         .execute(&mut *conn)
         .await
         .map_err(AppError::internal)?;
@@ -107,18 +142,10 @@ pub async fn replace(
                     unknown.push(code.clone());
                 }
             }
-            Area::Radius { radius_m } => {
-                sqlx::query(
-                    "INSERT INTO contractor_service_areas (id, contractor_id, radius_m) \
-                     VALUES ($1, $2, $3)",
-                )
-                .bind(new_id())
-                .bind(contractor_id)
-                .bind((*radius_m).clamp(1, MAX_RADIUS_M))
-                .execute(&mut *conn)
-                .await
-                .map_err(AppError::internal)?;
-            }
+            // Already applied above, to the contractor rather than to this
+            // table. Handled there because there is exactly one of them and it
+            // has to be written even when the caller sends none.
+            Area::Radius { .. } => {}
         }
     }
 
