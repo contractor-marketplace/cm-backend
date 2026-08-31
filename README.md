@@ -12,6 +12,7 @@ published Google reviews.
 | Document | Read it for |
 |---|---|
 | **`docs/architecture.md`** | **The whole stack and everything that has been built — start here** |
+| `docs/search.md` | Search and queries: retrieval, ranking, pagination, facets, and how they are measured |
 | `docs/runbook.md` | Deploying, importing, backups, what to do when something breaks |
 | `docs/handover.md` | What is and is not covered |
 | This file | Running it locally |

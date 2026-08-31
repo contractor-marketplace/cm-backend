@@ -3,9 +3,10 @@
 What this system is made of, what runs in production, and what each piece was
 built to do. Written to be read by somebody who has never seen the repository.
 
-Companion documents: `runbook.md` is the operational procedure (deploy order,
-imports, backups, incident response); `README.md` is how to run it locally.
-This one is the map.
+Companion documents: `search.md` is everything the two boards do — retrieval,
+ranking, pagination, facets, and how any of it is known to work; `runbook.md` is
+the operational procedure (deploy order, imports, backups, incident response);
+`README.md` is how to run it locally. This one is the map.
 
 Accurate as of migration **0028**, 2026-08-30.
 
