@@ -110,17 +110,53 @@ search, and silently so.
 
 ## Backups
 
+Installed as `cm-backup.timer`, nightly at 03:30 UTC — ahead of `cm-prune`
+(04:15), so the night's backup captures the database as the day left it rather
+than as housekeeping rewrote it.
+
 ```bash
-CM_BACKUP_RECIPIENT=age1... deploy/backup.sh          # nightly
-CM_BACKUP_IDENTITY=/root/backup.key deploy/restore-verify.sh   # weekly
+systemctl list-timers cm-backup.timer
+systemctl start cm-backup.service        # take one now
+journalctl -u cm-backup.service -n 20    # why the last one failed
+gcloud storage ls -l gs://cm-db-backups-6b1e669f/daily/
 ```
 
-`restore-verify.sh` restores the newest backup into a scratch database and
-checks the migration ledger. Run it on a timer. A backup that has never been
-restored is a hope.
+The unit runs `backup.sh` and then copies the result off the host, which is the
+half the script deliberately leaves to the site. Both steps are `ExecStart`
+lines, so a failed upload fails the unit rather than passing quietly with a
+local-only backup.
 
-**Copy backups off this host.** The script says so and does not do it: the
-destination is site-specific.
+**Configuration** lives in `/etc/cm-backup/env`, and the age identity beside it
+in `/etc/cm-backup/identity.txt` (0400, owned by `postgres`). Deliberately not
+`/etc/cm-backend/`: that directory is `root:cm` because it holds the
+application's database password, and letting `postgres` read the backup key out
+of it would hand the backup user the app's credentials as a side effect.
+
+**Restores are verified, not assumed.** `restore-verify.sh` decrypts the newest
+backup into a scratch database, checks the migration ledger and drops it again:
+
+```bash
+cd /tmp && sudo -u postgres bash -c 'set -a; . /etc/cm-backup/env; set +a; restore-verify.sh'
+# restore verified from cm-20260831T010156Z.dump.age: migration 24, 30 tables, 0 dirty
+```
+
+Run it from a directory `postgres` can read — it uses `find`, which fails
+trying to restore a working directory it was never allowed into.
+
+Two retention windows, and they are not the same number: 30 days on the box
+(`CM_BACKUP_KEEP_DAYS`), 90 in the bucket (a lifecycle rule). The bucket is the
+one that matters; the local copy exists so `restore-verify.sh` has something
+close at hand.
+
+**The identity file is the whole backup.** It never leaves the box, which is the
+point — the bucket is off-host and therefore untrusted, the box is not — but it
+also means losing the box loses every backup taken with that key. Copy
+`/etc/cm-backup/identity.txt` somewhere durable and outside GCP.
+
+**`gsutil` must be the apt build, never the snap.** The snap cannot start under
+`NoNewPrivileges=true`: snap-confine wants `cap_dac_override` and exits 1 before
+transferring anything. `/snap/bin` comes first in the default PATH, so the unit
+names `/usr/bin/gcloud` explicitly.
 
 ## When something is wrong
 
