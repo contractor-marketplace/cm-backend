@@ -427,6 +427,29 @@ and without the flags one silently overwrites the other.
 The total is what the board never had. It could only count the rows it had
 loaded, so it said "20+ jobs" for four hundred.
 
+### Semantic search, and why there is none
+
+The plan held embeddings behind a gate: ship only on a measured gain over what
+is already here. The golden set had saturated at 1.000, so it could not show
+one, and ten materially harder queries were added to look for it — whole
+sentences, symptoms rather than services, regional slang, a misspelled trade
+word rather than a misspelled business name.
+
+They found a gap, and it was 0.836. What it turned out to be was a missing
+string comparison: routing compared the whole query against an alias, so a
+sentence never matched the short phrase inside it. "cheapest roofer" contains
+"roofer" and matched nothing. Adding the containment direction —
+`word_similarity(alias, query)`, which asks whether the alias appears *in* what
+was typed, against the existing direction which asks whether what was typed
+approximates the alias — returned it to 1.000.
+
+Everything the hard queries asked for is answered by a table of words and two
+similarity comparisons. There is no gap left for a vector index to close, so
+there is nothing to justify the extension, the embedding pipeline, the provider
+dependency or the CI image that would come with it. The plan names this as a
+legitimate outcome rather than a deferral, and it is the one the evidence
+supports.
+
 ### The lead feed, and measuring it
 
 `GET /v1/me/jobs/feed` orders the board for the contractor asking: work in

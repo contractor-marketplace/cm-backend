@@ -21,3 +21,13 @@
 {"query": "solar", "intent": "C-46, another unseeded class", "relevant": {"991777": 3}}
 {"query": "90042", "intent": "a ZIP typed into the search box rather than the ZIP filter", "relevant": {"1047382": 3, "983313": 3, "445191": 3}}
 {"query": "zzzzznotarealbusiness", "intent": "a query that should match nothing; guards against a change that makes everything match", "relevant": {}}
+{"query": "someone to fix my leaking shower", "intent": "a whole sentence, the way people actually type into a search box", "relevant": {"771204": 3, "771205": 3, "771206": 3}}
+{"query": "my house needs rewiring", "intent": "a sentence with the trade word buried in it", "relevant": {"983311": 3, "983312": 3, "983313": 3, "983314": 3}}
+{"query": "kitchen cabinets installed", "intent": "the work, not the trade name; C-6 is 'Cabinet, Millwork and Finish Carpentry', so the specialist leads and general builders are a fair second", "relevant": {"660412": 3}}
+{"query": "who can build a granny flat", "intent": "regional slang for an ADU, which is general-contractor work", "relevant": {"1047382": 3, "1047383": 3, "1047384": 3}}
+{"query": "ac not cooling", "intent": "a symptom, not a service; routes to HVAC", "relevant": {"880455": 3}}
+{"query": "meridian", "intent": "a surname two businesses share; the better-established one must lead", "relevant": {"983311": 3, "983314": 2}}
+{"query": "electrical panel upgrade", "intent": "a specific job an electrician does, matching one bio exactly", "relevant": {"983311": 3, "983312": 2, "983313": 2, "983314": 2}}
+{"query": "drought tolerant garden", "intent": "phrasing that appears verbatim in one bio and nowhere else", "relevant": {"662010": 3}}
+{"query": "cheapest roofer", "intent": "a qualifier the directory cannot honour; the trade must still be found", "relevant": {"445190": 2, "445191": 3}}
+{"query": "plummer", "intent": "a common misspelling of a trade word, not of a business name", "relevant": {"771204": 3, "771205": 3, "771206": 3}}

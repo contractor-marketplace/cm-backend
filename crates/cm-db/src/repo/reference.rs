@@ -211,6 +211,21 @@ pub const CANONICAL_TRADES: &[CanonicalTrade] = &{
 /// 0.571 against "Stillwater Plumbing", over the name threshold.
 const ALIAS_SIMILARITY_THRESHOLD: f64 = 0.70;
 
+/// How nearly an alias has to appear *inside* the query before it routes.
+///
+/// The other direction, and it is a different question. The threshold above
+/// asks "is what they typed roughly this alias", which is what handles a typo
+/// and what a one-word query needs. This asks "does this alias appear in what
+/// they typed", which is what a sentence needs: nobody types "roofer", they
+/// type "cheapest roofer" or "my house needs rewiring", and the whole sentence
+/// is nothing like the short phrase it contains.
+///
+/// Strict, because containment should mean containment. Measured on the golden
+/// set's sentences, the alias that is genuinely present scores 1.000 — 0.538
+/// where it is present in part — and the highest-scoring wrong alias reaches
+/// 0.250. The gap is wide enough that this is not a tuned number.
+const ALIAS_CONTAINED_THRESHOLD: f64 = 0.90;
+
 /// The words homeowners use, and the trade each one means.
 ///
 /// A person with a problem does not type a CSLB classification. They type
@@ -252,6 +267,10 @@ const TRADE_ALIASES: &[(&str, &[&str])] = &[
             "gas line",
             "water line",
             "shower valve",
+            // What people say, rather than what a plumber says.
+            "shower",
+            "bathtub",
+            "bathroom plumbing",
         ],
     ),
     (
@@ -776,11 +795,14 @@ pub async fn trades_matching_text(
     // index is load-bearing here.
     sqlx::query_scalar(
         "SELECT DISTINCT trade_id FROM trade_aliases \
-          WHERE alias = $1 OR word_similarity($1, alias) >= $2 \
+          WHERE alias = $1 \
+             OR word_similarity($1, alias) >= $2 \
+             OR word_similarity(alias, $1) >= $3 \
           LIMIT 8",
     )
     .bind(&needle)
     .bind(ALIAS_SIMILARITY_THRESHOLD)
+    .bind(ALIAS_CONTAINED_THRESHOLD)
     .fetch_all(&mut *conn)
     .await
     .map_err(AppError::internal)

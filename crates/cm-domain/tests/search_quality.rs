@@ -83,18 +83,38 @@ use std::path::Path;
  *      Together: 0.644/0.667 -> 0.971/1.000.
  */
 
-/// Mean NDCG@10 across the golden set. Measured: 1.000.
+/// Mean NDCG@10 across the golden set. Measured: 1.000 over thirty-three
+/// queries, ten of which are materially harder than the original set.
 ///
 /// The road: 0.468 at the start, 0.607 with word similarity, 0.644 at the
 /// measured threshold, 0.971 once queries routed through the trade vocabulary,
-/// 1.000 once ranking blended standing quality with text relevance.
+/// 1.000 once ranking blended standing quality with text relevance — then 0.836
+/// when the hard queries were added, and 1.000 again once routing learned to
+/// find an alias inside a sentence.
 ///
-/// **This set is now exhausted as a guide.** At 1.000 it can only detect
-/// regression, not improvement — every remaining ranking change will measure as
-/// "no worse", which is not the same as "no better". Adding harder cases is the
-/// price of using it to steer the next phase: queries with more plausible
-/// wrong answers, ambiguous intent, and businesses that differ only in
-/// reputation.
+/// **What this says about semantic search.** The plan holds embeddings behind a
+/// gate: ship only on a measured gain over what is already here. The hard
+/// queries were added precisely to find that gap, and what they exposed was a
+/// missing string comparison, not a missing model. Everything they asked for is
+/// answered by a table of words and two similarity directions. There is no
+/// gap for a vector index to close, so there is nothing to justify one — which
+/// the plan names as a legitimate outcome rather than a deferral.
+///
+/// The set was exhausted once at twenty-three queries and was grown to
+/// thirty-three: whole sentences ("someone to fix my leaking shower"), symptoms
+/// rather than services ("ac not cooling"), regional slang ("granny flat"),
+/// qualifiers the directory cannot honour ("cheapest roofer") and a misspelled
+/// trade word rather than a misspelled business name ("plummer").
+///
+/// Those ten dropped the mean to 0.836, which is what a useful set of
+/// judgements is for: they found that routing compared the *whole* query
+/// against an alias, so a sentence never matched the short phrase inside it.
+/// Adding the containment direction took it to 0.939, and two fixture
+/// corrections — a finish-carpentry business the corpus was missing, and the
+/// words a person uses for a shower — took it to 1.000.
+///
+/// **It is saturated again, and will need growing again.** At 1.000 it can only
+/// detect regression, and "no worse" is not "no better".
 const NDCG_FLOOR: f64 = 0.99;
 /// Mean Recall@20. Measured: 1.000 — every golden query finds everything it
 /// should. Pinned just under, so a single lost result fails the build.
@@ -169,6 +189,7 @@ const CORPUS: &[Seed] = &[
     Seed { license_no: "553001",  name: "Coastline Painting",              status: "active",  postal_code: "90401", classification: "C-33", bio: None,                                                               rating: Some(4.0), reviews: Some(30),  verified: false },
     Seed { license_no: "662010",  name: "Verdant Landscape Design",        status: "active",  postal_code: "90232", classification: "C-27", bio: Some("Drought-tolerant gardens and irrigation."),                     rating: Some(4.6), reviews: Some(75),  verified: false },
     Seed { license_no: "880455",  name: "Polar Air Heating & Cooling",     status: "active",  postal_code: "90026", classification: "C-20", bio: None,                                                               rating: Some(4.7), reviews: Some(180), verified: false },
+    Seed { license_no: "660412",  name: "Alder & Oak Cabinetmakers",       status: "active",  postal_code: "90232", classification: "C-6",  bio: Some("Kitchen cabinets, built-ins and trim."),                        rating: Some(4.6), reviews: Some(58),  verified: false },
     Seed { license_no: "991777",  name: "Helios Power Systems",            status: "active",  postal_code: "90401", classification: "C-46", bio: None,                                                               rating: Some(4.4), reviews: Some(64),  verified: false },
 ];
 
