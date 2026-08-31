@@ -11,6 +11,12 @@ on:
   push:
     tags:
       - "v*"
+    # Feature branches build too, because a binary that only exists after a
+    # merge cannot be tested before one. `workflow_dispatch` alone is not
+    # enough: GitHub only offers it for workflows already on the default
+    # branch, which a branch this workflow was written on is not.
+    branches:
+      - "search/**"
 
 env:
   CARGO_TERM_COLOR: always
