@@ -51,8 +51,71 @@ cm-server check-config          # proves the file parses before anything restart
 DATABASE_URL=postgres://cm_migrate:...@127.0.0.1/cm cm-server migrate
 cm-server seed-trades          # trades, their aliases, and re-derives contractor trades
 cm-server load-regions --file deploy/data/zcta_ca.csv --source census_2020_gazetteer
+# Then the place hierarchy — see "Loading places" below. Order matters:
+# load-places reads the ZIP rows load-regions writes.
 systemctl enable --now cm-server cm-geocode-worker cm-verification.timer
 ```
+
+## Loading places
+
+Cities, counties, and which ZIP codes belong to them. Four files, all published
+by the Census, all plain text, all public domain.
+
+They are **not vendored into the repository**. Reference data belongs to its
+source: the Census republishes annually as cities file boundary changes through
+the [Boundary and Annexation Survey](https://www.census.gov/programs-surveys/bas.html),
+and a copy in git is a copy that silently goes stale. Download, load, delete.
+
+```bash
+cd /tmp && mkdir -p census && cd census
+
+# Names, Census class (C* legally incorporated, U* census-designated) and county.
+curl -sO https://www2.census.gov/geo/docs/reference/codes2020/national_place2020.txt
+
+# Interior points — a coordinate guaranteed to fall inside the place, which a
+# computed centroid is not for a concave city.
+curl -sO https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2024_Gazetteer/2024_Gaz_place_national.zip
+curl -sO https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2024_Gazetteer/2024_Gaz_counties_national.zip
+unzip -oq '*.zip'
+
+# ZIP-to-place, with the land area each pair shares. The Census already
+# intersected the boundaries; this is a read, not a computation.
+curl -sO https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_place20_natl.txt
+
+cm-server load-places \
+  --places       national_place2020.txt \
+  --place-points 2024_Gaz_place_national.txt \
+  --counties     2024_Gaz_counties_national.txt \
+  --zcta-places  tab20_zcta520_place20_natl.txt \
+  --state CA
+```
+
+California loads 58 counties, 1,610 places and ~2,800 memberships in about
+three seconds. Idempotent on `(kind, code)` — the Census GEOID — so re-running
+after a new vintage updates in place.
+
+Three numbers in the output are worth reading rather than skipping:
+
+- **skipped below 0.5% of the ZIP** — pairs where two boundaries merely graze.
+  Burbank and 90068 share 0.01 km², 0.0% of either, and without the threshold a
+  Hollywood Hills ZIP would be "in Burbank". Raise `--min-share` if a real
+  membership is ever dropped; the smallest genuine one in Los Angeles County is
+  far above it.
+- **ZIP name(s) superseded** — a curated ZIP label that only repeated the city
+  it sits in. Twelve of the twenty-five hand-curated names are cities, not
+  neighbourhoods (Burbank, Pasadena, Santa Monica…), and the city row is
+  strictly better: it knows its county and holds all of its ZIPs. The thirteen
+  real neighbourhoods — Silver Lake, Eagle Rock, Venice, Van Nuys — are
+  untouched, because the Census has no record of them and they are what people
+  actually type.
+- **no gazetteer point** — a place named in one file and absent from the other.
+  Skipped rather than given a guessed coordinate.
+
+**Supply ranking.** `load-places` also counts listings per region, and
+`recompute-verification` refreshes it nightly. That count is what orders place
+suggestions, and it is what makes a statewide index safe on a Los Angeles
+corpus: "san" offers San Pedro and San Gabriel ahead of San Francisco, because
+those are the ones a homeowner can actually get a contractor from.
 
 ## The order that matters
 

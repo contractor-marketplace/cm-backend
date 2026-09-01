@@ -2,6 +2,7 @@
 
 use cm_core::{new_id, AppError};
 use sqlx::PgConnection;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -968,6 +969,195 @@ pub async fn upsert_zcta(
     Ok(result.rows_affected() == 1)
 }
 
+/// Insert or refresh a place — a city, a county, a census-designated place.
+///
+/// Keyed on `(kind, code)` like every other region, where the code is the
+/// Census GEOID: `0608954` is Burbank, `06037` is Los Angeles County. A GEOID
+/// is stable across decades, so re-running the loader after the annual Census
+/// publication updates rows in place rather than accumulating duplicates.
+///
+/// Unlike `upsert_zcta` there is no placeholder rule to respect. The Census
+/// publishes the name, and it is the authority on it — "Glendora" came from
+/// Glendora's own filing, so nothing local should win against it.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_place(
+    conn: &mut PgConnection,
+    kind: &str,
+    code: &str,
+    name: &str,
+    lat: f64,
+    lon: f64,
+    parent_id: Option<Uuid>,
+    census_class: Option<&str>,
+    source: &str,
+) -> Result<Uuid, AppError> {
+    // RETURNING rather than a second SELECT: the loader needs the id to hang
+    // the county parent and the ZIP membership off, and on a re-run the
+    // conflicting row's id is the one that matters. The no-op DO UPDATE on
+    // conflict is what makes RETURNING fire at all — `DO NOTHING` returns no
+    // row when the row already exists, which is exactly the re-run case.
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO regions \
+             (id, kind, code, name, centroid, parent_id, census_class, source) \
+         VALUES ($1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography, \
+                 $7, $8, $9) \
+         ON CONFLICT (kind, code) DO UPDATE \
+             SET name = EXCLUDED.name, \
+                 centroid = EXCLUDED.centroid, \
+                 parent_id = COALESCE(EXCLUDED.parent_id, regions.parent_id), \
+                 census_class = COALESCE(EXCLUDED.census_class, regions.census_class), \
+                 source = EXCLUDED.source, updated_at = now() \
+         RETURNING id",
+    )
+    .bind(new_id())
+    .bind(kind)
+    .bind(code)
+    .bind(name)
+    .bind(lon)
+    .bind(lat)
+    .bind(parent_id)
+    .bind(census_class)
+    .bind(source)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(id)
+}
+
+/// Record that a ZIP code overlaps a place, and by how much.
+///
+/// The area is the point of it. Touching is not belonging: Burbank shares
+/// 0.01 km² with 90068 where two boundaries graze in the hills, and a caller
+/// deciding whether that counts needs the number, not a boolean.
+pub async fn link_region_place(
+    conn: &mut PgConnection,
+    region_id: Uuid,
+    place_id: Uuid,
+    shared_land_m2: i64,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO region_places (id, region_id, place_id, shared_land_m2) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (region_id, place_id) DO UPDATE \
+             SET shared_land_m2 = EXCLUDED.shared_land_m2, updated_at = now()",
+    )
+    .bind(new_id())
+    .bind(region_id)
+    .bind(place_id)
+    .bind(shared_land_m2)
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(())
+}
+
+/// Drop a ZIP's curated name where the city it belongs to already carries it.
+///
+/// Twelve of the twenty-five hand-written names are cities, not neighbourhoods:
+/// 91506 was labelled "Burbank", 91104 "Pasadena", 90401 "Santa Monica". Once
+/// the Census places are loaded those become two rows for one place — the city,
+/// which knows its county and holds all five of its ZIPs, and a lone ZIP
+/// wearing the city's name — and the second is strictly worse and
+/// indistinguishable from the first.
+///
+/// Resolved here rather than filtered in the suggest query, and the reason is
+/// measured: as a `NOT EXISTS` it inflated the planner's estimate to 505,000,
+/// which crossed `jit_above_cost` and bought 638 ms of JIT compilation for a
+/// 21 ms query. It is a fact about the data, so it is settled once, in the
+/// data.
+///
+/// Membership decides it, not the name alone. A neighbourhood is only
+/// redundant against the city it is actually inside; a namesake elsewhere in
+/// the state says nothing about it.
+pub async fn clear_redundant_zcta_names(conn: &mut PgConnection) -> Result<u64, AppError> {
+    let result = sqlx::query(
+        "UPDATE regions z SET name = z.code, updated_at = now() \
+          WHERE z.kind = 'zcta' AND z.name <> z.code \
+            AND EXISTS (SELECT 1 FROM region_places rp \
+                          JOIN regions p ON p.id = rp.place_id \
+                         WHERE rp.region_id = z.id \
+                           AND p.kind = 'city' AND p.name = z.name)",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(result.rows_affected())
+}
+
+/// Recount how many listings sit in each region.
+///
+/// Ranks suggestions by supply, which is what lets the place index be statewide
+/// on a Los Angeles corpus: "san" offers San Pedro and San Gabriel, where there
+/// are contractors, ahead of San Francisco, where there are none.
+///
+/// Two passes over one derived count. A ZCTA is counted directly from the
+/// postal code on the listing; a place inherits the sum of the ZCTAs that
+/// belong to it, so the arithmetic happens once. `owner_address_postal_code`
+/// wins where a claimant set one, matching the coalesce the search predicate
+/// uses — a contractor who corrected their address should be counted where
+/// they say they are.
+///
+/// Returns the number of regions left with a non-zero count.
+pub async fn refresh_region_supply(conn: &mut PgConnection) -> Result<u64, AppError> {
+    sqlx::query("UPDATE regions SET contractor_count = 0 WHERE contractor_count <> 0")
+        .execute(&mut *conn)
+        .await
+        .map_err(AppError::internal)?;
+
+    sqlx::query(
+        "UPDATE regions r SET contractor_count = sub.n, updated_at = now() \
+           FROM (SELECT COALESCE(c.owner_address_postal_code, c.postal_code) AS code, \
+                        count(*) AS n \
+                   FROM contractors c \
+                  WHERE COALESCE(c.owner_address_postal_code, c.postal_code) IS NOT NULL \
+                  GROUP BY 1) sub \
+          WHERE r.kind = 'zcta' AND r.code = sub.code",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    // A ZIP can straddle two cities, so this double-counts a listing across
+    // them. That is the honest reading for a ranking signal — the contractor
+    // genuinely is reachable from both — and the number is never displayed.
+    sqlx::query(
+        "UPDATE regions p SET contractor_count = sub.n, updated_at = now() \
+           FROM (SELECT rp.place_id, sum(z.contractor_count)::int AS n \
+                   FROM region_places rp \
+                   JOIN regions z ON z.id = rp.region_id \
+                  GROUP BY rp.place_id) sub \
+          WHERE p.id = sub.place_id",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    let counted: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM regions WHERE contractor_count > 0")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(AppError::internal)?;
+
+    Ok(counted as u64)
+}
+
+/// Every ZIP code to its region id, for a loader resolving membership in bulk.
+///
+/// One round trip instead of 82,880. The relationship file names ZIPs by code
+/// and places by GEOID, so the load needs both lookups in memory anyway.
+pub async fn list_zcta_ids(conn: &mut PgConnection) -> Result<HashMap<String, Uuid>, AppError> {
+    let rows: Vec<(String, Uuid)> =
+        sqlx::query_as("SELECT code, id FROM regions WHERE kind = 'zcta'")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(AppError::internal)?;
+
+    Ok(rows.into_iter().collect())
+}
+
 pub async fn find_zcta(conn: &mut PgConnection, code: &str) -> Result<Option<Region>, AppError> {
     // Never selects the geography itself: sqlx cannot decode PostGIS types, and
     // a query that returns one fails at the boundary.
@@ -982,11 +1172,35 @@ pub async fn find_zcta(conn: &mut PgConnection, code: &str) -> Result<Option<Reg
     .map_err(AppError::internal)
 }
 
+/// Every ZIP area, under the best name anybody can give it.
+///
+/// Three sources in preference order, and the order is a judgement about who
+/// knows best:
+///
+///   1. **A curated name**, where `name <> code`. Those are Los Angeles
+///      neighbourhoods — Silver Lake, Atwater Village, Highland Park — which
+///      are what people actually say and which the Census has no record of.
+///      A neighbourhood is not a Census place; nobody files its boundary.
+///   2. **The Census city** the ZIP mostly falls in, largest share first. This
+///      is the correction: 91730 used to answer "Glendora" because a hand-made
+///      file said so, and now answers "Rancho Cucamonga" because the Census
+///      measured 100% of it inside Rancho Cucamonga.
+///   3. **The code itself**, when a ZIP belongs to no incorporated place at
+///      all — a good deal of unincorporated county. Saying "91773" is honest;
+///      inventing a city for it is what got us here.
 pub async fn list_zctas(conn: &mut PgConnection) -> Result<Vec<Region>, AppError> {
     sqlx::query_as(
-        "SELECT id, kind, code, name, ST_Y(centroid::geometry) AS lat, \
-                ST_X(centroid::geometry) AS lon \
-           FROM regions WHERE kind = 'zcta' ORDER BY code",
+        "SELECT r.id, r.kind, r.code, \
+                COALESCE(NULLIF(r.name, r.code), place.name, r.code) AS name, \
+                ST_Y(r.centroid::geometry) AS lat, \
+                ST_X(r.centroid::geometry) AS lon \
+           FROM regions r \
+           LEFT JOIN LATERAL ( \
+                SELECT p.name FROM region_places rp \
+                  JOIN regions p ON p.id = rp.place_id \
+                 WHERE rp.region_id = r.id \
+                 ORDER BY rp.shared_land_m2 DESC LIMIT 1) place ON true \
+          WHERE r.kind = 'zcta' ORDER BY r.code",
     )
     .fetch_all(&mut *conn)
     .await

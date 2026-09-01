@@ -27,7 +27,10 @@ use sqlx::PgConnection;
 pub enum Kind {
     /// A kind of work. Applies `?trade=<value>`.
     Trade,
-    /// A ZIP code. Applies `?zip=<value>`.
+    /// Somewhere to search from — a city, a neighbourhood, or a ZIP code. Sets
+    /// the location from `lat`/`lon`, and never filters on a contractor's own
+    /// postal code: the question is who travels there, not who is registered
+    /// there.
     Place,
     /// One business. Navigates to its listing.
     Contractor,
@@ -38,10 +41,14 @@ pub struct Suggestion {
     pub kind: Kind,
     /// What to show.
     pub label: String,
-    /// The slug, ZIP or listing slug the client acts on. Never displayed.
+    /// The stable handle for what was chosen. Never displayed: a trade slug, a
+    /// listing slug, a ZIP code, or a Census GEOID for a city — `0608954` is
+    /// Burbank, and it stays Burbank across decades of redistricting.
     pub value: String,
-    /// A second line where one helps — the neighbourhood behind a ZIP, the
-    /// trades a business holds. Absent rather than empty when there is none.
+    /// The second line, and on a place it is what makes the row usable. Two
+    /// Californian cities are called Glendora and two ZCTAs are called Burbank;
+    /// without the county under the name they are the same row twice. Absent
+    /// rather than empty when there is nothing to say.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
     /// Where a place is, so choosing one is a complete answer.
@@ -121,27 +128,30 @@ pub async fn suggest(conn: &mut PgConnection, query: &str) -> Result<Vec<Suggest
     let contains = format!("%{needle}%");
     let business_pattern = (needle.chars().count() >= 3).then_some(contains.as_str());
 
-    // Which of the two place branches to run. A number is a ZIP and stays one
-    // row per ZIP — somebody typing "9150" is completing a code and wants to
-    // see the codes. A word is a place name, and those are one-to-many: five
-    // ZCTAs are called Burbank, so five rows of numbers is what the person
-    // asked to be spared. Grouping them also fixes a quieter bug — the cap is
-    // four per kind, so "burbank" returned 91501, 91502, 91504 and 91505 and
-    // dropped 91506 with no sign it had. Whichever they picked searched one
-    // two-kilometre ZIP rather than the city.
+    // Which place branch to run. A number is a ZIP and stays one row per ZIP —
+    // somebody typing "9150" is completing a code and wants to see the codes. A
+    // word is a place, and a place is a row of its own: five ZCTAs cover
+    // Burbank, and offering five rows of numbers makes the person pick one,
+    // which searches a two-kilometre postal area rather than the city.
     //
-    // The name branch clusters before it averages, because a name is not
-    // unique across the state and an average is not robust to that. Ten ZCTAs
-    // are called Glendale: nine around Los Angeles and 92105 in San Diego,
-    // ninety miles away. Averaging all ten put "Glendale" at 34.018, -118.139
-    // — open ground near Montebello, in neither city, and a search from there
-    // answers for nowhere. DBSCAN separates them into the two real places, so
-    // each gets its own centre and its own honest ZIP count.
+    // Both branches read the Census hierarchy loaded by `load-places`, which is
+    // what replaced a pile of guesswork here. This used to group ZCTAs by
+    // whatever name had been written on them and average the members'
+    // centroids, with an ST_ClusterDBSCAN window function to stop a namesake
+    // ninety miles away dragging the result into open ground. All of that was
+    // a distance heuristic standing in for a parent link. A place now has a
+    // county above it, an interior point the Census publishes, and a weighted
+    // list of the ZIPs inside it — so there is nothing to cluster and nothing
+    // to average.
     //
-    // 0.2 degrees is roughly twenty kilometres here. Wide enough that a long
-    // city stays one cluster — DBSCAN chains through neighbours, so Los
-    // Angeles holds together across far more than that — and far narrower than
-    // the gap between two cities that merely share a name.
+    // A named ZCTA still stands in for a neighbourhood, because the Census has
+    // no record of one: nobody files a boundary for Silver Lake or Eagle Rock,
+    // and they are what people type. But only where no city carries the name.
+    // Twelve of the twenty-five curated names — Burbank, Pasadena, Santa Monica
+    // — are cities, and offering the ZIP beside the city gave two rows for one
+    // place, with the worse one indistinguishable from the better. The city
+    // wins every time: it has a county above it, an interior point, and all of
+    // its ZIPs rather than one.
     let by_code = needle.starts_with(|c: char| c.is_ascii_digit());
 
     let rows: Vec<Row> = sqlx::query_as(
@@ -159,34 +169,34 @@ pub async fn suggest(conn: &mut PgConnection, query: &str) -> Result<Vec<Suggest
              LIMIT $3 \
         ) UNION ALL ( \
             SELECT 'place', r.code, r.code, \
-                   NULLIF(r.name, r.code), \
+                   place.name, \
                    (CASE WHEN r.code LIKE $2 THEN 1.0 ELSE 0.0 END)::float8, \
                    ST_Y(r.centroid::geometry), ST_X(r.centroid::geometry) \
               FROM regions r \
+              LEFT JOIN LATERAL ( \
+                   SELECT p.name FROM region_places rp \
+                     JOIN regions p ON p.id = rp.place_id \
+                    WHERE rp.region_id = r.id \
+                    ORDER BY rp.shared_land_m2 DESC LIMIT 1) place ON true \
              WHERE $5 AND r.kind = 'zcta' AND r.code LIKE $2 \
-             ORDER BY 5 DESC, r.code \
+             ORDER BY 5 DESC, r.contractor_count DESC, r.code \
              LIMIT $3 \
         ) UNION ALL ( \
-            SELECT 'place', g.name, g.name, \
-                   CASE WHEN g.n > 1 THEN g.n || ' ZIP codes' \
-                        ELSE 'ZIP ' || g.code END, \
-                   g.n::float8, g.lat, g.lon \
-              FROM ( \
-                SELECT c.name, count(*) AS n, min(c.code) AS code, \
-                       avg(c.lat) AS lat, avg(c.lon) AS lon \
-                  FROM ( \
-                    SELECT r.name, r.code, \
-                           ST_Y(r.centroid::geometry) AS lat, \
-                           ST_X(r.centroid::geometry) AS lon, \
-                           ST_ClusterDBSCAN(r.centroid::geometry, 0.2, 1) \
-                               OVER (PARTITION BY r.name) AS cluster \
-                      FROM regions r \
-                     WHERE NOT $5 AND r.kind = 'zcta' \
-                       AND r.name <> r.code AND lower(r.name) LIKE $2 \
-                  ) c \
-                 GROUP BY c.name, c.cluster \
-              ) g \
-             ORDER BY 5 DESC, g.name \
+            SELECT 'place', r.name, r.code, \
+                   COALESCE(parent.name, hood.name), \
+                   (CASE WHEN lower(r.name) LIKE $2 THEN 1.0 ELSE 0.0 END)::float8, \
+                   ST_Y(r.centroid::geometry), ST_X(r.centroid::geometry) \
+              FROM regions r \
+              LEFT JOIN regions parent ON parent.id = r.parent_id \
+              LEFT JOIN LATERAL ( \
+                   SELECT p.name FROM region_places rp \
+                     JOIN regions p ON p.id = rp.place_id \
+                    WHERE r.kind = 'zcta' AND rp.region_id = r.id \
+                    ORDER BY rp.shared_land_m2 DESC LIMIT 1) hood ON true \
+             WHERE NOT $5 \
+               AND lower(r.name) LIKE $2 \
+               AND (r.kind = 'city' OR (r.kind = 'zcta' AND r.name <> r.code)) \
+             ORDER BY 5 DESC, r.contractor_count DESC, r.name \
              LIMIT $3 \
         ) UNION ALL ( \
             SELECT 'contractor', c.display_name, c.slug, \
