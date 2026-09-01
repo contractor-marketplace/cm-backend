@@ -481,6 +481,36 @@ since 0005.
 50,000 contractors, Postgres with the indexes above answers every query here at
 the latencies in §9. The exit ramps are known and nothing above forecloses them.
 
+**Boundary polygons, and the containment search they enable.** Considered
+directly against how LoopNet does it — search a place, get its real outline
+drawn on the map, get an exact count of what falls inside — and declined on
+2026-08-31.
+
+`regions.boundary` is a geography column with a live GiST index and zero rows,
+and that is now a deliberate state rather than an unfinished one. Filling it
+means TIGER/Line ZCTA and Place shapefiles, about half a gigabyte, and a loader.
+Every area here stays a circle: a centroid plus `approx_radius_m`, the
+equal-area radius from the gazetteer.
+
+**What the circle costs.** A ZIP is not a circle. 91504 is a long wedge running
+along the I-5 with a notch bitten out where it meets the Verdugo foothills; an
+equal-area circle over it spills north into empty hillside and falls short at
+both narrow ends. For "does this contractor plausibly serve this area" that is a
+fair trade. It would not survive being drawn on a map next to its own results,
+which is exactly why the map is not drawing it.
+
+**The reason it is declined is semantic, not cost.** LoopNet lists properties,
+and a property has one fixed location, so "inside the boundary" is the whole
+question. A contractor travels. The directory answers "who serves this point",
+and a contractor in Glendale who covers Burbank is a correct result that a
+containment query would drop. Precision on the outline buys little when the
+outline is not what decides the answer.
+
+Revisit if the map starts drawing areas, if a region service area needs to be
+exactly right at its edge, or if "contractors based in this place" becomes a
+browse people ask for alongside coverage. The column and its index are already
+there for it.
+
 ---
 
 ## 11. Open
