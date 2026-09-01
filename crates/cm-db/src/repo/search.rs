@@ -414,20 +414,48 @@ fn list_sql(ordering: &Ordering) -> String {
         ),
     };
 
+    // The page is chosen before `license_records` is joined, not after.
+    //
+    // Nothing in `PREDICATE` reads `l.`; the join exists purely to project a
+    // licence number and an address. Left in the same query as the filter it
+    // runs for every candidate row, and a coverage search is not a small
+    // candidate set — 25 miles of downtown Los Angeles is 41,820 of the 49,774
+    // listings, because that is what covering central LA honestly means. So the
+    // join ran forty thousand times to decorate twenty rows.
+    //
+    // Selecting ids first and joining the page costs one index lookup per
+    // returned row instead. Measured on production data: 139ms to 93ms on a
+    // narrow projection, and the shipped projection is far wider than that.
+    //
+    // The outer ORDER BY repeats the inner one rather than trusting the
+    // subquery's order. A join is not obliged to preserve it, and Postgres is
+    // free to reorder here — the repeat costs a sort of twenty rows and is what
+    // stops the page coming back shuffled.
+    let order = ordering.order_by();
     format!(
-        "{SELECT}, {rank} AS rank_score {FROM} \
-         WHERE {PREDICATE} {keyset} ORDER BY {order} LIMIT ${limit}",
+        "{SELECT}, page.rank_score {FROM} \
+         JOIN (SELECT c.id, {rank} AS rank_score FROM contractors c \
+                WHERE {PREDICATE} {keyset} \
+                ORDER BY {order} LIMIT ${limit}) page ON page.id = c.id \
+         ORDER BY {order}",
         rank = rank_expression(),
-        order = ordering.order_by(),
     )
 }
 
 /// The map statement: the same predicate, a narrower ordering, one tail bind.
+///
+/// Defers the licence join for the same reason `list_sql` does, and the saving
+/// is larger here — the cap is 500 points rather than a page of twenty, so
+/// without this the join ran forty thousand times to decorate five hundred.
 fn map_sql() -> String {
     let limit = PREDICATE_BINDS + 1;
+    const ORDER: &str = "c.quality_score DESC, c.display_name, c.id";
     format!(
-        "{SELECT} {FROM} WHERE {PREDICATE} AND c.public_point IS NOT NULL \
-         ORDER BY c.quality_score DESC, c.display_name, c.id LIMIT ${limit}"
+        "{SELECT} {FROM} \
+         JOIN (SELECT c.id FROM contractors c \
+                WHERE {PREDICATE} AND c.public_point IS NOT NULL \
+                ORDER BY {ORDER} LIMIT ${limit}) page ON page.id = c.id \
+         ORDER BY {ORDER}"
     )
 }
 
