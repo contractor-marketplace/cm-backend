@@ -218,6 +218,15 @@ pub struct MapPoint {
     /// city and ZIP are already implied by where the pin is.
     #[serde(skip_serializing_if = "Option::is_none")]
     address_line1: Option<String>,
+    /// So a pin's hover card can say the same thing the row does.
+    ///
+    /// Both omitted when absent rather than sent as null, and they travel
+    /// together: ~1% of listings carry a rating, and a rating with no count
+    /// behind it is the claim this product exists to not make.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    google_rating: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    google_review_count: Option<i32>,
 }
 
 pub async fn map(
@@ -250,6 +259,8 @@ pub async fn map(
                 lon: c.lon?,
                 location_precision: c.location_precision,
                 address_line1: c.address_line1,
+                google_rating: c.google_rating,
+                google_review_count: c.google_review_count,
             })
         })
         .collect();

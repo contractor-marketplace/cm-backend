@@ -258,6 +258,48 @@ async fn the_map_shares_the_directory_predicate_and_caps_honestly(pool: PgPool) 
     assert_eq!(empty.json["points"].as_array().expect("array").len(), 0);
 }
 
+/// A pin's hover card says what the row says, or says nothing.
+///
+/// The rating rides along on the map payload so a pin can show it without the
+/// client paging to the row — around 1% of listings carry one. The absence has
+/// to stay an absence: sent as `null` it reads as a number to anything doing a
+/// truthiness check, and "no reviews collected" and "rated zero" are different
+/// claims that this product exists to keep apart.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_map_point_carries_a_rating_only_where_there_is_one(pool: PgPool) {
+    seed_directory(&pool).await;
+
+    sqlx::query(
+        "UPDATE contractors SET google_rating = 4.9, google_review_count = 508 \
+          WHERE display_name = 'Meridian Electric Co'",
+    )
+    .execute(&pool)
+    .await
+    .expect("set a rating");
+
+    let mut client = Client::new(router(pool));
+    let response = client.get("/v1/contractors/map?bbox=-119,33,-117,35").await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+
+    let points = response.json["points"].as_array().expect("array");
+    let rated = points
+        .iter()
+        .find(|p| p["display_name"] == "Meridian Electric Co")
+        .expect("the rated contractor is on the map");
+    assert_eq!(rated["google_rating"], 4.9);
+    assert_eq!(rated["google_review_count"], 508);
+
+    for point in points {
+        if point["display_name"] == "Meridian Electric Co" {
+            continue;
+        }
+        assert!(
+            point.get("google_rating").is_none(),
+            "an unrated listing sends no rating at all: {point}"
+        );
+    }
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_detail_page_resolves_by_id_or_slug_and_shows_its_evidence(pool: PgPool) {
     seed_directory(&pool).await;
