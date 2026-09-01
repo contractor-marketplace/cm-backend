@@ -387,21 +387,37 @@ box fills, and the first keystroke is not a mistake.
 
 ## 9. Measured latency
 
-Release build, 51,000 contractors, warm pool.
+Release build, on the production box against 49,774 real listings, warm pool.
 
-| | p50 | p95 |
-|---|---|---|
-| `/v1/suggest?q=plumb` | 7.5 ms | 8.2 ms |
-| `/v1/contractors` (browse) | 1.3 ms | 1.4 ms |
-| `/v1/contractors?q=ibarra` (few matches) | 2.8 ms | 3.2 ms |
-| `/v1/contractors?q=plumbing` (routes to a trade) | 152 ms | 199 ms |
-| `/v1/contractors/map` | 7.8 ms | 8.3 ms |
+| | p95 |
+|---|---|
+| `/v1/contractors` (browse) | 7 ms |
+| `/v1/contractors?sort=rating` | 7 ms |
+| `/v1/contractors?q=ibarra` (few matches) | 12 ms |
+| `/v1/suggest?q=elec` | 51 ms |
+| `/v1/contractors?lat=…&lon=…` (coverage, Glendale) | 181 ms |
+| `/v1/contractors/map?lat=…&lon=…` | 191 ms |
+| `/v1/contractors?lat=…&lon=…` (coverage, downtown LA) | 229 ms |
+| `/v1/contractors?q=water+heater` (routes to a trade) | 321 ms |
 
-The outlier is explainable and is the price of the recall the taxonomy bought. A
-query that routes to a trade matches every contractor holding that licence class
-— thousands of rows for "plumbing" — and ranking cannot order what it has not
-scored. A query with few matches is 3 ms. If it needs to come down, the lever is
-capping candidates for high-cardinality routes, not the ranking.
+Two outliers, both explainable, both the price of answering the right question.
+
+**Trade-routed queries** match every contractor holding that licence class —
+thousands of rows — and ranking cannot order what it has not scored. A query
+with few matches is 12 ms. The lever, if it is ever needed, is capping
+candidates for high-cardinality routes, not the ranking.
+
+**Coverage searches in dense areas** match most of the register, because that is
+what the answer is: 25 miles of downtown Los Angeles genuinely covers 41,820 of
+the 49,774 listings. The scan is index-served and takes 86 ms; the rest is
+ranking a set that large. Note this is not comparable to the older proximity
+number it replaced — the previous 169 ms searched a 25 km circle and returned a
+narrower, wrong answer, where this covers 40 km and returns the right one over
+2.6× the area.
+
+The remaining levers, in order of value: cap candidates before ranking in dense
+areas, or precompute a coarse coverage grid. Neither is worth doing until the
+click data from §7 says the ranking of a 40,000-row result set matters.
 
 ### Five findings about Postgres worth keeping
 
