@@ -173,3 +173,134 @@ async fn nonsense_suggests_nothing(pool: PgPool) {
         response.json
     );
 }
+
+/// A place is one suggestion, whatever the postal service thinks.
+///
+/// Five ZCTAs are called Burbank. Offering five rows of numbers makes the
+/// person pick one, and picking one searches a two-kilometre ZIP instead of
+/// the city — while the four-per-kind cap silently drops the fifth, so the
+/// city could not be searched whole even by choosing every row on offer.
+///
+/// So a word collapses to one row carrying its ZIPs, at the centre of them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_place_is_one_suggestion_however_many_zips_it_has(pool: PgPool) {
+    seed(&pool).await;
+    let mut conn = pool.acquire().await.expect("connection");
+    // Five Burbank ZCTAs in a rough line, so the average is the middle one.
+    for (i, code) in ["91501", "91502", "91504", "91505", "91506"]
+        .iter()
+        .enumerate()
+    {
+        cm_db::repo::reference::upsert_zcta(
+            &mut conn,
+            code,
+            "Burbank",
+            34.16 + (i as f64) * 0.01,
+            -118.32,
+            None,
+            "test",
+        )
+        .await
+        .expect("zcta");
+    }
+    drop(conn);
+
+    let mut client = Client::new(router(pool));
+    let response = client.get("/v1/suggest?q=burbank").await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+
+    let places: Vec<&serde_json::Value> = response.json["suggestions"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter(|s| s["kind"] == "place")
+        .collect();
+
+    assert_eq!(
+        places.len(),
+        1,
+        "one Burbank, not five: {:?}",
+        response.json
+    );
+    assert_eq!(places[0]["label"], "Burbank");
+    assert_eq!(places[0]["hint"], "5 ZIP codes");
+
+    // The point is the middle of the five, so choosing "Burbank" searches from
+    // the city rather than from whichever ZIP happened to sort first.
+    let lat = places[0]["lat"].as_f64().expect("lat");
+    let lon = places[0]["lon"].as_f64().expect("lon");
+    assert!((lat - 34.18).abs() < 0.001, "lat was {lat}");
+    assert!((lon + 118.32).abs() < 0.001, "lon was {lon}");
+}
+
+/// Typing digits is completing a code, so the codes are what come back.
+///
+/// The grouping above must not swallow this: somebody four characters into a
+/// ZIP wants to see 91501 and 91502, not one row saying "Burbank".
+#[sqlx::test(migrations = "../../migrations")]
+async fn typing_a_number_offers_the_codes_themselves(pool: PgPool) {
+    seed(&pool).await;
+    let mut conn = pool.acquire().await.expect("connection");
+    for code in ["91501", "91502"] {
+        cm_db::repo::reference::upsert_zcta(
+            &mut conn, code, "Burbank", 34.18, -118.32, None, "test",
+        )
+        .await
+        .expect("zcta");
+    }
+    drop(conn);
+
+    let mut client = Client::new(router(pool));
+    let response = client.get("/v1/suggest?q=9150").await;
+    let places: Vec<(&str, &str)> = response.json["suggestions"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter(|s| s["kind"] == "place")
+        .map(|s| {
+            (
+                s["label"].as_str().expect("label"),
+                s["hint"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+
+    assert_eq!(places.len(), 2, "both codes: {:?}", response.json);
+    assert!(places.iter().any(|(l, h)| *l == "91501" && *h == "Burbank"));
+    assert!(places.iter().any(|(l, h)| *l == "91502" && *h == "Burbank"));
+}
+
+/// Every place answers where it is, so choosing one needs no second lookup.
+/// The client used to resolve a ZIP against all 1,763 regions it had loaded,
+/// which cannot work for a city — "Burbank" has no code to look up.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_place_carries_its_own_point(pool: PgPool) {
+    seed(&pool).await;
+    let mut client = Client::new(router(pool));
+
+    let response = client.get("/v1/suggest?q=silver").await;
+    let place = response.json["suggestions"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|s| s["kind"] == "place")
+        .cloned()
+        .unwrap_or_else(|| panic!("a place: {:?}", response.json));
+
+    assert_eq!(place["label"], "Silver Lake");
+    assert!((place["lat"].as_f64().expect("lat") - 34.0781).abs() < 0.001);
+    assert!((place["lon"].as_f64().expect("lon") + 118.2606).abs() < 0.001);
+
+    // A trade carries none: it is not somewhere.
+    let trade = response.json["suggestions"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|s| s["kind"] == "trade");
+    if let Some(trade) = trade {
+        assert!(
+            trade.get("lat").is_none(),
+            "a trade is not a place: {trade}"
+        );
+    }
+}

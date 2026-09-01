@@ -44,7 +44,33 @@ pub struct Suggestion {
     /// trades a business holds. Absent rather than empty when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Where a place is, so choosing one is a complete answer.
+    ///
+    /// On `place` only. Carried here rather than looked up by the client
+    /// because a place is no longer always a ZIP: "Burbank" is five of them,
+    /// and there is no code to look up. It also removes the client's need to
+    /// hold all 1,763 regions in memory to resolve one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lon: Option<f64>,
 }
+
+/// One row of the union, in its column order.
+///
+/// `(kind, label, value, hint, lead, lat, lon)` — `lead` decides the order
+/// within a kind and is dropped on the way out; `lat`/`lon` are set on places
+/// only. Named because the branches have to agree on this shape column for
+/// column, and a bare seven-tuple says nothing about which is which.
+type Row = (
+    String,
+    String,
+    String,
+    Option<String>,
+    f64,
+    Option<f64>,
+    Option<f64>,
+);
 
 /// The most suggestions any one request returns.
 ///
@@ -95,11 +121,22 @@ pub async fn suggest(conn: &mut PgConnection, query: &str) -> Result<Vec<Suggest
     let contains = format!("%{needle}%");
     let business_pattern = (needle.chars().count() >= 3).then_some(contains.as_str());
 
-    let rows: Vec<(String, String, String, Option<String>, f64)> = sqlx::query_as(
+    // Which of the two place branches to run. A number is a ZIP and stays one
+    // row per ZIP — somebody typing "9150" is completing a code and wants to
+    // see the codes. A word is a place name, and those are one-to-many: five
+    // ZCTAs are called Burbank, so five rows of numbers is what the person
+    // asked to be spared. Grouping them also fixes a quieter bug — the cap is
+    // four per kind, so "burbank" returned 91501, 91502, 91504 and 91505 and
+    // dropped 91506 with no sign it had. Whichever they picked searched one
+    // two-kilometre ZIP rather than the city.
+    let by_code = needle.starts_with(|c: char| c.is_ascii_digit());
+
+    let rows: Vec<Row> = sqlx::query_as(
         "( \
             SELECT 'trade' AS kind, t.name AS label, t.slug AS value, \
                    NULL::text AS hint, \
-                   (CASE WHEN lower(t.name) LIKE $2 THEN 1.0 ELSE 0.0 END)::float8 AS lead \
+                   (CASE WHEN lower(t.name) LIKE $2 THEN 1.0 ELSE 0.0 END)::float8 AS lead, \
+                   NULL::float8 AS lat, NULL::float8 AS lon \
               FROM trades t \
              WHERE t.active \
                AND (lower(t.name) LIKE $2 OR EXISTS ( \
@@ -110,17 +147,30 @@ pub async fn suggest(conn: &mut PgConnection, query: &str) -> Result<Vec<Suggest
         ) UNION ALL ( \
             SELECT 'place', r.code, r.code, \
                    NULLIF(r.name, r.code), \
-                   (CASE WHEN r.code LIKE $2 THEN 1.0 ELSE 0.0 END)::float8 \
+                   (CASE WHEN r.code LIKE $2 THEN 1.0 ELSE 0.0 END)::float8, \
+                   ST_Y(r.centroid::geometry), ST_X(r.centroid::geometry) \
               FROM regions r \
-             WHERE r.kind = 'zcta' \
-               AND (r.code LIKE $2 OR lower(r.name) LIKE $2) \
+             WHERE $5 AND r.kind = 'zcta' AND r.code LIKE $2 \
              ORDER BY 5 DESC, r.code \
+             LIMIT $3 \
+        ) UNION ALL ( \
+            SELECT 'place', r.name, r.name, \
+                   CASE WHEN count(*) > 1 THEN count(*) || ' ZIP codes' \
+                        ELSE 'ZIP ' || min(r.code) END, \
+                   (CASE WHEN lower(r.name) LIKE $2 THEN 1.0 ELSE 0.0 END)::float8, \
+                   avg(ST_Y(r.centroid::geometry)), avg(ST_X(r.centroid::geometry)) \
+              FROM regions r \
+             WHERE NOT $5 AND r.kind = 'zcta' \
+               AND r.name <> r.code AND lower(r.name) LIKE $2 \
+             GROUP BY r.name \
+             ORDER BY 5 DESC, r.name \
              LIMIT $3 \
         ) UNION ALL ( \
             SELECT 'contractor', c.display_name, c.slug, \
                    NULLIF(btrim(COALESCE(c.owner_address_city, l.city, '')), ''), \
                    ((CASE WHEN c.display_name ILIKE $2 THEN 1.0 ELSE 0.0 END) \
-                    + c.quality_score)::float8 \
+                    + c.quality_score)::float8, \
+                   NULL::float8, NULL::float8 \
               FROM contractors c \
               LEFT JOIN license_records l ON l.id = c.license_record_id \
              WHERE c.display_name ILIKE $4 \
@@ -132,13 +182,14 @@ pub async fn suggest(conn: &mut PgConnection, query: &str) -> Result<Vec<Suggest
     .bind(&prefix)
     .bind(MAX_PER_KIND)
     .bind(business_pattern)
+    .bind(by_code)
     .fetch_all(&mut *conn)
     .await
     .map_err(AppError::internal)?;
 
     let mut suggestions: Vec<Suggestion> = rows
         .into_iter()
-        .filter_map(|(kind, label, value, hint, _)| {
+        .filter_map(|(kind, label, value, hint, _, lat, lon)| {
             let kind = match kind.as_str() {
                 "trade" => Kind::Trade,
                 "place" => Kind::Place,
@@ -150,6 +201,8 @@ pub async fn suggest(conn: &mut PgConnection, query: &str) -> Result<Vec<Suggest
                 label,
                 value,
                 hint,
+                lat,
+                lon,
             })
         })
         .collect();
