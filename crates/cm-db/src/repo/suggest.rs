@@ -129,6 +129,19 @@ pub async fn suggest(conn: &mut PgConnection, query: &str) -> Result<Vec<Suggest
     // four per kind, so "burbank" returned 91501, 91502, 91504 and 91505 and
     // dropped 91506 with no sign it had. Whichever they picked searched one
     // two-kilometre ZIP rather than the city.
+    //
+    // The name branch clusters before it averages, because a name is not
+    // unique across the state and an average is not robust to that. Ten ZCTAs
+    // are called Glendale: nine around Los Angeles and 92105 in San Diego,
+    // ninety miles away. Averaging all ten put "Glendale" at 34.018, -118.139
+    // — open ground near Montebello, in neither city, and a search from there
+    // answers for nowhere. DBSCAN separates them into the two real places, so
+    // each gets its own centre and its own honest ZIP count.
+    //
+    // 0.2 degrees is roughly twenty kilometres here. Wide enough that a long
+    // city stays one cluster — DBSCAN chains through neighbours, so Los
+    // Angeles holds together across far more than that — and far narrower than
+    // the gap between two cities that merely share a name.
     let by_code = needle.starts_with(|c: char| c.is_ascii_digit());
 
     let rows: Vec<Row> = sqlx::query_as(
@@ -154,16 +167,26 @@ pub async fn suggest(conn: &mut PgConnection, query: &str) -> Result<Vec<Suggest
              ORDER BY 5 DESC, r.code \
              LIMIT $3 \
         ) UNION ALL ( \
-            SELECT 'place', r.name, r.name, \
-                   CASE WHEN count(*) > 1 THEN count(*) || ' ZIP codes' \
-                        ELSE 'ZIP ' || min(r.code) END, \
-                   (CASE WHEN lower(r.name) LIKE $2 THEN 1.0 ELSE 0.0 END)::float8, \
-                   avg(ST_Y(r.centroid::geometry)), avg(ST_X(r.centroid::geometry)) \
-              FROM regions r \
-             WHERE NOT $5 AND r.kind = 'zcta' \
-               AND r.name <> r.code AND lower(r.name) LIKE $2 \
-             GROUP BY r.name \
-             ORDER BY 5 DESC, r.name \
+            SELECT 'place', g.name, g.name, \
+                   CASE WHEN g.n > 1 THEN g.n || ' ZIP codes' \
+                        ELSE 'ZIP ' || g.code END, \
+                   g.n::float8, g.lat, g.lon \
+              FROM ( \
+                SELECT c.name, count(*) AS n, min(c.code) AS code, \
+                       avg(c.lat) AS lat, avg(c.lon) AS lon \
+                  FROM ( \
+                    SELECT r.name, r.code, \
+                           ST_Y(r.centroid::geometry) AS lat, \
+                           ST_X(r.centroid::geometry) AS lon, \
+                           ST_ClusterDBSCAN(r.centroid::geometry, 0.2, 1) \
+                               OVER (PARTITION BY r.name) AS cluster \
+                      FROM regions r \
+                     WHERE NOT $5 AND r.kind = 'zcta' \
+                       AND r.name <> r.code AND lower(r.name) LIKE $2 \
+                  ) c \
+                 GROUP BY c.name, c.cluster \
+              ) g \
+             ORDER BY 5 DESC, g.name \
              LIMIT $3 \
         ) UNION ALL ( \
             SELECT 'contractor', c.display_name, c.slug, \

@@ -304,3 +304,50 @@ async fn a_place_carries_its_own_point(pool: PgPool) {
         );
     }
 }
+
+/// A namesake ninety miles away is a different place, not an outlier.
+///
+/// Ten ZCTAs are called Glendale: nine around Los Angeles and 92105 in San
+/// Diego. Averaging all ten put "Glendale" at 34.018, -118.139 — open ground
+/// near Montebello, in neither city. A search from there answers for nowhere,
+/// and nothing on the page would have said so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_far_away_namesake_does_not_drag_a_place_off_itself(pool: PgPool) {
+    seed(&pool).await;
+    let mut conn = pool.acquire().await.expect("connection");
+    for (code, lat, lon) in [
+        ("91201", 34.1705, -118.2895),
+        ("91202", 34.1684, -118.2678),
+        ("91203", 34.1533, -118.2630),
+        // San Diego, and also called Glendale.
+        ("92105", 32.7378, -117.0927),
+    ] {
+        cm_db::repo::reference::upsert_zcta(&mut conn, code, "Glendale", lat, lon, None, "test")
+            .await
+            .expect("zcta");
+    }
+    drop(conn);
+
+    let mut client = Client::new(router(pool));
+    let response = client.get("/v1/suggest?q=glendale").await;
+    let places: Vec<&serde_json::Value> = response.json["suggestions"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter(|s| s["kind"] == "place")
+        .collect();
+
+    // Two places, largest first — not one average of both.
+    assert_eq!(places.len(), 2, "two Glendales: {:?}", response.json);
+    assert_eq!(places[0]["hint"], "3 ZIP codes");
+
+    // The Los Angeles one sits on Los Angeles, not between the two.
+    let lat = places[0]["lat"].as_f64().expect("lat");
+    let lon = places[0]["lon"].as_f64().expect("lon");
+    assert!((34.15..34.18).contains(&lat), "lat was {lat}");
+    assert!((-118.30..-118.25).contains(&lon), "lon was {lon}");
+
+    // And the San Diego one is still reachable, on itself.
+    assert_eq!(places[1]["hint"], "ZIP 92105");
+    assert!((places[1]["lat"].as_f64().expect("lat") - 32.7378).abs() < 0.001);
+}
