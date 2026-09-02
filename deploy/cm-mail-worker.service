@@ -1,0 +1,29 @@
+[Unit]
+Description=Contractor marketplace mail worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=exec
+User=cm
+Group=cm
+EnvironmentFile=/etc/cm-backend/env
+ExecStart=/usr/local/bin/cm-server mail-worker
+Restart=on-failure
+RestartSec=30s
+# The worker finishes its current pass before exiting, and any message it had
+# claimed is returned to the outbox by the next pass's stall sweep. The
+# provider idempotency key makes even a resend of an already-accepted message
+# a no-op, so a hard kill costs a delay, never a duplicate email.
+TimeoutStopSec=60
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

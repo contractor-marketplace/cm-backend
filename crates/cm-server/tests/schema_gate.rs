@@ -51,6 +51,12 @@ fn serve(url: &str) -> Command {
         )
         .env("CM_ARGON2_MAX_CONCURRENCY", "1")
         .env("CM_ENV", "production")
+        // Production refuses to start with gaps (no photo bucket, no mail), so
+        // these tests configure both: what is under test here is the schema
+        // gate, not the gap gate.
+        .env("CM_JOB_PHOTO_BUCKET", "cm-test-bucket")
+        .env("CM_RESEND_API_KEY", "re_test_key_never_used")
+        .env("CM_MAIL_FROM", "Test <no-reply@example.test>")
         .env("CM_LOG_FORMAT", "json")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())

@@ -244,6 +244,17 @@ pub struct FirebaseConfig {
     pub emulator_host: Option<String>,
 }
 
+/// Outbound email, when configured. Absent means mail is queued but nothing
+/// delivers it — acceptable in development, a production gap in production.
+#[derive(Debug, Clone)]
+pub struct MailConfig {
+    /// The Resend API key.
+    pub resend_api_key: Secret<String>,
+    /// The From header, e.g. `Contractor Marketplace <no-reply@example.com>`.
+    /// Its domain must be verified in Resend or every send is refused.
+    pub from: String,
+}
+
 /// Database connection settings.
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
@@ -269,6 +280,13 @@ pub struct Config {
     /// `Config::production_gaps`, which is what stops an unset variable from
     /// quietly downgrading a live server to storage that vanishes on restart.
     pub job_photo_bucket: Option<String>,
+    /// Outbound email via Resend.
+    ///
+    /// Optional so development and tests run with an in-memory mailer and no
+    /// credentials. Production refuses to start without it — see
+    /// `Config::production_gaps` — because a live server that silently queues
+    /// sign-in codes nobody delivers is a server nobody can log in to.
+    pub mail: Option<MailConfig>,
     /// How much each signal counts when the directory ranks a listing.
     ///
     /// Configurable because ranking is the one thing here that is tuned by
@@ -583,6 +601,43 @@ impl Config {
             });
         }
 
+        // Both-or-neither: a key with no From (or the reverse) is a variable
+        // someone meant to fill in, and half-configured mail should fail the
+        // deploy preflight rather than fail at the first send.
+        let mail = match (
+            read(&source, "CM_RESEND_API_KEY"),
+            read(&source, "CM_MAIL_FROM"),
+        ) {
+            (Some(key), Some(from)) if from.contains('@') => Some(MailConfig {
+                resend_api_key: Secret::new(key),
+                from,
+            }),
+            (Some(_), Some(_)) => {
+                errors.push(ConfigError::Invalid {
+                    key: "CM_MAIL_FROM",
+                    reason: "expected an email From header, for example \
+                             Name <no-reply@example.com>"
+                        .to_owned(),
+                });
+                None
+            }
+            (Some(_), None) => {
+                errors.push(ConfigError::Invalid {
+                    key: "CM_MAIL_FROM",
+                    reason: "is not set but CM_RESEND_API_KEY is".to_owned(),
+                });
+                None
+            }
+            (None, Some(_)) => {
+                errors.push(ConfigError::Invalid {
+                    key: "CM_RESEND_API_KEY",
+                    reason: "is not set but CM_MAIL_FROM is".to_owned(),
+                });
+                None
+            }
+            (None, None) => None,
+        };
+
         let trust_proxy_headers = match read(&source, "CM_TRUST_PROXY_HEADERS") {
             None => Some(false),
             Some(raw) => match raw.to_ascii_lowercase().as_str() {
@@ -634,6 +689,7 @@ impl Config {
                 shutdown_grace_secs.expect("shutdown_grace validated"),
             ),
             job_photo_bucket: read(&source, "CM_JOB_PHOTO_BUCKET"),
+            mail,
         })
     }
 
@@ -649,6 +705,15 @@ impl Config {
             gaps.push(
                 "CM_JOB_PHOTO_BUCKET is not set, so job photos would be held in memory and \
                  lost on restart. Set it to the GCS bucket name."
+                    .to_owned(),
+            );
+        }
+
+        if self.environment == Environment::Production && self.mail.is_none() {
+            gaps.push(
+                "CM_RESEND_API_KEY / CM_MAIL_FROM are not set, so sign-in codes, password \
+                 resets and job alerts would be queued and never delivered. Set the Resend \
+                 API key and a From address on the verified sending domain."
                     .to_owned(),
             );
         }
@@ -705,6 +770,15 @@ impl Config {
             (
                 "trust_proxy_headers",
                 self.auth.trust_proxy_headers.to_string(),
+            ),
+            (
+                "mail",
+                match &self.mail {
+                    // The From address identifies the configuration; the key
+                    // stays redacted by never being read here at all.
+                    Some(mail) => mail.from.clone(),
+                    None => "(unset — mail is queued, never sent)".to_owned(),
+                },
             ),
             (
                 "google_sign_in",
@@ -1124,6 +1198,86 @@ mod tests {
         assert_eq!(
             config.database.url.expose(),
             "postgres://cmdev@127.0.0.1:5432/cm_dev"
+        );
+    }
+
+    /// Half-configured mail must fail the preflight, not the first send.
+    #[test]
+    fn mail_config_requires_the_key_and_the_from_address_together() {
+        let mut vars = minimal();
+        vars.push(("CM_RESEND_API_KEY", "re_test_key"));
+        let errors = Config::load(env(&vars)).expect_err("a key with no From should fail");
+        assert_eq!(errors.keys(), vec!["CM_MAIL_FROM"]);
+
+        let mut vars = minimal();
+        vars.push(("CM_MAIL_FROM", "Test <no-reply@example.com>"));
+        let errors = Config::load(env(&vars)).expect_err("a From with no key should fail");
+        assert_eq!(errors.keys(), vec!["CM_RESEND_API_KEY"]);
+
+        let mut vars = minimal();
+        vars.push(("CM_RESEND_API_KEY", "re_test_key"));
+        vars.push(("CM_MAIL_FROM", "Test <no-reply@example.com>"));
+        let config = Config::load(env(&vars)).expect("both set should load");
+        assert_eq!(
+            config.mail.expect("configured").from,
+            "Test <no-reply@example.com>"
+        );
+
+        let config = Config::load(env(&minimal())).expect("neither set should load");
+        assert!(config.mail.is_none(), "unset mail is a gap, not an error");
+    }
+
+    #[test]
+    fn a_from_address_without_an_at_sign_is_rejected() {
+        let mut vars = minimal();
+        vars.push(("CM_RESEND_API_KEY", "re_test_key"));
+        vars.push(("CM_MAIL_FROM", "not-an-address"));
+        let errors = Config::load(env(&vars)).expect_err("should fail");
+        assert_eq!(errors.keys(), vec!["CM_MAIL_FROM"]);
+    }
+
+    /// A live server that queues sign-in codes nobody delivers is a server
+    /// nobody can log in to; the gap has to be loud before deploy.
+    #[test]
+    fn unset_mail_is_a_production_gap_and_a_development_shrug() {
+        let mut vars = minimal();
+        vars.push(("CM_ENV", "production"));
+        vars.retain(|(k, _)| *k != "CM_SITE_ORIGIN");
+        vars.push(("CM_SITE_ORIGIN", "https://app.example.com"));
+        vars.push(("CM_JOB_PHOTO_BUCKET", "cm-photos"));
+        let config = Config::load(env(&vars)).expect("should load");
+
+        let gaps = config.production_gaps();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("CM_RESEND_API_KEY"), "{}", gaps[0]);
+
+        let config = Config::load(env(&minimal())).expect("should load");
+        assert!(
+            config.production_gaps().is_empty(),
+            "development has no gaps"
+        );
+    }
+
+    #[test]
+    fn the_redacted_summary_never_shows_the_resend_key() {
+        let mut vars = minimal();
+        vars.push(("CM_RESEND_API_KEY", "re_live_secret_key"));
+        vars.push(("CM_MAIL_FROM", "Test <no-reply@example.com>"));
+        let config = Config::load(env(&vars)).expect("should load");
+
+        let summary = config.redacted_summary();
+        assert_eq!(summary["mail"], "Test <no-reply@example.com>");
+        for value in summary.values() {
+            assert!(
+                !value.contains("re_live_secret_key"),
+                "the summary leaked the key: {value}"
+            );
+        }
+
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("re_live_secret_key"),
+            "debug output leaked the key: {debug}"
         );
     }
 }
