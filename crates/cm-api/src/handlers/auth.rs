@@ -87,6 +87,19 @@ pub struct FederatedSignInRequest {
     /// The sign-up page sends it; the sign-in page does not.
     #[serde(default)]
     pub account_type: Option<String>,
+
+    /// The address the provider showed the browser during the popup.
+    ///
+    /// A fallback, not an authority: the Firebase console mode this product
+    /// requires (account linking off) strips the email claim from OAuth
+    /// tokens, so the verified token often cannot say what address the person
+    /// signed in with — while the popup result still can. The service prefers
+    /// whatever the token itself carries, consults this only when creating an
+    /// account, and stores it **unverified**: it is exactly as trustworthy as
+    /// an address typed into the email form, and earns verified status the
+    /// same way, by the emailed code.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +230,7 @@ pub async fn google_sign_in(
             Provider::Google,
             &body.id_token,
             account_type,
+            body.email.as_deref(),
             &context,
         )
         .await?;
@@ -246,6 +260,7 @@ pub async fn facebook_sign_in(
             Provider::Facebook,
             &body.id_token,
             account_type,
+            body.email.as_deref(),
             &context,
         )
         .await?;

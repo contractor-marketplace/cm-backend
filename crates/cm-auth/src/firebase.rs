@@ -146,6 +146,11 @@ pub struct VerifiedIdentity {
     /// Firebase's own uid. Recorded for support, never matched on.
     pub firebase_uid: String,
     pub email: Option<String>,
+    /// True when `email` came from the identities-map fallback rather than the
+    /// top-level claim. Telemetry only — it answers which shape production
+    /// tokens actually take, the question that made the sign-up outage take
+    /// two rounds to diagnose.
+    pub email_from_identities: bool,
     pub email_verified: bool,
 }
 
@@ -302,9 +307,13 @@ impl FirebaseVerifier {
         // caller's refusal handles it. The verified flag is NOT inferred: an
         // address recovered from the fallback proves itself by the emailed
         // code like any other unverified address.
+        let mut email_from_identities = false;
         let email = claims.email.clone().or_else(|| {
             match claims.firebase.identities.get("email").map(Vec::as_slice) {
-                Some([only]) if !only.trim().is_empty() => Some(only.clone()),
+                Some([only]) if !only.trim().is_empty() => {
+                    email_from_identities = true;
+                    Some(only.clone())
+                }
                 _ => None,
             }
         });
@@ -313,6 +322,7 @@ impl FirebaseVerifier {
             provider_subject,
             firebase_uid: claims.sub.clone(),
             email,
+            email_from_identities,
             email_verified: claims.email_verified.unwrap_or(false),
         })
     }

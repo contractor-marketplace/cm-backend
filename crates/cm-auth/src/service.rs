@@ -1180,6 +1180,7 @@ impl AuthService {
         provider: Provider,
         id_token: &str,
         intended_account_type: Option<users::AccountType>,
+        client_email: Option<&str>,
         context: &RequestContext,
     ) -> Result<LoginOutcome, AppError> {
         let now = Utc::now();
@@ -1213,20 +1214,56 @@ impl AuthService {
             None => {
                 // A fresh account. The address is stored as this account's
                 // email; if it collides with an existing account the insert
-                // fails, and the caller is told to sign in and link instead.
+                // fails, and the caller is told to sign in to that account.
                 //
-                // Facebook makes the absent case real rather than theoretical:
-                // an account created from a phone number, or one that declined
-                // the email permission, returns no address at all. There is
-                // nowhere to put such a user yet — `users.email` is NOT NULL —
-                // so they are turned away with a message that says what to do.
-                let email = identity.email.clone().ok_or_else(|| {
-                    AppError::invalid(format!(
-                        "That {} account has no email address. Sign up with an email \
-                         address instead.",
-                        provider.display_name()
-                    ))
-                })?;
+                // Where the address comes from is a chain, most-proved first.
+                // The token's own claim wins — but the console mode this
+                // product requires (account linking off) strips that claim
+                // from OAuth tokens, so the browser also forwards the address
+                // the popup showed. That client copy is exactly as trustworthy
+                // as one typed into the email form, which is to say: contact
+                // information until the emailed code proves it, never before.
+                // The verified fast-path below stays keyed to the token's own
+                // claim, so a client-sourced address cannot verify itself.
+                //
+                // Facebook makes the fully-absent case real rather than
+                // theoretical: an account created from a phone number, or one
+                // that declined the email permission, has no address anywhere.
+                // There is nowhere to put such a user yet — `users.email` is
+                // NOT NULL — so they are turned away with a message that says
+                // what to do.
+                let client_email = client_email
+                    .map(str::trim)
+                    .filter(|value| looks_like_email(value));
+                let email_source = if identity.email.is_some() {
+                    if identity.email_from_identities {
+                        "identities"
+                    } else {
+                        "token"
+                    }
+                } else if client_email.is_some() {
+                    "client"
+                } else {
+                    "none"
+                };
+                let email = identity
+                    .email
+                    .clone()
+                    .or_else(|| client_email.map(str::to_owned))
+                    .ok_or_else(|| {
+                        AppError::invalid(format!(
+                            "That {} account has no email address. Sign up with an email \
+                             address instead.",
+                            provider.display_name()
+                        ))
+                    })?;
+                // Answers, permanently, what production tokens actually carry
+                // — the question that made this outage take two rounds to fix.
+                tracing::info!(
+                    provider = provider.as_str(),
+                    email_source,
+                    "federated first arrival"
+                );
                 let display_name = email.split('@').next().unwrap_or("New user").to_owned();
 
                 // Which side of the marketplace this account is on has to come
@@ -1256,18 +1293,16 @@ impl AuthService {
                     users::insert(&mut tx, new_id(), email.trim(), &display_name, account_type)
                         .await
                         .map_err(|error| match error {
-                            // Says what can actually be done today. The link endpoints
-                            // exist for both providers, but nothing in the product
-                            // reaches them yet — there is no account-settings page —
-                            // so naming one sends people looking for something that is
-                            // not there. Restore the fuller wording when that page
-                            // ships.
-                            AppError::Conflict { .. } => AppError::conflict(format!(
-                                "An account already uses that email address. Sign in with your \
-                         email and password instead. Connecting {} to an existing account \
-                         isn't available yet.",
-                                provider.display_name()
-                            )),
+                            // Method-agnostic on purpose: the colliding account may
+                            // itself be federated (a Google account, hit by a Facebook
+                            // sign-up sharing the address), and "sign in with your
+                            // password" is wrong advice for an account that has none.
+                            // Naming the link feature waits for the account page that
+                            // reaches it — Phase D restores the fuller wording.
+                            AppError::Conflict { .. } => AppError::conflict(
+                                "An account already uses that email address. Sign in to \
+                                 that account instead.",
+                            ),
                             other => other,
                         })?;
 

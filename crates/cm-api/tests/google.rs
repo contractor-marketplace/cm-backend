@@ -58,6 +58,46 @@ fn token(google_subject: &str, email: &str) -> String {
     provider_token("google.com", google_subject, email)
 }
 
+/// The token production actually mints.
+///
+/// With account linking off — the console mode this product requires — Firebase
+/// strips the top-level `email` claim from OAuth tokens. When it kept an
+/// address at all, it rides in the identities map's `"email"` slot; sometimes
+/// there is none anywhere. The sign-up outage happened because only the
+/// always-present builder above existed, so no test could mint what production
+/// mints.
+fn production_token(
+    firebase_provider: &str,
+    subject: &str,
+    identities_email: Option<&str>,
+) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let now = chrono::Utc::now().timestamp();
+    let mut identities = json!({ firebase_provider: [subject] });
+    if let Some(email) = identities_email {
+        identities["email"] = json!([email]);
+    }
+    let claims = json!({
+        "sub": format!("firebase-{subject}"),
+        "user_id": format!("firebase-{subject}"),
+        "auth_time": now - 30,
+        "iat": now - 30,
+        "exp": now + 3600,
+        "iss": format!("https://securetoken.google.com/{PROJECT}"),
+        "aud": PROJECT,
+        "firebase": {
+            "sign_in_provider": firebase_provider,
+            "identities": identities
+        }
+    });
+
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
+    format!("{header}.{payload}.")
+}
+
 fn facebook_token(app_scoped_id: &str, email: &str) -> String {
     provider_token("facebook.com", app_scoped_id, email)
 }
@@ -392,13 +432,17 @@ async fn a_shared_email_across_providers_is_a_conflict_not_a_merge(pool: PgPool)
         StatusCode::CONFLICT,
         "a shared address must never merge two providers into one account"
     );
+    // This is exactly the collision whose other side is NOT a password
+    // account — the address belongs to a Google-created one. The advice must
+    // therefore stay method-agnostic: pointing at "your password" here sends
+    // the person to a credential that does not exist.
+    let message = facebook.json["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        facebook.json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Facebook"),
-        "the message names the provider the user just tried: {:?}",
-        facebook.json
+        message.contains("email") && !message.contains("password"),
+        "the refusal points at the existing account without assuming how it \
+         signs in: {message}"
     );
 
     let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
@@ -588,4 +632,163 @@ async fn an_unknown_account_type_is_refused_by_name(pool: PgPool) {
         .as_str()
         .unwrap_or_default()
         .contains("homeowner"));
+}
+
+/* ── The production token shape ─────────────────────────────────────────────
+Every test above minted tokens with a top-level email claim, which is why a
+day of green tests coexisted with a total sign-up outage. These four mint
+what the console mode actually produces. ─────────────────────────────────*/
+
+/// No top-level claim, address in the identities slot: sign-up works, and the
+/// address is contact info, not proof — nothing marked verified.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_production_shaped_token_signs_up_via_the_identities_slot(pool: PgPool) {
+    let mut client = Client::new(emulator_router(pool.clone()));
+
+    let response = client
+        .post(
+            "/v1/auth/google",
+            json!({
+                "id_token": production_token("google.com", "prod-subject-1", Some("marisol@example.test")),
+                "account_type": "homeowner"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+    assert_eq!(response.json["user"]["email"], "marisol@example.test");
+    assert_eq!(
+        response.json["user"]["email_verified"], false,
+        "an identities-slot address is unproved: {:?}",
+        response.json
+    );
+}
+
+/// No address in the token at all — the popup's copy, forwarded by the
+/// browser, is accepted at exactly the trust level of a typed one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_token_with_no_email_anywhere_accepts_the_popups_copy(pool: PgPool) {
+    let mut client = Client::new(emulator_router(pool.clone()));
+
+    let response = client
+        .post(
+            "/v1/auth/google",
+            json!({
+                "id_token": production_token("google.com", "prod-subject-2", None),
+                "account_type": "contractor",
+                "email": "marisol@example.test"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+    assert_eq!(response.json["user"]["email"], "marisol@example.test");
+    assert_eq!(response.json["user"]["email_verified"], false);
+    assert_eq!(response.json["user"]["account_type"], "contractor");
+
+    let verified_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT email_verified_at FROM users")
+            .fetch_one(&pool)
+            .await
+            .expect("user row");
+    assert!(
+        verified_at.is_none(),
+        "a client-supplied address must not verify itself"
+    );
+}
+
+/// The token outranks the browser: when both carry an address, the verified
+/// token's wins and the client copy is ignored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_tokens_address_outranks_the_browsers(pool: PgPool) {
+    let mut client = Client::new(emulator_router(pool.clone()));
+
+    let response = client
+        .post(
+            "/v1/auth/google",
+            json!({
+                "id_token": production_token("google.com", "prod-subject-3", Some("token@example.test")),
+                "account_type": "homeowner",
+                "email": "attacker-chosen@example.test"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+    assert_eq!(response.json["user"]["email"], "token@example.test");
+}
+
+/// A client-supplied address that collides with an existing account is a
+/// conflict, same as everywhere else — and the advice no longer assumes the
+/// other account has a password.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_client_address_colliding_with_an_existing_account_is_refused(pool: PgPool) {
+    let mut client = Client::new(emulator_router(pool.clone()));
+
+    let registered = client
+        .post(
+            "/v1/auth/register",
+            json!({
+                "email": "marisol@example.test",
+                "display_name": "Marisol",
+                "password": PASSWORD,
+                "account_type": "homeowner"
+            }),
+        )
+        .await;
+    assert_eq!(
+        registered.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        registered.json
+    );
+
+    let response = client
+        .post(
+            "/v1/auth/google",
+            json!({
+                "id_token": production_token("google.com", "prod-subject-4", None),
+                "account_type": "homeowner",
+                "email": "MARISOL@Example.TEST"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status, StatusCode::CONFLICT, "{:?}", response.json);
+    let message = response.json["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !message.contains("password"),
+        "the advice must not assume the colliding account has one: {message}"
+    );
+}
+
+/// A returning identity is a sign-in, and a sign-in changes nothing: whatever
+/// address rides in the body is ignored outright.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_client_address_is_ignored_for_a_returning_identity(pool: PgPool) {
+    let router = emulator_router(pool.clone());
+    let id_token = production_token("google.com", "prod-subject-5", Some("marisol@example.test"));
+
+    let first = Client::new(router.clone())
+        .post(
+            "/v1/auth/google",
+            json!({ "id_token": id_token, "account_type": "homeowner" }),
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.json);
+
+    let second = Client::new(router)
+        .post(
+            "/v1/auth/google",
+            json!({ "id_token": id_token, "email": "other@example.test" }),
+        )
+        .await;
+
+    assert_eq!(second.status, StatusCode::OK, "{:?}", second.json);
+    assert_eq!(
+        second.json["user"]["email"], "marisol@example.test",
+        "a sign-in must not rewrite the account's address"
+    );
 }
