@@ -286,10 +286,33 @@ impl FirebaseVerifier {
             }
         };
 
+        // The address, from wherever this console mode put it.
+        //
+        // With account linking off — the setting this product requires — the
+        // documented behaviour is that OAuth tokens carry no top-level `email`
+        // claim; the address travels only in the `identities` map, in the
+        // `"email"` slot beside the provider subject read above. Reading only
+        // the top level meant every federated sign-up was refused with "that
+        // account has no email address", which on a Gmail account is absurd:
+        // there was no way into the product through the provider buttons.
+        //
+        // The top level wins when present; the slot is a fallback, and only
+        // when it holds exactly one address — picking one of several would
+        // attach an address nobody proved, so ambiguity stays None and the
+        // caller's refusal handles it. The verified flag is NOT inferred: an
+        // address recovered from the fallback proves itself by the emailed
+        // code like any other unverified address.
+        let email = claims.email.clone().or_else(|| {
+            match claims.firebase.identities.get("email").map(Vec::as_slice) {
+                Some([only]) if !only.trim().is_empty() => Some(only.clone()),
+                _ => None,
+            }
+        });
+
         Ok(VerifiedIdentity {
             provider_subject,
             firebase_uid: claims.sub.clone(),
-            email: claims.email.clone(),
+            email,
             email_verified: claims.email_verified.unwrap_or(false),
         })
     }

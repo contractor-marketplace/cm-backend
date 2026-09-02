@@ -494,3 +494,69 @@ async fn emulator_mode_accepts_unsigned_tokens_but_still_checks_claims() {
         );
     }
 }
+
+/// The token Firebase actually mints with account linking off.
+///
+/// The console mode this product requires — "create multiple accounts for
+/// each identity provider" — has a documented side effect: the top-level
+/// `email` claim is omitted for OAuth users. The address still travels in the
+/// token, in the `identities` map beside the provider subject. Reading only
+/// the top level turned every federated sign-up away with "that account has
+/// no email address", which on a Gmail account is absurd — there was no way
+/// into the product through the Google or Facebook buttons at all.
+#[tokio::test]
+async fn a_multiple_accounts_mode_token_still_yields_its_email() {
+    let (verifier, _) = verifier(Duration::from_secs(3600));
+
+    let token = TokenBuilder::valid()
+        .remove("email")
+        .remove("email_verified")
+        .claim(
+            "firebase.identities",
+            json!({
+                "google.com": ["100000000000000000001"],
+                "email": ["marisol@example.test"]
+            }),
+        )
+        .sign();
+
+    let identity = verifier
+        .verify(&token, Provider::Google)
+        .await
+        .expect("should verify");
+
+    assert_eq!(identity.email.as_deref(), Some("marisol@example.test"));
+    // No top-level claim means no verified claim either; the account is
+    // created unverified and proves its address by the emailed code like
+    // everyone else.
+    assert!(!identity.email_verified);
+}
+
+/// Two addresses in the slot is not a shape to guess about.
+///
+/// With linking off it cannot normally happen; if it does, picking one would
+/// attach an address nobody proved. No email means the sign-up is refused
+/// with the message that says to use the email path — safe, and honest.
+#[tokio::test]
+async fn a_plural_identities_email_is_not_guessed_at() {
+    let (verifier, _) = verifier(Duration::from_secs(3600));
+
+    let token = TokenBuilder::valid()
+        .remove("email")
+        .remove("email_verified")
+        .claim(
+            "firebase.identities",
+            json!({
+                "google.com": ["100000000000000000001"],
+                "email": ["one@example.test", "two@example.test"]
+            }),
+        )
+        .sign();
+
+    let identity = verifier
+        .verify(&token, Provider::Google)
+        .await
+        .expect("the token itself is valid");
+
+    assert_eq!(identity.email, None, "ambiguity must not become an address");
+}
