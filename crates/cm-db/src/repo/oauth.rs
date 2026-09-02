@@ -103,7 +103,6 @@ pub async fn exists_for_user(
     .map_err(AppError::internal)
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The providers connected to an account, for the account page.
 ///
 /// Names only — the subjects stay server-side. A page needs to render
@@ -126,6 +125,7 @@ pub async fn providers_for_user(
         .ok_or_else(|| AppError::internal("unknown provider in oauth_identities"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert(
     conn: &mut PgConnection,
     id: Uuid,
