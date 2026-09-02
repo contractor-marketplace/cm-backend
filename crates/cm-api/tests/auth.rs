@@ -15,11 +15,13 @@ const EMAIL: &str = "marisol@example.test";
 async fn registration_creates_an_account_and_signs_it_in(pool: PgPool) {
     let mut client = Client::new(router(pool.clone()));
 
+    // `register` completes the emailed-code step, so the response here is the
+    // final one: a session, and an address the code round-trip just verified.
     let response = client.register(EMAIL).await;
-    assert_eq!(response.status, StatusCode::CREATED, "{:?}", response.json);
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
     assert_eq!(response.json["user"]["email"], EMAIL);
     assert_eq!(response.json["user"]["status"], "active");
-    assert_eq!(response.json["user"]["email_verified"], false);
+    assert_eq!(response.json["user"]["email_verified"], true);
     assert!(response.json["csrf_token"].is_string());
 
     // The session works straight away, without a separate login.
@@ -90,7 +92,7 @@ async fn a_duplicate_address_is_refused(pool: PgPool) {
     let router = router(pool);
     assert_eq!(
         Client::new(router.clone()).register(EMAIL).await.status,
-        StatusCode::CREATED
+        StatusCode::OK
     );
 
     // A different case of the same address is the same address: the unique

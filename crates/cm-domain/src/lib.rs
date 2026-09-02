@@ -5,13 +5,18 @@
 //! `cm-db`, so "which query touches a restricted column" stays a grep.
 
 pub mod claims;
+pub mod contractors;
 pub mod geocode_worker;
 pub mod geocoder;
 pub mod import;
+pub mod job_alerts;
 pub mod jobs;
 pub mod location;
+pub mod mail_worker;
+pub mod mailer;
 pub mod maintenance;
 pub mod messaging;
+pub mod quality;
 pub mod search;
 pub mod verification;
 

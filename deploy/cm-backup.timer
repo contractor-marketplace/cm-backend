@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly database backup
+
+[Timer]
+# Ahead of cm-prune (04:15) and cm-verification, so the night's backup captures
+# the database as the day left it rather than as housekeeping rewrote it.
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=10m
+# Catches up a backup missed while the box was down, which is exactly when one
+# is most likely to be wanted.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

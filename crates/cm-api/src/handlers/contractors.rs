@@ -1,12 +1,12 @@
 //! The public contractor directory, and the claimant's own edit surface.
 
-use crate::extract::{CurrentUser, Json as ValidJson};
+use crate::extract::{Context, CurrentUser, Json as ValidJson};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use cm_core::AppError;
 use cm_db::repo::contractors::{self, AddressVisibility, ProfileUpdate, PublicContractor};
-use cm_db::repo::{claims, reference, search};
+use cm_db::repo::{claims, reference, reviews, search, search_events, service_areas, suggest};
 use cm_domain::search as search_input;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -23,7 +23,10 @@ pub struct ListResponse {
     ignored_filters: Vec<String>,
 }
 
-async fn trade_ids(state: &AppState, trade: Option<&str>) -> Result<Vec<Uuid>, AppError> {
+async fn trade_ids(
+    conn: &mut sqlx::PgConnection,
+    trade: Option<&str>,
+) -> Result<Vec<Uuid>, AppError> {
     let Some(trade) = trade else {
         return Ok(Vec::new());
     };
@@ -38,19 +41,123 @@ async fn trade_ids(state: &AppState, trade: Option<&str>) -> Result<Vec<Uuid>, A
         return Ok(Vec::new());
     }
 
+    reference::trade_ids_for_slugs(conn, &slugs).await
+}
+
+/// The trades a free-text query is asking for.
+///
+/// "hvac" is not a business name and never will be, so matching it against
+/// names and bios finds nothing however well that matching works. Resolving it
+/// through the alias vocabulary first turns a hopeless text query into an
+/// indexed semi-join. Applied to the list and the map alike, or the two would
+/// disagree about what matches — which is the one thing the shared predicate
+/// exists to prevent.
+async fn query_trades(
+    conn: &mut sqlx::PgConnection,
+    query: Option<&str>,
+) -> Result<Vec<Uuid>, AppError> {
+    match query {
+        Some(query) => reference::trades_matching_text(conn, query).await,
+        None => Ok(Vec::new()),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuggestResponse {
+    suggestions: Vec<suggest::Suggestion>,
+}
+
+/// What the person might mean, while they are still typing.
+///
+/// Public, and the only endpoint here that fires on every keystroke, so it is
+/// rate limited per address — high enough that nobody typing meets it, low
+/// enough that it cannot be used to walk the directory a letter at a time.
+/// Enforced before the query runs, so a caller over the limit costs a bucket
+/// read rather than a search.
+///
+/// A query too short to mean anything returns an empty list rather than an
+/// error: the client asks as the box fills, and the first character is not a
+/// mistake worth reporting.
+pub async fn suggest(
+    State(state): State<AppState>,
+    Context(context): Context,
+    Query(raw): Query<SuggestQuery>,
+) -> Result<Json<SuggestResponse>, AppError> {
+    if let Some(client) = context.client_ip.as_deref() {
+        cm_auth::ratelimit::enforce(
+            &state.pool,
+            state.auth.pepper(),
+            cm_auth::ratelimit::suggest_per_ip(),
+            client,
+            chrono::Utc::now(),
+        )
+        .await?;
+    }
+
+    let query = raw.q.unwrap_or_default();
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    reference::trade_ids_for_slugs(&mut conn, &slugs).await
+    let suggestions = suggest::suggest(&mut conn, &query).await?;
+
+    Ok(Json(SuggestResponse { suggestions }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SuggestQuery {
+    pub q: Option<String>,
+}
+
+/// Record what a page showed, without letting that failure reach the page.
+///
+/// Deliberately swallows its error. An impression that does not get written is
+/// a gap in an analysis; a search that 500s because logging failed is an outage,
+/// and the two are not close enough in cost to treat the same way.
+async fn record_impressions(
+    conn: &mut sqlx::PgConnection,
+    surface: search_events::Surface,
+    subjects: impl IntoIterator<Item = Uuid>,
+    actor: Option<Uuid>,
+    had_query: bool,
+    sort: Option<String>,
+    request_id: Option<String>,
+) {
+    let events: Vec<search_events::Event> = subjects
+        .into_iter()
+        .enumerate()
+        .map(|(index, subject_id)| search_events::Event {
+            kind: search_events::Kind::Impression,
+            surface,
+            subject_id,
+            actor_user_id: actor,
+            // One-based: "position 1" is the top of the page, which is what
+            // every rate is read against.
+            position: (index + 1) as i32,
+            had_query,
+            sort: sort.clone(),
+            request_id: request_id.clone(),
+        })
+        .collect();
+
+    if let Err(error) = search_events::record(conn, &events).await {
+        tracing::warn!(%error, "could not record impressions");
+    }
 }
 
 pub async fn list(
     State(state): State<AppState>,
+    Context(context): Context,
     Query(raw): Query<search_input::RawQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
-    let ids = trade_ids(&state, raw.trade.as_deref()).await?;
-    let request = search_input::parse(&raw, ids)?;
-
+    // One connection for the whole request. Resolving the trade filter, routing
+    // the query through the alias vocabulary and running the search are one
+    // unit of work, and taking a connection from the pool three times to do it
+    // costs three acquisitions and three statement caches to warm.
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    let page = search::list(
+
+    let ids = trade_ids(&mut conn, raw.trade.as_deref()).await?;
+    let mut request = search_input::parse(&raw, ids)?;
+    request.filters.query_trade_ids =
+        query_trades(&mut conn, request.filters.query.as_deref()).await?;
+    let mut page = search::list(
         &mut conn,
         &request.filters,
         request.sort,
@@ -58,6 +165,21 @@ pub async fn list(
         request.cursor.as_ref(),
     )
     .await?;
+
+    // Storage keys become URLs here, never in the row reader. Every read path
+    // that serves a contractor has to do this or photos go out as bare keys.
+    search::attach_photo_urls(&mut page.contractors, |key| state.store.url_for(key));
+
+    record_impressions(
+        &mut conn,
+        search_events::Surface::Directory,
+        page.contractors.iter().map(|c| c.id),
+        None,
+        request.filters.query.is_some(),
+        raw.sort.clone(),
+        context.request_id.clone(),
+    )
+    .await;
 
     Ok(Json(ListResponse {
         contractors: page.contractors,
@@ -73,6 +195,15 @@ pub struct MapResponse {
     /// omits pins is worse than one that says it is showing a subset.
     truncated: bool,
     limit: i64,
+    /// Filters that could not be parsed and were dropped.
+    ///
+    /// The list has always reported these and the map never did, though both
+    /// parse the same query with the same function. A visitor whose ZIP was
+    /// rejected saw the note beside the results and nothing beside the map,
+    /// which reads as the map disagreeing rather than as one filter being
+    /// ignored by both.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ignored_filters: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,16 +218,31 @@ pub struct MapPoint {
     /// city and ZIP are already implied by where the pin is.
     #[serde(skip_serializing_if = "Option::is_none")]
     address_line1: Option<String>,
+    /// So a pin's hover card can say the same thing the row does.
+    ///
+    /// Both omitted when absent rather than sent as null, and they travel
+    /// together: ~1% of listings carry a rating, and a rating with no count
+    /// behind it is the claim this product exists to not make.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    google_rating: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    google_review_count: Option<i32>,
 }
 
 pub async fn map(
     State(state): State<AppState>,
     Query(raw): Query<search_input::RawQuery>,
 ) -> Result<Json<MapResponse>, AppError> {
-    let ids = trade_ids(&state, raw.trade.as_deref()).await?;
-    let request = search_input::parse(&raw, ids)?;
-
+    // One connection for the whole request. Resolving the trade filter, routing
+    // the query through the alias vocabulary and running the search are one
+    // unit of work, and taking a connection from the pool three times to do it
+    // costs three acquisitions and three statement caches to warm.
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+
+    let ids = trade_ids(&mut conn, raw.trade.as_deref()).await?;
+    let mut request = search_input::parse(&raw, ids)?;
+    request.filters.query_trade_ids =
+        query_trades(&mut conn, request.filters.query.as_deref()).await?;
     let (found, truncated) =
         search::map_points(&mut conn, &request.filters, search::MAX_MAP_POINTS).await?;
 
@@ -113,6 +259,8 @@ pub async fn map(
                 lon: c.lon?,
                 location_precision: c.location_precision,
                 address_line1: c.address_line1,
+                google_rating: c.google_rating,
+                google_review_count: c.google_review_count,
             })
         })
         .collect();
@@ -121,6 +269,7 @@ pub async fn map(
         points,
         truncated,
         limit: search::MAX_MAP_POINTS,
+        ignored_filters: request.ignored,
     }))
 }
 
@@ -137,6 +286,14 @@ pub struct DetailResponse {
     license_data_as_of: Option<chrono::NaiveDate>,
     /// The evidence behind the badge.
     verification: Vec<VerificationView>,
+    /// Third-party reviews, capped. Empty for a listing the enrichment load
+    /// never reached, which is most of them.
+    ///
+    /// The totals live on the flattened contractor as `google_rating` and
+    /// `google_review_count`, and the count is Google's own — normally larger
+    /// than this array, which is a sample. A client that renders "N reviews"
+    /// should use the count, not `reviews.len()`.
+    reviews: Vec<reviews::PublicReview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,11 +310,14 @@ pub async fn detail(
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
 
     // Accepts an id or a slug, so a shareable URL does not have to be a UUID.
-    let contractor = match Uuid::parse_str(&id) {
+    let mut one = match Uuid::parse_str(&id) {
         Ok(uuid) => search::find_public(&mut conn, uuid).await?,
         Err(_) => search::find_public_by_slug(&mut conn, &id).await?,
     }
+    .map(|c| vec![c])
     .ok_or(AppError::NotFound)?;
+    search::attach_photo_urls(&mut one, |key| state.store.url_for(key));
+    let contractor = one.remove(0);
 
     let verification_reason: Option<String> =
         sqlx::query_scalar("SELECT verification_reason FROM contractors WHERE id = $1")
@@ -180,11 +340,15 @@ pub async fn detail(
         })
         .collect();
 
+    let reviews =
+        reviews::list_for_contractor(&mut conn, contractor.id, reviews::MAX_PER_CONTRACTOR).await?;
+
     Ok(Json(DetailResponse {
         contractor,
         verification_reason,
         license_data_as_of,
         verification,
+        reviews,
     }))
 }
 
@@ -209,10 +373,95 @@ pub struct UpdateProfileRequest {
     pub public_phone: Option<String>,
     pub accepts_dm: Option<bool>,
     pub address_visibility: Option<String>,
+    /// The claimant's own address. All four parts or none — a partial address
+    /// is refused rather than merged with the licence's, because merging would
+    /// geocode a building that exists nowhere.
+    ///
+    /// `Some(null)` clears it and the listing falls back to the licence
+    /// address; absent leaves it alone. That distinction is why this is
+    /// `Option<Option<_>>` rather than a flat option.
+    #[serde(default, deserialize_with = "double_option")]
+    pub owner_address: Option<Option<OwnerAddressRequest>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub google_review_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub yelp_url: Option<Option<String>>,
     /// Present only so a client that sends it gets a clear refusal instead of
     /// silently having it ignored — which would teach the client it worked.
     #[serde(default)]
     pub verified: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OwnerAddressRequest {
+    pub line1: String,
+    pub city: String,
+    pub state: String,
+    pub postal_code: String,
+}
+
+/// Distinguish "absent" from "explicitly null".
+///
+/// serde collapses both to `None` on a plain `Option`, which would make
+/// "leave my Yelp link alone" and "remove my Yelp link" the same request.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Turn the wire's `Option<Option<T>>` into the repo's explicit `Edit`.
+fn edit<T>(field: Option<Option<T>>) -> contractors::Edit<T> {
+    match field {
+        None => contractors::Edit::Unchanged,
+        Some(None) => contractors::Edit::Cleared,
+        Some(Some(value)) => contractors::Edit::Set(value),
+    }
+}
+
+/// A link the contractor supplies about themselves.
+///
+/// Checked rather than trusted: this string is rendered as an `href` on a
+/// public page, so `javascript:` and `data:` must not survive. Only http(s) is
+/// accepted, and the host has to look like a host.
+fn clean_link(value: String, field: &str) -> Result<String, AppError> {
+    let trimmed = value.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err(AppError::invalid(format!("{field} cannot be blank.")));
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if !(lowered.starts_with("https://") || lowered.starts_with("http://")) {
+        return Err(AppError::invalid(format!(
+            "{field} must start with https:// or http://"
+        )));
+    }
+    // Cheap structural check rather than a URL parser: everything after the
+    // scheme up to the first slash must contain a dot and no whitespace.
+    let host = lowered
+        .split_once("//")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    if host.is_empty() || !host.contains('.') || host.contains(char::is_whitespace) {
+        return Err(AppError::invalid(format!("{field} is not a valid link.")));
+    }
+    if trimmed.chars().count() > 500 {
+        return Err(AppError::invalid(format!("{field} is too long.")));
+    }
+    Ok(trimmed)
+}
+
+/// One part of an address, trimmed and bounded.
+fn clean_address_part(value: &str, field: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::invalid(format!("{field} cannot be blank.")));
+    }
+    if trimmed.chars().count() > 200 {
+        return Err(AppError::invalid(format!("{field} is too long.")));
+    }
+    Ok(trimmed.to_owned())
 }
 
 pub async fn update_profile(
@@ -247,6 +496,29 @@ pub async fn update_profile(
         }
     };
 
+    // Validated before the transaction opens, so a bad link is a 400 rather
+    // than a rolled-back write.
+    let owner_address = match body.owner_address {
+        None => contractors::Edit::Unchanged,
+        Some(None) => contractors::Edit::Cleared,
+        Some(Some(a)) => contractors::Edit::Set(contractors::OwnerAddress {
+            line1: clean_address_part(&a.line1, "Street address")?,
+            city: clean_address_part(&a.city, "City")?,
+            state: clean_address_part(&a.state, "State")?,
+            postal_code: clean_address_part(&a.postal_code, "ZIP code")?,
+        }),
+    };
+    let address_changed = !matches!(owner_address, contractors::Edit::Unchanged);
+
+    let google_review_url = match edit(body.google_review_url) {
+        contractors::Edit::Set(v) => contractors::Edit::Set(clean_link(v, "Google review link")?),
+        other => other,
+    };
+    let yelp_url = match edit(body.yelp_url) {
+        contractors::Edit::Set(v) => contractors::Edit::Set(clean_link(v, "Yelp link")?),
+        other => other,
+    };
+
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
     contractors::update_profile(
         &mut tx,
@@ -257,6 +529,9 @@ pub async fn update_profile(
             public_phone: body.public_phone,
             accepts_dm: body.accepts_dm,
             address_visibility: visibility,
+            owner_address,
+            google_review_url,
+            yelp_url,
         },
     )
     .await?;
@@ -265,11 +540,199 @@ pub async fn update_profile(
     if visibility.is_some() {
         cm_domain::location::reapply(&mut tx, contractor_id).await?;
     }
+
+    // A new address means a new pin. Queued inside the same transaction as the
+    // write, so a rollback cannot leave a geocode job for an address that was
+    // never saved.
+    if address_changed {
+        cm_domain::contractors::relocate_after_address_change(&mut tx, contractor_id).await?;
+    }
+
     tx.commit().await.map_err(AppError::internal)?;
 
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    search::find_public(&mut conn, contractor_id)
+    let mut found = search::find_public(&mut conn, contractor_id)
         .await?
-        .map(Json)
-        .ok_or(AppError::NotFound)
+        .map(|c| vec![c])
+        .ok_or(AppError::NotFound)?;
+    search::attach_photo_urls(&mut found, |key| state.store.url_for(key));
+    Ok(Json(found.remove(0)))
+}
+
+/// Set the listing's profile photo. Multipart, claimant only.
+pub async fn set_photo(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+    mut form: axum::extract::Multipart,
+) -> Result<Json<cm_domain::contractors::ProfilePhoto>, AppError> {
+    let mut bytes: Option<Vec<u8>> = None;
+
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|error| AppError::invalid(format!("That upload could not be read: {error}")))?
+    {
+        if field.name() == Some("file") {
+            bytes = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|error| {
+                        AppError::invalid(format!("That upload could not be read: {error}"))
+                    })?
+                    .to_vec(),
+            );
+            break;
+        }
+    }
+
+    let bytes = bytes.ok_or_else(|| AppError::invalid("Attach a photo in a \"file\" field."))?;
+
+    let photo = cm_domain::contractors::set_photo(
+        &state.pool,
+        &state.store,
+        state.auth.pepper(),
+        caller.user.id,
+        contractor_id,
+        &bytes,
+    )
+    .await?;
+
+    Ok(Json(photo))
+}
+
+pub async fn remove_photo(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+) -> Result<http::StatusCode, AppError> {
+    cm_domain::contractors::remove_photo(&state.pool, &state.store, caller.user.id, contractor_id)
+        .await?;
+    Ok(http::StatusCode::NO_CONTENT)
+}
+
+/// A profile photo is one image, so the limit is lower than the job composer's
+/// twelve megabytes — it is a logo or a van, not a set of site photographs.
+const MAX_PHOTO_BYTES: usize = 8 * 1024 * 1024;
+
+/// The photo routes, with the upload limit attached to them and nowhere else.
+#[derive(Debug, Serialize)]
+pub struct ServiceAreasResponse {
+    areas: Vec<service_areas::Area>,
+    /// ZIPs that were sent and could not be stored, because the Census draws no
+    /// area around them — PO-box and business-only codes. Named rather than
+    /// silently dropped, so a claimant can see which of their list did not take.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unknown: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetServiceAreas {
+    areas: Vec<ServiceAreaInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ServiceAreaInput {
+    Region { code: String },
+    Radius { radius_m: i32 },
+}
+
+/// Where this contractor says they work.
+pub async fn service_areas_get(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+) -> Result<Json<ServiceAreasResponse>, AppError> {
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+    require_claimant(&mut conn, &caller, contractor_id).await?;
+
+    Ok(Json(ServiceAreasResponse {
+        areas: service_areas::for_contractor(&mut conn, contractor_id).await?,
+        unknown: Vec::new(),
+    }))
+}
+
+/// Replace where this contractor says they work.
+///
+/// The whole set, because that is what a list of checkboxes produces, and
+/// reconciling a set against itself buys nothing at forty rows.
+pub async fn service_areas_put(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+    ValidJson(body): ValidJson<SetServiceAreas>,
+) -> Result<Json<ServiceAreasResponse>, AppError> {
+    if body.areas.len() > service_areas::MAX_AREAS {
+        return Err(AppError::invalid(format!(
+            "A listing may declare at most {} service areas.",
+            service_areas::MAX_AREAS
+        )));
+    }
+
+    let mut areas = Vec::with_capacity(body.areas.len());
+    let mut radii = 0;
+    for input in body.areas {
+        match input {
+            ServiceAreaInput::Region { code } => {
+                let code = code.trim().to_owned();
+                if code.len() != 5 || !code.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(AppError::invalid(format!(
+                        "\"{code}\" is not a five-digit ZIP code."
+                    )));
+                }
+                areas.push(service_areas::Area::Region { code });
+            }
+            ServiceAreaInput::Radius { radius_m } => {
+                // One radius is a statement about reach; several are a
+                // contradiction, and the largest would win silently.
+                radii += 1;
+                if radii > 1 {
+                    return Err(AppError::invalid(
+                        "A listing may set one travel radius, not several.",
+                    ));
+                }
+                if !(1..=service_areas::MAX_RADIUS_M).contains(&radius_m) {
+                    return Err(AppError::invalid(format!(
+                        "A travel radius must be between 1 and {} metres.",
+                        service_areas::MAX_RADIUS_M
+                    )));
+                }
+                areas.push(service_areas::Area::Radius { radius_m });
+            }
+        }
+    }
+
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+    require_claimant(&mut conn, &caller, contractor_id).await?;
+
+    let unknown = service_areas::replace(&mut conn, contractor_id, &areas).await?;
+
+    Ok(Json(ServiceAreasResponse {
+        areas: service_areas::for_contractor(&mut conn, contractor_id).await?,
+        unknown,
+    }))
+}
+
+/// Only the claimant edits their own listing. The same check the profile
+/// editor makes, in one place rather than two.
+async fn require_claimant(
+    conn: &mut sqlx::PgConnection,
+    caller: &cm_auth::Authenticated,
+    contractor_id: Uuid,
+) -> Result<(), AppError> {
+    match contractors::claimed_by(conn, caller.user.id).await? {
+        Some(owned) if owned == contractor_id => Ok(()),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
+pub fn photo_routes() -> axum::Router<AppState> {
+    axum::Router::new().route(
+        "/v1/contractors/{id}/photo",
+        axum::routing::post(set_photo)
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_PHOTO_BYTES))
+            .delete(remove_photo),
+    )
 }

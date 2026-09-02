@@ -3,11 +3,19 @@
 The contractor marketplace v1 backend: Rust, axum, sqlx, PostgreSQL 16 with
 PostGIS, deployed on a single self-hosted VPS.
 
-**Current state: v1 feature-complete.** Password and Google authentication,
-CSLB licence import, background geocoding, PostGIS search and map, contractor
-claims with an auditable verified badge, and direct messaging with blocking and
-reporting. See `docs/runbook.md` to deploy it and `docs/handover.md` for what is
-and is not covered.
+**Current state: v1 feature-complete.** Password, Google and Facebook
+authentication; CSLB licence import; background geocoding; PostGIS search and
+map; contractor claims with an auditable verified badge and a moderation queue;
+a structured job board with photos; a claimant-owned profile; and ~11,000
+published Google reviews.
+
+| Document | Read it for |
+|---|---|
+| **`docs/architecture.md`** | **The whole stack and everything that has been built — start here** |
+| `docs/search.md` | Search and queries: retrieval, ranking, pagination, facets, and how they are measured |
+| `docs/runbook.md` | Deploying, importing, backups, what to do when something breaks |
+| `docs/handover.md` | What is and is not covered |
+| This file | Running it locally |
 
 ## Layout
 
@@ -164,6 +172,8 @@ front.
 | `GET /v1/contractors` | — | Keyset-paginated. Text, trade, ZIP, radius, bbox, verified. |
 | `GET /v1/contractors/map` | — | Same predicate, capped at 500 points, `truncated` flag. |
 | `GET /v1/contractors/{id\|slug}` | — | Detail plus the evidence behind the badge. |
+| `GET /v1/suggest` | — | Typeahead: trades, places and businesses. Rate limited per address. |
+| `GET /v1/jobs/map` | — | Open jobs as pins. Same predicate as the board, capped at 500. |
 | `GET /v1/trades`, `GET /v1/regions` | — | Filter vocabularies. |
 | `PATCH /v1/contractors/{id}` | claimant | Bio, phone, website, DM opt-in, address visibility. |
 | `POST /v1/contractors/{id}/claims` | required | Open a claim. |
@@ -209,10 +219,12 @@ cm-server admin grant-role  --email person@example.com --role admin
 cm-server admin revoke-role --email person@example.com --role admin
 
 cm-server import-cslb --file ./LicenseMaster.csv --county "LOS ANGELES" [--dry-run]
-cm-server load-regions --file deploy/data/zcta_la_county.csv --source census
+cm-server load-regions --file deploy/data/zcta_ca.csv --source census_2020_gazetteer
 cm-server seed-trades
 cm-server recompute-verification
 cm-server geocode-worker [--once]
+cm-server mail-worker [--once]   # drains the email outbox into Resend
+cm-server job-alerts             # matches new jobs to saved searches, weekly
 ```
 
 Roles are granted from a shell, never over HTTP. The first admin has to come
@@ -273,8 +285,13 @@ rolling deploy (migrate, then restart) is safe in both orders.
 | 0013 | `0013_homeowner_profiles.sql` | `homeowner_profiles` |
 | 0014 | `0014_messaging.sql` | `conversations`, `conversation_participants`, `messages` |
 | 0015 | `0015_safety.sql` | `user_blocks`, `message_reports` |
+| … | | 0016–0031 add the account split, jobs and their intake, published licence addresses, Facebook, Google reviews, the trade vocabulary, the quality score, the job board's search document, `search_events`, service areas and places |
+| 0032 | `0032_email_outbox.sql` | `email_outbox` |
+| 0033 | `0033_login_codes.sql` | `auth_tokens` gains the `login_code` purpose and an attempt counter |
+| 0034 | `0034_saved_searches.sql` | `saved_searches`, `jobs.alerts_matched_at` |
 
-`auth_tokens` is created but unused: password reset and email verification need
-a mail path that does not exist yet, so no endpoint issues or consumes a token.
-The table lands with the rest of the auth schema so those flows are a code
-change rather than a migration when the mail path is approved.
+`auth_tokens` was created in 0005 and left unused until the mail path existed;
+0033 added the `login_code` purpose and an attempt counter, and it now carries
+both the emailed sign-in codes and the password-reset links. Landing the table
+with the rest of the auth schema is what made those flows a code change rather
+than a migration when the time came.

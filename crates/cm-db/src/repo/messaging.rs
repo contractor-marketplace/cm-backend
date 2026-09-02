@@ -93,6 +93,12 @@ pub async fn find_or_create_dm(
     initiator: Uuid,
     recipient: Uuid,
     contractor_id: Option<Uuid>,
+    // `job_id` is the posting this conversation came from, when it came from
+    // one. Recorded so "how many contractors have replied to this posting" is
+    // answerable: it was resolved to a poster and then forgotten, which left
+    // the signal a lead feed most needs underivable — a job with nine replies
+    // is worth less to the tenth contractor than one with none.
+    job_id: Option<Uuid>,
 ) -> Result<(Conversation, bool), AppError> {
     if initiator == recipient {
         return Err(AppError::invalid(
@@ -102,8 +108,8 @@ pub async fn find_or_create_dm(
     let (lo, hi) = ordered(initiator, recipient);
 
     let inserted: Option<Uuid> = sqlx::query_scalar(
-        "INSERT INTO conversations (id, kind, contractor_id, dm_lo, dm_hi, created_by) \
-         VALUES ($1, 'dm', $2, $3, $4, $5) \
+        "INSERT INTO conversations (id, kind, contractor_id, dm_lo, dm_hi, created_by, job_id) \
+         VALUES ($1, 'dm', $2, $3, $4, $5, $6) \
          ON CONFLICT DO NOTHING RETURNING id",
     )
     .bind(new_id())
@@ -111,6 +117,7 @@ pub async fn find_or_create_dm(
     .bind(lo)
     .bind(hi)
     .bind(initiator)
+    .bind(job_id)
     .fetch_optional(&mut *conn)
     .await
     .map_err(AppError::internal)?;
@@ -306,17 +313,32 @@ pub async fn mark_read(
 }
 
 /// Soft-delete a message. The row stays so the sequence has no hole.
+///
+/// Every condition that authorises the delete is in the `WHERE` clause rather
+/// than checked first and acted on second: the message must be in the named
+/// conversation, the caller must be the one who sent it, and it must not
+/// already be deleted. A check-then-act version would let two concurrent
+/// requests both pass the check, and would let a caller delete a message from
+/// a conversation they are merely a participant of by passing another
+/// conversation's message id.
+///
+/// Returns false when nothing matched, which the caller reports as 404 — the
+/// same answer a non-participant gets, so nobody learns a message exists by
+/// failing to delete it.
 pub async fn soft_delete(
     conn: &mut PgConnection,
+    conversation_id: Uuid,
     message_id: Uuid,
-    by: Uuid,
+    sender: Uuid,
 ) -> Result<bool, AppError> {
     let result = sqlx::query(
-        "UPDATE messages SET deleted_at = now(), deleted_by = $2, updated_at = now() \
-          WHERE id = $1 AND deleted_at IS NULL",
+        "UPDATE messages SET deleted_at = now(), deleted_by = $3, updated_at = now() \
+          WHERE id = $1 AND conversation_id = $2 AND sender_user_id = $3 \
+            AND deleted_at IS NULL",
     )
     .bind(message_id)
-    .bind(by)
+    .bind(conversation_id)
+    .bind(sender)
     .execute(&mut *conn)
     .await
     .map_err(AppError::internal)?;

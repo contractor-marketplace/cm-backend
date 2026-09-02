@@ -557,3 +557,217 @@ async fn messaging_endpoints_require_a_session_and_a_csrf_token(pool: PgPool) {
         StatusCode::FORBIDDEN
     );
 }
+
+/// A retracted message keeps its place, and only its sender may retract it.
+///
+/// The sequence is the poll cursor. If a delete removed the row, a client
+/// resuming from `after_seq` could not tell "seq 2 was deleted" from "seq 2 has
+/// not arrived yet", and would either stall or skip. So the row survives as a
+/// tombstone with its body replaced, and every seq around it is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deleted_message_keeps_its_place_in_the_sequence(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, mut owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router);
+    homeowner.register("homeowner@example.test").await;
+
+    let started = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+
+    let messages = format!("/v1/conversations/{conversation}/messages");
+    for body in ["first", "second, to be retracted", "third"] {
+        let sent = homeowner.post(&messages, json!({ "body": body })).await;
+        assert_eq!(sent.status, StatusCode::CREATED, "{:?}", sent.json);
+    }
+
+    let page = homeowner.get(&messages).await;
+    let second = page.json["messages"][1]["id"]
+        .as_str()
+        .expect("the second message")
+        .to_owned();
+
+    // The recipient may not delete what they did not write. Answered 404 rather
+    // than 403 so a probe learns nothing about what exists.
+    let refused = owner
+        .delete(&format!(
+            "/v1/conversations/{conversation}/messages/{second}"
+        ))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::NOT_FOUND,
+        "a recipient deleted the sender's message: {:?}",
+        refused.json
+    );
+
+    let removed = homeowner
+        .delete(&format!(
+            "/v1/conversations/{conversation}/messages/{second}"
+        ))
+        .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{:?}", removed.json);
+
+    // Three messages still, in the same order, with the middle one tombstoned.
+    let after = owner.get(&messages).await;
+    let rows = after.json["messages"].as_array().expect("messages");
+    assert_eq!(rows.len(), 3, "a delete left a hole in the sequence");
+
+    assert_eq!(rows[0]["seq"], 1);
+    assert_eq!(rows[0]["body"], "first");
+    assert_eq!(rows[0]["deleted"], false);
+
+    assert_eq!(rows[1]["seq"], 2, "the tombstone lost its place");
+    assert_eq!(rows[1]["body"], "[removed]");
+    assert_eq!(rows[1]["deleted"], true);
+
+    assert_eq!(rows[2]["seq"], 3);
+    assert_eq!(rows[2]["body"], "third");
+
+    // Deleting twice is not an error worth inventing state for, but it must not
+    // report success either — the row no longer matches.
+    let again = homeowner
+        .delete(&format!(
+            "/v1/conversations/{conversation}/messages/{second}"
+        ))
+        .await;
+    assert_eq!(again.status, StatusCode::NOT_FOUND);
+}
+
+/// A contractor can answer posted work, and the reply lands in the same thread.
+///
+/// The pair identifies a conversation, not the direction it opened from, so a
+/// homeowner who later writes to the same contractor must land in the thread
+/// that already exists rather than starting a second one beside it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_contractor_can_answer_a_posted_job(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+    let (contractor, mut owner) = claimed_and_open(&pool, &router).await;
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("poster@example.test").await;
+
+    let posted = homeowner
+        .post(
+            "/v1/jobs",
+            json!({
+                "title": "Rewire a 1920s duplex",
+                "description": "Knob and tube throughout. Needs a full rewire and a new panel.",
+                "trade": "electrician",
+                "build_type": "replacement",
+                "job_size": "Whole house, roughly 1,800 sq ft",
+                "postal_code": "90026",
+                "budget": { "min_cents": 800_000, "max_cents": 1_500_000 },
+                "timeline": "within_2_weeks"
+            }),
+        )
+        .await;
+    assert_eq!(posted.status, StatusCode::CREATED, "{:?}", posted.json);
+    let job = posted.json["id"].as_str().expect("job id").to_owned();
+
+    // Exactly one selector, or the request is meaningless.
+    let both = owner
+        .post(
+            "/v1/conversations",
+            json!({ "contractor_id": contractor, "job_id": job }),
+        )
+        .await;
+    assert_eq!(both.status, StatusCode::BAD_REQUEST, "{:?}", both.json);
+
+    // A homeowner cannot answer a job — that is the contractor's direction.
+    let wrong_side = homeowner
+        .post("/v1/conversations", json!({ "job_id": job }))
+        .await;
+    assert_eq!(wrong_side.status, StatusCode::FORBIDDEN);
+
+    let started = owner
+        .post("/v1/conversations", json!({ "job_id": job }))
+        .await;
+    assert_eq!(started.status, StatusCode::CREATED, "{:?}", started.json);
+    let conversation = started.json["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        started.json["contractor_id"],
+        contractor.to_string(),
+        "the thread is tagged with the writing contractor's listing, so the \
+         homeowner can see which business is contacting them"
+    );
+
+    let sent = owner
+        .post(
+            &format!("/v1/conversations/{conversation}/messages"),
+            json!({ "body": "Saw your rewire post — I do knob and tube. Free next week." }),
+        )
+        .await;
+    assert_eq!(sent.status, StatusCode::CREATED, "{:?}", sent.json);
+
+    // The homeowner has it, and replying needs nothing new.
+    let inbox = homeowner.get("/v1/conversations").await;
+    assert_eq!(inbox.json[0]["id"], conversation);
+    assert_eq!(inbox.json[0]["unread"], 1);
+
+    let replied = homeowner
+        .post(
+            &format!("/v1/conversations/{conversation}/messages"),
+            json!({ "body": "Yes please — what does the panel usually run?" }),
+        )
+        .await;
+    assert_eq!(replied.status, StatusCode::CREATED, "{:?}", replied.json);
+    assert_eq!(replied.json["seq"], 2);
+
+    // The other direction finds the same thread rather than forking one.
+    let from_the_other_side = homeowner
+        .post("/v1/conversations", json!({ "contractor_id": contractor }))
+        .await;
+    assert_eq!(
+        from_the_other_side.json["id"], conversation,
+        "opening from the other direction forked a second conversation"
+    );
+}
+
+/// A contractor with no approved listing cannot message posters.
+///
+/// Without this, any account that signed up could write to every homeowner who
+/// posted work, and the homeowner would have no licence to check them against.
+#[sqlx::test(migrations = "../../migrations")]
+async fn answering_a_job_needs_an_approved_listing(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("poster2@example.test").await;
+    let posted = homeowner
+        .post(
+            "/v1/jobs",
+            json!({
+                "title": "Replace a water heater",
+                "description": "The old one is leaking from the base and needs replacing soon.",
+                "trade": "other",
+                "build_type": "replacement",
+                "job_size": "One unit",
+                "postal_code": "90026",
+                "budget": "unsure",
+                "timeline": "asap"
+            }),
+        )
+        .await;
+    let job = posted.json["id"].as_str().expect("job id").to_owned();
+
+    let mut unclaimed = Client::new(router);
+    unclaimed
+        .register_contractor("nolisting@example.test")
+        .await;
+
+    let refused = unclaimed
+        .post("/v1/conversations", json!({ "job_id": job }))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "a contractor with no approved listing reached a homeowner: {:?}",
+        refused.json
+    );
+}

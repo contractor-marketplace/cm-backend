@@ -244,6 +244,17 @@ pub struct FirebaseConfig {
     pub emulator_host: Option<String>,
 }
 
+/// Outbound email, when configured. Absent means mail is queued but nothing
+/// delivers it — acceptable in development, a production gap in production.
+#[derive(Debug, Clone)]
+pub struct MailConfig {
+    /// The Resend API key.
+    pub resend_api_key: Secret<String>,
+    /// The From header, e.g. `Contractor Marketplace <no-reply@example.com>`.
+    /// Its domain must be verified in Resend or every send is refused.
+    pub from: String,
+}
+
 /// Database connection settings.
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
@@ -269,6 +280,43 @@ pub struct Config {
     /// `Config::production_gaps`, which is what stops an unset variable from
     /// quietly downgrading a live server to storage that vanishes on restart.
     pub job_photo_bucket: Option<String>,
+    /// Outbound email via Resend.
+    ///
+    /// Optional so development and tests run with an in-memory mailer and no
+    /// credentials. Production refuses to start without it — see
+    /// `Config::production_gaps` — because a live server that silently queues
+    /// sign-in codes nobody delivers is a server nobody can log in to.
+    pub mail: Option<MailConfig>,
+    /// How much each signal counts when the directory ranks a listing.
+    ///
+    /// Configurable because ranking is the one thing here that is tuned by
+    /// looking at results rather than reasoned to in advance, and a weight that
+    /// needs a redeploy to change does not get changed. Every value is a
+    /// fraction; they do not have to sum to anything, because the score
+    /// normalises by their total.
+    pub ranking: RankingConfig,
+}
+
+/// The ranking weights, one per reason a listing might rank well.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankingConfig {
+    pub rating: f32,
+    pub reviews: f32,
+    pub verified: f32,
+    pub claimed: f32,
+    pub completeness: f32,
+}
+
+impl Default for RankingConfig {
+    fn default() -> Self {
+        Self {
+            rating: 0.40,
+            reviews: 0.25,
+            verified: 0.20,
+            claimed: 0.05,
+            completeness: 0.10,
+        }
+    }
 }
 
 /// One thing wrong with the environment.
@@ -389,6 +437,25 @@ impl Config {
                 Some(Environment::Development) | None => LogFormat::Pretty,
                 Some(_) => LogFormat::Json,
             }),
+        };
+
+        let defaults = RankingConfig::default();
+        let ranking = RankingConfig {
+            rating: weight(&source, "CM_RANK_W_RATING", defaults.rating, &mut errors),
+            reviews: weight(&source, "CM_RANK_W_REVIEWS", defaults.reviews, &mut errors),
+            verified: weight(
+                &source,
+                "CM_RANK_W_VERIFIED",
+                defaults.verified,
+                &mut errors,
+            ),
+            claimed: weight(&source, "CM_RANK_W_CLAIMED", defaults.claimed, &mut errors),
+            completeness: weight(
+                &source,
+                "CM_RANK_W_COMPLETENESS",
+                defaults.completeness,
+                &mut errors,
+            ),
         };
 
         let max_connections = bounded_or_default::<u32>(
@@ -534,6 +601,43 @@ impl Config {
             });
         }
 
+        // Both-or-neither: a key with no From (or the reverse) is a variable
+        // someone meant to fill in, and half-configured mail should fail the
+        // deploy preflight rather than fail at the first send.
+        let mail = match (
+            read(&source, "CM_RESEND_API_KEY"),
+            read(&source, "CM_MAIL_FROM"),
+        ) {
+            (Some(key), Some(from)) if from.contains('@') => Some(MailConfig {
+                resend_api_key: Secret::new(key),
+                from,
+            }),
+            (Some(_), Some(_)) => {
+                errors.push(ConfigError::Invalid {
+                    key: "CM_MAIL_FROM",
+                    reason: "expected an email From header, for example \
+                             Name <no-reply@example.com>"
+                        .to_owned(),
+                });
+                None
+            }
+            (Some(_), None) => {
+                errors.push(ConfigError::Invalid {
+                    key: "CM_MAIL_FROM",
+                    reason: "is not set but CM_RESEND_API_KEY is".to_owned(),
+                });
+                None
+            }
+            (None, Some(_)) => {
+                errors.push(ConfigError::Invalid {
+                    key: "CM_RESEND_API_KEY",
+                    reason: "is not set but CM_MAIL_FROM is".to_owned(),
+                });
+                None
+            }
+            (None, None) => None,
+        };
+
         let trust_proxy_headers = match read(&source, "CM_TRUST_PROXY_HEADERS") {
             None => Some(false),
             Some(raw) => match raw.to_ascii_lowercase().as_str() {
@@ -556,6 +660,7 @@ impl Config {
         // Every `expect` below is unreachable: a `None` pushed an error, and a
         // non-empty error list returned above.
         Ok(Self {
+            ranking,
             environment: environment.expect("environment validated"),
             bind_addr: bind_addr.expect("bind_addr validated"),
             site_origin: site_origin.expect("site_origin validated"),
@@ -584,6 +689,7 @@ impl Config {
                 shutdown_grace_secs.expect("shutdown_grace validated"),
             ),
             job_photo_bucket: read(&source, "CM_JOB_PHOTO_BUCKET"),
+            mail,
         })
     }
 
@@ -599,6 +705,15 @@ impl Config {
             gaps.push(
                 "CM_JOB_PHOTO_BUCKET is not set, so job photos would be held in memory and \
                  lost on restart. Set it to the GCS bucket name."
+                    .to_owned(),
+            );
+        }
+
+        if self.environment == Environment::Production && self.mail.is_none() {
+            gaps.push(
+                "CM_RESEND_API_KEY / CM_MAIL_FROM are not set, so sign-in codes, password \
+                 resets and job alerts would be queued and never delivered. Set the Resend \
+                 API key and a From address on the verified sending domain."
                     .to_owned(),
             );
         }
@@ -655,6 +770,15 @@ impl Config {
             (
                 "trust_proxy_headers",
                 self.auth.trust_proxy_headers.to_string(),
+            ),
+            (
+                "mail",
+                match &self.mail {
+                    // The From address identifies the configuration; the key
+                    // stays redacted by never being read here at all.
+                    Some(mail) => mail.from.clone(),
+                    None => "(unset — mail is queued, never sent)".to_owned(),
+                },
             ),
             (
                 "google_sign_in",
@@ -723,6 +847,45 @@ where
                 reason: expected.to_owned(),
             });
             None
+        }
+    }
+}
+
+/// A ranking weight: a fraction, bounded so a mistyped value cannot silently
+/// dominate every other signal.
+///
+/// Zero is allowed and means "this reason does not count", which is a real
+/// thing an operator might want. Negative is not: a weight that subtracts would
+/// rank a well-reviewed listing below an unreviewed one, and there is no
+/// reading of the scoring rule where that is intended rather than a typo.
+fn weight(
+    source: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: f32,
+    errors: &mut Vec<ConfigError>,
+) -> f32 {
+    let Some(raw) = source(key).map(|value| value.trim().to_owned()) else {
+        return default;
+    };
+    if raw.is_empty() {
+        return default;
+    }
+
+    match raw.parse::<f32>() {
+        Ok(value) if value.is_finite() && (0.0..=1.0).contains(&value) => value,
+        Ok(_) => {
+            errors.push(ConfigError::Invalid {
+                key,
+                reason: "must be a number between 0 and 1".to_owned(),
+            });
+            default
+        }
+        Err(_) => {
+            errors.push(ConfigError::Invalid {
+                key,
+                reason: "must be a number between 0 and 1".to_owned(),
+            });
+            default
         }
     }
 }
@@ -1035,6 +1198,86 @@ mod tests {
         assert_eq!(
             config.database.url.expose(),
             "postgres://cmdev@127.0.0.1:5432/cm_dev"
+        );
+    }
+
+    /// Half-configured mail must fail the preflight, not the first send.
+    #[test]
+    fn mail_config_requires_the_key_and_the_from_address_together() {
+        let mut vars = minimal();
+        vars.push(("CM_RESEND_API_KEY", "re_test_key"));
+        let errors = Config::load(env(&vars)).expect_err("a key with no From should fail");
+        assert_eq!(errors.keys(), vec!["CM_MAIL_FROM"]);
+
+        let mut vars = minimal();
+        vars.push(("CM_MAIL_FROM", "Test <no-reply@example.com>"));
+        let errors = Config::load(env(&vars)).expect_err("a From with no key should fail");
+        assert_eq!(errors.keys(), vec!["CM_RESEND_API_KEY"]);
+
+        let mut vars = minimal();
+        vars.push(("CM_RESEND_API_KEY", "re_test_key"));
+        vars.push(("CM_MAIL_FROM", "Test <no-reply@example.com>"));
+        let config = Config::load(env(&vars)).expect("both set should load");
+        assert_eq!(
+            config.mail.expect("configured").from,
+            "Test <no-reply@example.com>"
+        );
+
+        let config = Config::load(env(&minimal())).expect("neither set should load");
+        assert!(config.mail.is_none(), "unset mail is a gap, not an error");
+    }
+
+    #[test]
+    fn a_from_address_without_an_at_sign_is_rejected() {
+        let mut vars = minimal();
+        vars.push(("CM_RESEND_API_KEY", "re_test_key"));
+        vars.push(("CM_MAIL_FROM", "not-an-address"));
+        let errors = Config::load(env(&vars)).expect_err("should fail");
+        assert_eq!(errors.keys(), vec!["CM_MAIL_FROM"]);
+    }
+
+    /// A live server that queues sign-in codes nobody delivers is a server
+    /// nobody can log in to; the gap has to be loud before deploy.
+    #[test]
+    fn unset_mail_is_a_production_gap_and_a_development_shrug() {
+        let mut vars = minimal();
+        vars.push(("CM_ENV", "production"));
+        vars.retain(|(k, _)| *k != "CM_SITE_ORIGIN");
+        vars.push(("CM_SITE_ORIGIN", "https://app.example.com"));
+        vars.push(("CM_JOB_PHOTO_BUCKET", "cm-photos"));
+        let config = Config::load(env(&vars)).expect("should load");
+
+        let gaps = config.production_gaps();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("CM_RESEND_API_KEY"), "{}", gaps[0]);
+
+        let config = Config::load(env(&minimal())).expect("should load");
+        assert!(
+            config.production_gaps().is_empty(),
+            "development has no gaps"
+        );
+    }
+
+    #[test]
+    fn the_redacted_summary_never_shows_the_resend_key() {
+        let mut vars = minimal();
+        vars.push(("CM_RESEND_API_KEY", "re_live_secret_key"));
+        vars.push(("CM_MAIL_FROM", "Test <no-reply@example.com>"));
+        let config = Config::load(env(&vars)).expect("should load");
+
+        let summary = config.redacted_summary();
+        assert_eq!(summary["mail"], "Test <no-reply@example.com>");
+        for value in summary.values() {
+            assert!(
+                !value.contains("re_live_secret_key"),
+                "the summary leaked the key: {value}"
+            );
+        }
+
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("re_live_secret_key"),
+            "debug output leaked the key: {debug}"
         );
     }
 }

@@ -14,14 +14,24 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
     Google,
+    Facebook,
 }
 
 impl Provider {
-    pub const ALL: [Self; 1] = [Self::Google];
-
+    /// Matches the `oauth_identities.provider` CHECK. Adding a variant without
+    /// a migration that widens that constraint fails at the insert, loudly.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Google => "google",
+            Self::Facebook => "facebook",
+        }
+    }
+
+    /// How the provider names itself to a user, for messages they will read.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Google => "Google",
+            Self::Facebook => "Facebook",
         }
     }
 }

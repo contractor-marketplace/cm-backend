@@ -25,8 +25,9 @@ profile. And the front end never offers an action the account cannot take.
 
 There is no conversion. An account is one side of the marketplace or the other
 for its whole life, so somebody who registers as the wrong one needs a new
-account under a different address — which, with no password reset and no email
-verification, is worth saying on the form. It is.
+account under a different address. The form says so, which matters more now
+that registration requires a real inbox: the emailed sign-in code means the
+address on a mistaken account is one the person actually holds.
 
 Google sign-in cannot ask, because the account is created from a token rather
 than a form; it defaults to homeowner, the side that cannot claim. Enabling it
@@ -64,8 +65,8 @@ companion that proves the backups restore.
 |---|---|---|
 | **CSLB column names** | The importer accepts several plausible spellings per field and **fails loudly listing what it saw** when a required one is missing. It has not been run against a real CSLB download in this environment. | Run `import-cslb --dry-run` against the real file. If it refuses, add the actual column name to `FIELD_ALIASES` in `crates/cm-domain/src/import.rs`. One line per column. |
 | **CSLB download** | Manual. The portal serves files through an ASP.NET postback, not a stable URL. | Nothing, unless unattended refresh is wanted. Then a small fetcher that round-trips the viewstate — deliberately not written, because it would be a brittle dependency load-bearing on a cron nobody watches. |
-| **ZIP centroids** | `deploy/data/zcta_la_county.csv` carries 25 LA County ZIPs, taken from the existing front end. | Load the full Census ZCTA gazetteer for complete county coverage. A contractor in a ZIP with no centroid is *unlocated* and absent from distance search — `cm-server prune --report-only` and the unlocated count make that visible. |
-| **Password reset / email verification** | The `auth_tokens` table exists; no endpoint issues or consumes a token. | An SMTP path, then the two flows. Until then a user who forgets their password needs an operator. |
+| **ZIP centroids** | Done. `deploy/data/zcta_ca.csv` carries all 1,763 California ZCTAs from the 2020 Census gazetteer. On a 3,000-row slice of the real register this took ZIP coverage from 25 of 340 to 271, and located contractors from 9% to 96%. | Nothing, with one standing caveat: 69 of those 340 ZIPs have **no ZCTA anywhere in the US**. They are PO-box and business-only ZIPs (90209, 90607-90609, 90733), and the Census only draws a ZCTA around a populated area. Contractors there are located by geocoding their street address instead; a job posted in one has no location at all, because jobs carry no address by design. Watch the unlocated count. |
+| **Password reset / email verification** | Done, via Resend. A 6-digit emailed code signs people in from an unrecognised browser and is what verifies the address; password reset is an emailed single-use link. | Set `CM_RESEND_API_KEY` and `CM_MAIL_FROM` in `/etc/cm-backend/env` and start `cm-mail-worker` — production refuses to boot without them. Confirm SPF+DKIM are verified for the sending domain in Resend. |
 | **Apple sign-in** | Not implemented, by decision. | Direct OIDC, never through Firebase, if a native iOS app ships. |
 | **Firebase against a real project** | Verification is tested against a locally generated key pair and in emulator mode. Google's live key document has not been fetched here. | Point `FIREBASE_PROJECT_ID` at the real project and sign in once. The failure mode is loud: verification fails closed. |
 | **CI** | `.github/workflows/ci.yml` is written and has never run on GitHub. | Push and watch it. |

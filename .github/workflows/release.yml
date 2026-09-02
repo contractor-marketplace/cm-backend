@@ -1,0 +1,73 @@
+name: Release binary
+
+# Builds the deployable `cm-server` binary and keeps it as an artifact.
+#
+# Separate from CI on purpose: CI proves the tree is correct, this produces the
+# one file that goes on the box. Running them together would mean every push
+# paid for a release build it never uses.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+    # Feature branches build too, because a binary that only exists after a
+    # merge cannot be tested before one. `workflow_dispatch` alone is not
+    # enough: GitHub only offers it for workflows already on the default
+    # branch, which a branch this workflow was written on is not.
+    branches:
+      - "search/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    # Pinned to 22.04 to match the production VM, and it must stay pinned.
+    # glibc is forward- but not backward-compatible: a binary linked against
+    # ubuntu-latest (24.04, glibc 2.39) dies on the box (glibc 2.35) with
+    # "GLIBC_2.38 not found" before main() runs. The deployed binary links
+    # nothing but libc and libgcc_s, so this is the only compatibility axis.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same toolchain resolution as ci.yml: read from rust-toolchain.toml so
+      # the release build and the checks that gate it use one compiler.
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          pinned="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml)"
+          test -n "$pinned" || { echo "rust-toolchain.toml does not pin a channel"; exit 1; }
+          rustup toolchain install "$pinned" --profile minimal
+          rustc --version | grep -Fq "$pinned" \
+            || { echo "active rustc is not the pinned $pinned"; exit 1; }
+
+      - uses: Swatinem/rust-cache@v2
+
+      # DATABASE_URL is empty for the same reason CI builds that way: a
+      # compile-time-checked query landing here would make the release build
+      # depend on a database that will not exist at deploy time.
+      - name: Build
+        run: cargo build --release -p cm-server --locked
+        env:
+          DATABASE_URL: ""
+
+      # Fails the build rather than the deploy if the binary picks up a
+      # dependency the box does not carry.
+      - name: Report linkage
+        run: |
+          set -euo pipefail
+          ldd target/release/cm-server
+          ldd target/release/cm-server | grep -qi 'ssl\|crypto' \
+            && { echo "unexpected OpenSSL linkage; the box has none"; exit 1; } || true
+          objdump -T target/release/cm-server \
+            | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cm-server-${{ github.sha }}
+          path: target/release/cm-server
+          retention-days: 14
+          if-no-files-found: error

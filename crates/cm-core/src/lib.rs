@@ -12,7 +12,7 @@ pub mod telemetry;
 
 pub use config::{
     AuthConfig, Config, ConfigError, ConfigErrors, DatabaseConfig, Environment, FirebaseConfig,
-    LogFormat, Origin, Secret,
+    LogFormat, MailConfig, Origin, RankingConfig, Secret,
 };
 pub use error::{AppError, BoxError};
 pub use id::new_id;

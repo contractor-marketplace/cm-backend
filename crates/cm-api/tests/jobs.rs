@@ -787,3 +787,589 @@ async fn cancelling_a_job_removes_its_photos(pool: PgPool) {
         .expect("count");
     assert_eq!(kept, 1, "a completed job keeps its record");
 }
+
+/// A closed job can be put back on the board; a cancelled one cannot.
+///
+/// The asymmetry is the point. Closing takes nothing away, so it is safe to
+/// undo — a poster who closed in haste, or whose contractor fell through, gets
+/// their listing back. Cancelling deletes the photos from the object store, and
+/// nothing can undelete them, so reopening would republish a job quietly
+/// missing the pictures a contractor was meant to see.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_closed_job_can_be_reopened_but_a_cancelled_one_cannot(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("reopen@example.test").await;
+
+    let job = homeowner.post("/v1/jobs", a_job()).await.json["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // Closed, then off the public board.
+    let closed = homeowner
+        .post(
+            &format!("/v1/jobs/{job}/close"),
+            json!({ "status": "closed" }),
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT, "{:?}", closed.json);
+    assert_eq!(
+        Client::new(router.clone())
+            .get(&format!("/v1/jobs/{job}"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "a closed job stays on the public board"
+    );
+
+    let reopened = homeowner
+        .post(&format!("/v1/jobs/{job}/reopen"), json!({}))
+        .await;
+    assert_eq!(
+        reopened.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        reopened.json
+    );
+
+    let public = Client::new(router.clone())
+        .get(&format!("/v1/jobs/{job}"))
+        .await;
+    assert_eq!(
+        public.status,
+        StatusCode::OK,
+        "reopening did not republish it"
+    );
+    assert_eq!(public.json["status"], "open");
+
+    // Reopening an already-open job changes nothing and says so.
+    let again = homeowner
+        .post(&format!("/v1/jobs/{job}/reopen"), json!({}))
+        .await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+
+    // Cancelled is a one-way door.
+    let cancelled = homeowner
+        .post(
+            &format!("/v1/jobs/{job}/close"),
+            json!({ "status": "cancelled" }),
+        )
+        .await;
+    assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
+
+    let refused = homeowner
+        .post(&format!("/v1/jobs/{job}/reopen"), json!({}))
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "a cancelled job was reopened, and its photos are already gone: {:?}",
+        refused.json
+    );
+
+    // Somebody else's job is not found, not forbidden.
+    let mut other = Client::new(router);
+    other.register("nosy@example.test").await;
+    assert_eq!(
+        other
+            .post(&format!("/v1/jobs/{job}/reopen"), json!({}))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// Photos reach every list, not only the detail page.
+///
+/// They did not: `detail` attached them and `list` and `mine` did not, so the
+/// board served `photos: []` for a job that had pictures. A contractor scanning
+/// the board saw a job with no photos and scrolled past it, and the poster's
+/// own list could not count them either. Nothing failed — the field was just
+/// always empty, which is the kind of bug that survives a long time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn photos_reach_the_board_and_the_posters_list(pool: PgPool) {
+    seed_directory(&pool).await;
+    let router = router(pool.clone());
+
+    let mut homeowner = Client::new(router.clone());
+    homeowner.register("gallery@example.test").await;
+
+    let job = homeowner.post("/v1/jobs", a_job()).await.json["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    for _ in 0..2 {
+        let uploaded = homeowner
+            .post_file(&format!("/v1/jobs/{job}/photos"), a_tiny_png())
+            .await;
+        assert_eq!(uploaded.status, StatusCode::CREATED, "{:?}", uploaded.json);
+    }
+
+    // The public board, which is where this was broken.
+    let board = Client::new(router).get("/v1/jobs").await;
+    let listed = &board.json["jobs"][0];
+    assert_eq!(listed["id"], job);
+    assert_eq!(
+        listed["photos"].as_array().map(Vec::len),
+        Some(2),
+        "the board served a job with photos as though it had none: {:?}",
+        listed["photos"]
+    );
+    assert!(
+        listed["photos"][0]["url"]
+            .as_str()
+            .is_some_and(|u| !u.is_empty()),
+        "a photo on the board carries no URL, so it cannot render"
+    );
+
+    // And the poster's own list.
+    let mine = homeowner.get("/v1/me/jobs").await;
+    assert_eq!(mine.json[0]["photos"].as_array().map(Vec::len), Some(2));
+}
+
+/// The board and the map must agree about which jobs exist, and the map must
+/// show all of them rather than the page the board happens to be on.
+///
+/// Deriving pins from the loaded list is the bug this endpoint exists to fix:
+/// a board page holds twenty jobs, so a map drawn from it showed twenty pins
+/// however many matched — a map of the county displaying a fifth of the work
+/// on it, with nothing to say so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_jobs_map_shows_every_match_not_the_current_page(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("mapper@example.com").await;
+    let poster = common::user_id(&pool, "mapper@example.com").await;
+    common::seed_jobs(&pool, poster, 25, "90042").await;
+
+    let mut client = Client::new(router(pool));
+
+    // One page of the board.
+    let board = client.get("/v1/jobs?limit=5").await;
+    assert_eq!(board.status, StatusCode::OK, "{:?}", board.json);
+    assert_eq!(board.json["jobs"].as_array().expect("array").len(), 5);
+
+    let map = client.get("/v1/jobs/map").await;
+    assert_eq!(map.status, StatusCode::OK, "{:?}", map.json);
+    let points = map.json["points"].as_array().expect("array");
+    assert_eq!(points.len(), 25, "the map shows every match, not a page");
+    assert_eq!(map.json["truncated"], serde_json::json!(false));
+
+    for point in points {
+        assert!(point["lat"].is_number(), "a pin needs a position: {point}");
+        assert!(point["lon"].is_number());
+        // The board's payload is not the map's: a pin needs a label, not a
+        // description and a photo set, five hundred times over.
+        assert!(point.get("description").is_none(), "{point}");
+    }
+}
+
+/// The same predicate, so a filter narrows both surfaces identically.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_jobs_map_shares_the_boards_filters(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("filters@example.com").await;
+    let poster = common::user_id(&pool, "filters@example.com").await;
+    common::seed_jobs(&pool, poster, 6, "90042").await;
+
+    let mut client = Client::new(router(pool));
+
+    let matching = client.get("/v1/jobs/map?zip=90042").await;
+    assert_eq!(matching.json["points"].as_array().expect("array").len(), 6);
+
+    let elsewhere = client.get("/v1/jobs/map?zip=90401").await;
+    assert!(elsewhere.json["points"]
+        .as_array()
+        .expect("array")
+        .is_empty());
+}
+
+/// A dropped filter is reported on the map exactly as it is on the board.
+/// Both parse the same query with the same function, and only one of them used
+/// to say so — which reads as the map disagreeing rather than as one filter
+/// being ignored by both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn both_job_surfaces_report_a_dropped_filter(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool));
+
+    for path in ["/v1/jobs?zip=banana", "/v1/jobs/map?zip=banana"] {
+        let response = client.get(path).await;
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        let empty = Vec::new();
+        let ignored: Vec<&str> = response.json["ignored_filters"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            ignored.contains(&"zip"),
+            "{path} did not report it: {:?}",
+            response.json
+        );
+    }
+}
+
+/// The board has never had a search box, so a contractor looking for bathroom
+/// work read the list. Text now matches the title and the description, and an
+/// everyday word reaches the trade it means through the same vocabulary the
+/// directory uses — no job is titled "C-36".
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_board_can_be_searched_by_text_and_by_meaning(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    {
+        let mut conn = pool.acquire().await.expect("connection");
+        cm_db::repo::reference::seed_trade_aliases(&mut conn)
+            .await
+            .expect("aliases");
+    }
+
+    let mut client = Client::new(router(pool.clone()));
+    client.register("searcher@example.com").await;
+    let poster = common::user_id(&pool, "searcher@example.com").await;
+    common::seed_jobs(&pool, poster, 3, "90042").await;
+
+    // A job whose title says what it is.
+    sqlx::query(
+        "UPDATE jobs SET title = 'Replace the water heater in the garage' \
+          WHERE id = (SELECT id FROM jobs ORDER BY created_at LIMIT 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("retitle");
+
+    let mut client = Client::new(router(pool));
+
+    let by_text = client.get("/v1/jobs?q=water+heater").await;
+    assert_eq!(by_text.status, StatusCode::OK, "{:?}", by_text.json);
+    let titles: Vec<&str> = by_text.json["jobs"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|j| j["title"].as_str())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.contains("water heater")),
+        "{titles:?}"
+    );
+
+    // Nonsense matches nothing, which is the guard against a change that makes
+    // everything match.
+    let nothing = client.get("/v1/jobs?q=zzzzznotarealjob").await;
+    assert!(nothing.json["jobs"].as_array().expect("array").is_empty());
+}
+
+/// Every ordering has to page correctly, for the reason the directory's did
+/// not: a cursor that carries the posting time while the ORDER BY leads with a
+/// budget resumes from the wrong place and drops rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_board_sort_pages_through_the_jobs_exactly_once(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("pager@example.com").await;
+    let poster = common::user_id(&pool, "pager@example.com").await;
+    common::seed_jobs(&pool, poster, 12, "90042").await;
+
+    // A spread of budgets, so a budget ordering has something to order.
+    sqlx::query(
+        "UPDATE jobs SET budget_min_cents = 100000, \
+                         budget_max_cents = 100000 + (extract(epoch from created_at)::bigint % 7) * 100000",
+    )
+    .execute(&pool)
+    .await
+    .expect("budgets");
+
+    let mut client = Client::new(router(pool));
+
+    for sort in ["", "&sort=newest", "&sort=budget"] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..20 {
+            let path = match &cursor {
+                Some(value) => format!("/v1/jobs?limit=3{sort}&cursor={value}"),
+                None => format!("/v1/jobs?limit=3{sort}"),
+            };
+            let page = client.get(&path).await;
+            assert_eq!(page.status, StatusCode::OK, "{path}: {:?}", page.json);
+
+            for job in page.json["jobs"].as_array().expect("array") {
+                seen.push(job["id"].as_str().expect("id").to_owned());
+            }
+            match page.json["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(
+            seen.len(),
+            unique.len(),
+            "{sort:?} repeated a job: {seen:?}"
+        );
+        assert_eq!(
+            seen.len(),
+            12,
+            "{sort:?} paged through {} of 12",
+            seen.len()
+        );
+    }
+
+    // A sort nobody offers is a 400, not a silently different order.
+    assert_eq!(
+        client.get("/v1/jobs?sort=cheapest").await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// Counts that disagree with the list beside them are worse than no counts,
+/// because they are read as the list being wrong. They come from one query
+/// under the same predicate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_facet_counts_agree_with_the_results(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("facets@example.com").await;
+    let poster = common::user_id(&pool, "facets@example.com").await;
+    common::seed_jobs(&pool, poster, 9, "90042").await;
+
+    let mut client = Client::new(router(pool));
+
+    let all = client.get("/v1/jobs?limit=50").await;
+    assert_eq!(all.status, StatusCode::OK, "{:?}", all.json);
+
+    // The total is the count of everything matching, not of what was loaded.
+    // The board could only ever count its own rows, so it said "20+".
+    let total = all.json["facets"]["total"].as_i64().expect("total");
+    assert_eq!(total, 9);
+    assert_eq!(all.json["jobs"].as_array().expect("array").len(), 9);
+
+    // Every facet count must be reproducible by applying that facet.
+    let timelines = all.json["facets"]["timeline"]
+        .as_array()
+        .expect("array")
+        .clone();
+    assert!(!timelines.is_empty(), "{:?}", all.json["facets"]);
+
+    for facet in timelines {
+        let value = facet["value"].as_str().expect("value");
+        let count = facet["count"].as_i64().expect("count");
+
+        let filtered = client
+            .get(&format!("/v1/jobs?limit=50&timeline={value}"))
+            .await;
+        assert_eq!(filtered.status, StatusCode::OK, "{:?}", filtered.json);
+        assert_eq!(
+            filtered.json["jobs"].as_array().expect("array").len() as i64,
+            count,
+            "the {value} facet promised {count}"
+        );
+        assert_eq!(
+            filtered.json["facets"]["total"].as_i64().expect("total"),
+            count
+        );
+    }
+}
+
+/// A facet value nobody offers is dropped and named, like every other optional
+/// filter, rather than failing a page somebody reached from a shared link.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_junk_facet_is_dropped_and_reported(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool));
+
+    let response = client
+        .get("/v1/jobs?timeline=eventually&build_type=knocking_it_down&budget_min=lots")
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+
+    let ignored: Vec<&str> = response.json["ignored_filters"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+
+    for expected in ["timeline", "build_type", "budget_min"] {
+        assert!(
+            ignored.contains(&expected),
+            "{expected} not reported: {ignored:?}"
+        );
+    }
+}
+
+/// The personalised feed lives behind a session by construction, not behind a
+/// flag on the public board. The board's whole first paragraph is that it has
+/// no notion of who is asking, and a branch that served a different order to a
+/// signed-in caller would be exactly the thing it refuses to have.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lead_feed_needs_a_claimed_listing(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut anonymous = Client::new(router(pool.clone()));
+
+    // No session at all.
+    assert_eq!(
+        anonymous.get("/v1/me/jobs/feed").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // A signed-in account with no approved claim has no listing to fit work
+    // to, so there is no feed for it.
+    let mut homeowner = Client::new(router(pool.clone()));
+    homeowner.register("nobody@example.com").await;
+    assert_eq!(
+        homeowner.get("/v1/me/jobs/feed").await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // The public board is unchanged for everybody.
+    assert_eq!(anonymous.get("/v1/jobs").await.status, StatusCode::OK);
+}
+
+/// Work in the contractor's own trade comes first. It is the strongest signal
+/// there is — a plumber wants plumbing work — and the feed is worth nothing if
+/// it does not get that right.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_feed_leads_with_work_in_the_contractors_trade(pool: PgPool) {
+    common::seed_directory(&pool).await;
+
+    let mut contractor = Client::new(router(pool.clone()));
+    contractor.register_contractor("plumber@example.com").await;
+    let user = common::user_id(&pool, "plumber@example.com").await;
+    // Stillwater Plumbing is the C-36 in the seed set.
+    let listing = common::contractor_id(&pool, "771204").await;
+    common::force_claim(&pool, listing, user).await;
+
+    // Somebody else posts a spread of work.
+    let mut homeowner = Client::new(router(pool.clone()));
+    homeowner.register("poster@example.com").await;
+    let poster = common::user_id(&pool, "poster@example.com").await;
+    common::seed_jobs(&pool, poster, 6, "90042").await;
+
+    // Half of it is plumbing, and it is the older half — so ordering by
+    // anything but fit would put the other half first.
+    sqlx::query(
+        "UPDATE jobs SET trade_id = (SELECT id FROM trades WHERE slug = 'plumber'), \
+                         created_at = now() - interval '5 days' \
+          WHERE id IN (SELECT id FROM jobs ORDER BY created_at LIMIT 3)",
+    )
+    .execute(&pool)
+    .await
+    .expect("retrade");
+
+    let feed = contractor.get("/v1/me/jobs/feed?limit=6").await;
+    assert_eq!(feed.status, StatusCode::OK, "{:?}", feed.json);
+
+    let trades: Vec<&str> = feed.json["jobs"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|job| job["trade"].as_str().unwrap_or("none"))
+        .collect();
+
+    assert_eq!(
+        &trades[..3],
+        &["plumber", "plumber", "plumber"],
+        "the contractor's own trade must lead: {trades:?}"
+    );
+
+    // And the plain queue is still available, ordered by nothing but time.
+    let newest = contractor.get("/v1/me/jobs/feed?sort=newest&limit=6").await;
+    let newest_trades: Vec<&str> = newest.json["jobs"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|job| job["trade"].as_str().unwrap_or("none"))
+        .collect();
+    assert_ne!(
+        newest_trades, trades,
+        "sort=newest must not be the fit order"
+    );
+}
+
+/// Every page recorded is a page that can be judged later. A golden set says
+/// whether search finds the right things; only this says whether anybody
+/// opened them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn showing_a_page_records_what_was_on_it(pool: PgPool) {
+    common::seed_directory(&pool).await;
+    let mut client = Client::new(router(pool.clone()));
+    client.register("watcher@example.com").await;
+    let poster = common::user_id(&pool, "watcher@example.com").await;
+    common::seed_jobs(&pool, poster, 4, "90042").await;
+
+    let mut client = Client::new(router(pool.clone()));
+    assert_eq!(client.get("/v1/jobs?limit=3").await.status, StatusCode::OK);
+    assert_eq!(
+        client.get("/v1/contractors?limit=2").await.status,
+        StatusCode::OK
+    );
+
+    let rows: Vec<(String, String, i32)> = sqlx::query_as(
+        "SELECT surface, kind, position FROM search_events ORDER BY surface, position",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("events");
+
+    let jobs: Vec<i32> = rows
+        .iter()
+        .filter(|(surface, _, _)| surface == "jobs")
+        .map(|(_, _, position)| *position)
+        .collect();
+    let directory: Vec<i32> = rows
+        .iter()
+        .filter(|(surface, _, _)| surface == "directory")
+        .map(|(_, _, position)| *position)
+        .collect();
+
+    // One row per result, positioned one-based: position 1 is the top of the
+    // page, which is what every rate is read against.
+    assert_eq!(jobs, vec![1, 2, 3]);
+    assert_eq!(directory, vec![1, 2]);
+    assert!(rows.iter().all(|(_, kind, _)| kind == "impression"));
+}
+
+/// A conversation started from a job records which job. It resolved the
+/// posting to its poster and then forgot it, which left "how many contractors
+/// have replied to this" — the signal the feed most needs — underivable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn replying_to_a_job_records_which_job(pool: PgPool) {
+    common::seed_directory(&pool).await;
+
+    let mut homeowner = Client::new(router(pool.clone()));
+    homeowner.register("owner@example.com").await;
+    let poster = common::user_id(&pool, "owner@example.com").await;
+    let jobs = common::seed_jobs(&pool, poster, 1, "90042").await;
+    let job = jobs[0];
+
+    let mut contractor = Client::new(router(pool.clone()));
+    contractor.register_contractor("replier@example.com").await;
+    let user = common::user_id(&pool, "replier@example.com").await;
+    let listing = common::contractor_id(&pool, "771204").await;
+    common::force_claim(&pool, listing, user).await;
+
+    let started = contractor
+        .post("/v1/conversations", serde_json::json!({ "job_id": job }))
+        .await;
+    assert_eq!(started.status, StatusCode::CREATED, "{:?}", started.json);
+
+    let recorded: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT job_id FROM conversations WHERE job_id IS NOT NULL")
+            .fetch_optional(&pool)
+            .await
+            .expect("query");
+
+    assert_eq!(
+        recorded,
+        Some(job),
+        "the conversation must remember its job"
+    );
+}

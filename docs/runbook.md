@@ -2,6 +2,10 @@
 
 Everything an operator needs that is not obvious from the code.
 
+For what the system is made of and why — the stack, the crates, the schema
+invariants, the pipelines — see [`architecture.md`](architecture.md). This file
+is the procedure; that one is the map.
+
 ## First deploy, in order
 
 ```bash
@@ -39,16 +43,114 @@ CM_SITE_ORIGIN=https://app.example.com
 CM_HASH_PEPPER=$(openssl rand -base64 48)
 CM_ENV=production
 CM_TRUST_PROXY_HEADERS=true
+CM_JOB_PHOTO_BUCKET=cm-job-photos
+# Mail. Production refuses to start without both: without them, sign-in codes
+# would be queued and never delivered, and nobody could log in.
+CM_RESEND_API_KEY=re_...
+CM_MAIL_FROM=Contractor Marketplace <no-reply@contractorsmarketplace.co>
 ENV
 chown root:cm /etc/cm-backend/env && chmod 0640 /etc/cm-backend/env
 
 # 4. Schema, then reference data, then the service.
+# check-config now also reports production gaps and exits 2 on them, so a
+# missing bucket or mail key fails here rather than at the first send.
 cm-server check-config          # proves the file parses before anything restarts
 DATABASE_URL=postgres://cm_migrate:...@127.0.0.1/cm cm-server migrate
-cm-server seed-trades
-cm-server load-regions --file deploy/data/zcta_la_county.csv --source demo_zip_centroids
-systemctl enable --now cm-server cm-geocode-worker cm-verification.timer
+cm-server seed-trades          # trades, their aliases, and re-derives contractor trades
+cm-server load-regions --file deploy/data/zcta_ca.csv --source census_2020_gazetteer
+# Then the place hierarchy — see "Loading places" below. Order matters:
+# load-places reads the ZIP rows load-regions writes.
+systemctl enable --now cm-server cm-geocode-worker cm-mail-worker \
+                       cm-verification.timer cm-job-alerts.timer
 ```
+
+## Mail
+
+Every email leaves through the outbox, so "is mail working" is one query:
+
+```sql
+SELECT status, count(*) FROM email_outbox GROUP BY status;
+```
+
+`queued` climbing while `sent` does not means the worker is down or Resend is
+refusing; `last_error` on a failed row says which. A row is retried with
+exponential backoff for eight attempts before it is given up on, and the outbox
+row's id is the provider idempotency key, so restarting the worker mid-batch
+cannot double-send.
+
+```bash
+journalctl -u cm-mail-worker -f            # sends, failures, stall recoveries
+systemctl start cm-job-alerts              # run the weekly digest by hand
+systemctl list-timers cm-job-alerts.timer  # when it next fires (Mondays)
+```
+
+**Deliverability.** The sending domain in `CM_MAIL_FROM` must show SPF and DKIM
+verified in the Resend dashboard, and a DMARC record should exist
+(`p=none; rua=...` is enough to start). After the first real send, open the
+message in Gmail → "Show original" and confirm SPF, DKIM and DMARC all PASS. Job
+alerts carry `List-Unsubscribe` and `List-Unsubscribe-Post`, which Gmail and
+Yahoo require of bulk senders; the auth emails are transactional and do not.
+
+## Loading places
+
+Cities, counties, and which ZIP codes belong to them. Four files, all published
+by the Census, all plain text, all public domain.
+
+They are **not vendored into the repository**. Reference data belongs to its
+source: the Census republishes annually as cities file boundary changes through
+the [Boundary and Annexation Survey](https://www.census.gov/programs-surveys/bas.html),
+and a copy in git is a copy that silently goes stale. Download, load, delete.
+
+```bash
+cd /tmp && mkdir -p census && cd census
+
+# Names, Census class (C* legally incorporated, U* census-designated) and county.
+curl -sO https://www2.census.gov/geo/docs/reference/codes2020/national_place2020.txt
+
+# Interior points — a coordinate guaranteed to fall inside the place, which a
+# computed centroid is not for a concave city.
+curl -sO https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2024_Gazetteer/2024_Gaz_place_national.zip
+curl -sO https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2024_Gazetteer/2024_Gaz_counties_national.zip
+unzip -oq '*.zip'
+
+# ZIP-to-place, with the land area each pair shares. The Census already
+# intersected the boundaries; this is a read, not a computation.
+curl -sO https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/tab20_zcta520_place20_natl.txt
+
+cm-server load-places \
+  --places       national_place2020.txt \
+  --place-points 2024_Gaz_place_national.txt \
+  --counties     2024_Gaz_counties_national.txt \
+  --zcta-places  tab20_zcta520_place20_natl.txt \
+  --state CA
+```
+
+California loads 58 counties, 1,610 places and ~2,800 memberships in about
+three seconds. Idempotent on `(kind, code)` — the Census GEOID — so re-running
+after a new vintage updates in place.
+
+Three numbers in the output are worth reading rather than skipping:
+
+- **skipped below 0.5% of the ZIP** — pairs where two boundaries merely graze.
+  Burbank and 90068 share 0.01 km², 0.0% of either, and without the threshold a
+  Hollywood Hills ZIP would be "in Burbank". Raise `--min-share` if a real
+  membership is ever dropped; the smallest genuine one in Los Angeles County is
+  far above it.
+- **ZIP name(s) superseded** — a curated ZIP label that only repeated the city
+  it sits in. Twelve of the twenty-five hand-curated names are cities, not
+  neighbourhoods (Burbank, Pasadena, Santa Monica…), and the city row is
+  strictly better: it knows its county and holds all of its ZIPs. The thirteen
+  real neighbourhoods — Silver Lake, Eagle Rock, Venice, Van Nuys — are
+  untouched, because the Census has no record of them and they are what people
+  actually type.
+- **no gazetteer point** — a place named in one file and absent from the other.
+  Skipped rather than given a guessed coordinate.
+
+**Supply ranking.** `load-places` also counts listings per region, and
+`recompute-verification` refreshes it nightly. That count is what orders place
+suggestions, and it is what makes a statewide index safe on a Los Angeles
+corpus: "san" offers San Pedro and San Gabriel ahead of San Francisco, because
+those are the ones a homeowner can actually get a contractor from.
 
 ## The order that matters
 
@@ -106,17 +208,53 @@ search, and silently so.
 
 ## Backups
 
+Installed as `cm-backup.timer`, nightly at 03:30 UTC — ahead of `cm-prune`
+(04:15), so the night's backup captures the database as the day left it rather
+than as housekeeping rewrote it.
+
 ```bash
-CM_BACKUP_RECIPIENT=age1... deploy/backup.sh          # nightly
-CM_BACKUP_IDENTITY=/root/backup.key deploy/restore-verify.sh   # weekly
+systemctl list-timers cm-backup.timer
+systemctl start cm-backup.service        # take one now
+journalctl -u cm-backup.service -n 20    # why the last one failed
+gcloud storage ls -l gs://cm-db-backups-6b1e669f/daily/
 ```
 
-`restore-verify.sh` restores the newest backup into a scratch database and
-checks the migration ledger. Run it on a timer. A backup that has never been
-restored is a hope.
+The unit runs `backup.sh` and then copies the result off the host, which is the
+half the script deliberately leaves to the site. Both steps are `ExecStart`
+lines, so a failed upload fails the unit rather than passing quietly with a
+local-only backup.
 
-**Copy backups off this host.** The script says so and does not do it: the
-destination is site-specific.
+**Configuration** lives in `/etc/cm-backup/env`, and the age identity beside it
+in `/etc/cm-backup/identity.txt` (0400, owned by `postgres`). Deliberately not
+`/etc/cm-backend/`: that directory is `root:cm` because it holds the
+application's database password, and letting `postgres` read the backup key out
+of it would hand the backup user the app's credentials as a side effect.
+
+**Restores are verified, not assumed.** `restore-verify.sh` decrypts the newest
+backup into a scratch database, checks the migration ledger and drops it again:
+
+```bash
+cd /tmp && sudo -u postgres bash -c 'set -a; . /etc/cm-backup/env; set +a; restore-verify.sh'
+# restore verified from cm-20260831T010156Z.dump.age: migration 24, 30 tables, 0 dirty
+```
+
+Run it from a directory `postgres` can read — it uses `find`, which fails
+trying to restore a working directory it was never allowed into.
+
+Two retention windows, and they are not the same number: 30 days on the box
+(`CM_BACKUP_KEEP_DAYS`), 90 in the bucket (a lifecycle rule). The bucket is the
+one that matters; the local copy exists so `restore-verify.sh` has something
+close at hand.
+
+**The identity file is the whole backup.** It never leaves the box, which is the
+point — the bucket is off-host and therefore untrusted, the box is not — but it
+also means losing the box loses every backup taken with that key. Copy
+`/etc/cm-backup/identity.txt` somewhere durable and outside GCP.
+
+**`gsutil` must be the apt build, never the snap.** The snap cannot start under
+`NoNewPrivileges=true`: snap-confine wants `cap_dac_override` and exits 1 before
+transferring anything. `/snap/bin` comes first in the default PATH, so the unit
+names `/usr/bin/gcloud` explicitly.
 
 ## When something is wrong
 

@@ -35,6 +35,10 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/auth/logout-all", post(handlers::auth::logout_all))
         .route("/v1/auth/password", post(handlers::auth::change_password))
         .route("/v1/auth/link/google", post(handlers::auth::link_google))
+        .route(
+            "/v1/auth/link/facebook",
+            post(handlers::auth::link_facebook),
+        )
         // Homeowner profile.
         .route(
             "/v1/me/homeowner-profile",
@@ -43,10 +47,23 @@ pub fn build(state: AppState) -> Router {
         // Jobs a homeowner posts. The board itself is public; these are not.
         .route("/v1/jobs", post(handlers::jobs::post_job))
         .route("/v1/me/jobs", get(handlers::jobs::mine))
+        // The board ordered for the contractor asking. Separate from the
+        // public board, which deliberately has no notion of who is asking.
+        .route("/v1/me/jobs/feed", get(handlers::jobs::feed))
         .route("/v1/jobs/{id}/close", post(handlers::jobs::close))
+        .route("/v1/jobs/{id}/reopen", post(handlers::jobs::reopen))
         // Merged rather than listed inline: the upload body limit belongs to
         // these two routes and must travel with them, not with the router.
         .merge(handlers::jobs::photo_routes())
+        // Saved searches and their weekly alerts.
+        .route(
+            "/v1/saved-searches",
+            get(handlers::saved_searches::list).post(handlers::saved_searches::create),
+        )
+        .route(
+            "/v1/saved-searches/{id}",
+            axum::routing::delete(handlers::saved_searches::delete),
+        )
         // Claiming a listing.
         .route("/v1/contractors/{id}/claims", post(handlers::claims::open))
         .route("/v1/me/claims", get(handlers::claims::mine))
@@ -59,12 +76,25 @@ pub fn build(state: AppState) -> Router {
             "/v1/contractors/{id}",
             patch(handlers::contractors::update_profile),
         )
+        // Where the listing works, as opposed to where its licence says it is.
+        .route(
+            "/v1/contractors/{id}/service-areas",
+            get(handlers::contractors::service_areas_get)
+                .put(handlers::contractors::service_areas_put),
+        )
+        // Merged for the same reason the job photo routes are: the upload body
+        // limit belongs to the route, not to the whole router.
+        .merge(handlers::contractors::photo_routes())
         // Messaging.
         .route("/v1/conversations", get(handlers::messaging::list))
         .route("/v1/conversations", post(handlers::messaging::start))
         .route(
             "/v1/conversations/{conversation_id}/messages",
             get(handlers::messaging::poll).post(handlers::messaging::send),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/messages/{message_id}",
+            axum::routing::delete(handlers::messaging::delete_message),
         )
         .route(
             "/v1/conversations/{conversation_id}/read",
@@ -97,10 +127,34 @@ pub fn build(state: AppState) -> Router {
     let public = Router::new()
         .route("/v1/auth/register", post(handlers::auth::register))
         .route("/v1/auth/login", post(handlers::auth::login))
+        .route(
+            "/v1/auth/login/verify",
+            post(handlers::auth::verify_login_code),
+        )
+        .route(
+            "/v1/auth/login/resend",
+            post(handlers::auth::resend_login_code),
+        )
+        .route(
+            "/v1/auth/password-reset/request",
+            post(handlers::auth::request_password_reset),
+        )
+        .route(
+            "/v1/auth/password-reset/confirm",
+            post(handlers::auth::confirm_password_reset),
+        )
         .route("/v1/auth/google", post(handlers::auth::google_sign_in))
+        .route("/v1/auth/facebook", post(handlers::auth::facebook_sign_in))
+        // Sessionless by design: mail clients POST the one-click unsubscribe
+        // with no cookies, and the HMAC token is the whole authorisation.
+        .route(
+            "/v1/saved-searches/{id}/unsubscribe",
+            post(handlers::saved_searches::unsubscribe),
+        )
         .route("/v1/contractors", get(handlers::contractors::list))
         .route("/v1/contractors/map", get(handlers::contractors::map))
         .route("/v1/contractors/{id}", get(handlers::contractors::detail))
+        .route("/v1/suggest", get(handlers::contractors::suggest))
         .route("/v1/trades", get(handlers::contractors::trades))
         .route("/v1/regions", get(handlers::contractors::regions))
         .merge(handlers::jobs::public_routes());

@@ -74,6 +74,32 @@ pub async fn find(
     Ok(row.map(Into::into))
 }
 
+/// Set the password outright, from a completed reset.
+///
+/// An upsert, not an update: a federated-only account has no credential row,
+/// and a reset is exactly how it comes to have one. The failure counter and
+/// lock are cleared in the same statement — the proven inbox outranks the
+/// guesses that locked the account.
+pub async fn set_hash(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    password_hash: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO password_credentials (user_id, password_hash) VALUES ($1, $2) \
+         ON CONFLICT (user_id) DO UPDATE \
+            SET password_hash = $2, failed_attempts = 0, locked_until = NULL, \
+                updated_at = now()",
+    )
+    .bind(user_id)
+    .bind(password_hash)
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(())
+}
+
 /// Read the credential and hold a row lock until the transaction ends.
 ///
 /// This is what closes the window between verifying a password and acting on

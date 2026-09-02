@@ -11,9 +11,17 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Exactly one of these, and which one decides the direction.
+///
+/// `contractor_id` is a homeowner writing to a business; `job_id` is a
+/// contractor writing to whoever posted that job. Both land in the same
+/// conversation table and the same thread — the pair is what identifies a
+/// conversation, not the direction it opened from, so if both sides reach for
+/// each other they meet in one place rather than two.
 #[derive(Debug, Deserialize)]
 pub struct StartRequest {
-    pub contractor_id: Uuid,
+    pub contractor_id: Option<Uuid>,
+    pub job_id: Option<Uuid>,
 }
 
 pub async fn start(
@@ -22,22 +30,45 @@ pub async fn start(
     CurrentUser(caller): CurrentUser,
     ValidJson(body): ValidJson<StartRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), AppError> {
-    // Starting a conversation is how a homeowner hires. A contractor account
-    // replies inside a conversation a homeowner opened, and never opens one —
-    // an account is one side of the marketplace or the other, never both.
-    if !caller.user.account_type.may_hire() {
-        // Only a homeowner account can start a conversation.
-        return Err(AppError::Forbidden);
-    }
+    let conversation = match (body.contractor_id, body.job_id) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(AppError::invalid(
+                "Send exactly one of \"contractor_id\" or \"job_id\".",
+            ))
+        }
 
-    let conversation = cm_domain::messaging::start_with_contractor(
-        &state.pool,
-        state.auth.pepper(),
-        caller.user.id,
-        body.contractor_id,
-        context.request_id,
-    )
-    .await?;
+        // A homeowner hiring.
+        (Some(contractor_id), None) => {
+            if !caller.user.account_type.may_hire() {
+                return Err(AppError::Forbidden);
+            }
+            cm_domain::messaging::start_with_contractor(
+                &state.pool,
+                state.auth.pepper(),
+                caller.user.id,
+                contractor_id,
+                context.request_id,
+            )
+            .await?
+        }
+
+        // A contractor answering posted work. The account-type check is the
+        // mirror of the one above: an account is one side of the marketplace
+        // or the other, so each direction is open to exactly one of them.
+        (None, Some(job_id)) => {
+            if !caller.user.account_type.may_claim_a_listing() {
+                return Err(AppError::Forbidden);
+            }
+            cm_domain::messaging::start_with_job(
+                &state.pool,
+                state.auth.pepper(),
+                caller.user.id,
+                job_id,
+                context.request_id,
+            )
+            .await?
+        }
+    };
 
     Ok((StatusCode::CREATED, Json(conversation)))
 }
@@ -112,6 +143,18 @@ pub async fn send(
     .await?;
 
     Ok((StatusCode::CREATED, Json(message)))
+}
+
+/// Retract a message you sent. Soft — the sequence keeps its place.
+pub async fn delete_message(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path((conversation_id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    cm_domain::messaging::delete_message(&state.pool, conversation_id, message_id, caller.user.id)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]

@@ -7,10 +7,14 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use cm_auth::cookie;
-use cm_auth::{IssuedSession, LoginOutcome};
+use cm_auth::login_code::{device_cookie, DEVICE_COOKIE};
+use cm_auth::{Challenge, IssuedSession, LoginOutcome, LoginResult};
 use cm_core::AppError;
-use http::StatusCode;
+use cm_db::repo::oauth::Provider;
+use cm_db::repo::users::AccountType;
+use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -30,10 +34,59 @@ pub struct LoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GoogleSignInRequest {
+pub struct VerifyCodeRequest {
+    pub challenge_id: Uuid,
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResendCodeRequest {
+    pub challenge_id: Uuid,
+}
+
+/// A sign-in waiting on its emailed code. 202: the request was accepted, the
+/// session it asked for does not exist yet.
+#[derive(Debug, Serialize)]
+pub struct ChallengeResponse {
+    challenge_id: Uuid,
+    email: String,
+}
+
+fn challenge_response(challenge: Challenge) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(ChallengeResponse {
+            challenge_id: challenge.challenge_id,
+            email: challenge.email,
+        }),
+    )
+        .into_response()
+}
+
+/// The remembered-device cookie, if the browser sent one.
+fn device_from(headers: &HeaderMap) -> Option<String> {
+    let header = headers.get(http::header::COOKIE)?.to_str().ok()?;
+    cookie::read(header, DEVICE_COOKIE).map(str::to_owned)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FederatedSignInRequest {
     /// The Firebase ID token the browser obtained. Verified, used once, and
     /// never stored.
+    ///
+    /// Note what this body does *not* carry: which provider it came from. That
+    /// is fixed by the route, so a token can never nominate the identity slot
+    /// it wants to be checked against.
     pub id_token: String,
+
+    /// Which side of the marketplace to create, if this token turns out to
+    /// belong to nobody yet. Optional because signing in does not need it, and
+    /// ignored outright when the identity already resolves to an account — an
+    /// account never changes sides, so this can only ever describe a new one.
+    ///
+    /// The sign-up page sends it; the sign-in page does not.
+    #[serde(default)]
+    pub account_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +122,7 @@ pub async fn register(
 ) -> Result<Response, AppError> {
     let account_type = cm_db::repo::users::AccountType::parse_request(&body.account_type)?;
 
-    let outcome = state
+    let challenge = state
         .auth
         .register(
             &state.pool,
@@ -81,30 +134,120 @@ pub async fn register(
         )
         .await?;
 
-    Ok(session_response(StatusCode::CREATED, &outcome, &state))
+    Ok(challenge_response(challenge))
 }
 
 pub async fn login(
     State(state): State<AppState>,
     Context(context): Context,
+    headers: HeaderMap,
     ValidJson(body): ValidJson<LoginRequest>,
 ) -> Result<Response, AppError> {
-    let outcome = state
+    let device = device_from(&headers);
+
+    let result = state
         .auth
-        .login(&state.pool, &body.email, &body.password, &context)
+        .login(
+            &state.pool,
+            &body.email,
+            &body.password,
+            device.as_deref(),
+            &context,
+        )
         .await?;
 
-    Ok(session_response(StatusCode::OK, &outcome, &state))
+    Ok(match result {
+        LoginResult::Session(outcome) => session_response(StatusCode::OK, &outcome, &state),
+        LoginResult::Challenged(challenge) => challenge_response(challenge),
+    })
+}
+
+/// Exchange a challenge and its emailed code for a session. The response also
+/// marks this browser as remembered, so the next login is one step.
+pub async fn verify_login_code(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<VerifyCodeRequest>,
+) -> Result<Response, AppError> {
+    let (outcome, device) = state
+        .auth
+        .verify_login_code(&state.pool, body.challenge_id, &body.code, &context)
+        .await?;
+
+    Ok(with_cookies(
+        session_response(StatusCode::OK, &outcome, &state),
+        [device_cookie(&device)],
+    ))
+}
+
+/// Re-send a challenge's code. The reply carries a fresh challenge id — the
+/// old code and id stop working the moment this succeeds.
+pub async fn resend_login_code(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<ResendCodeRequest>,
+) -> Result<Response, AppError> {
+    let challenge = state
+        .auth
+        .resend_login_code(&state.pool, body.challenge_id, &context)
+        .await?;
+
+    Ok(challenge_response(challenge))
 }
 
 pub async fn google_sign_in(
     State(state): State<AppState>,
     Context(context): Context,
-    ValidJson(body): ValidJson<GoogleSignInRequest>,
+    ValidJson(body): ValidJson<FederatedSignInRequest>,
 ) -> Result<Response, AppError> {
+    // Parsed here so an unknown value is a 400 naming the options, rather than
+    // reaching the service as something it has to guess about.
+    let account_type = body
+        .account_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(AccountType::parse_request)
+        .transpose()?;
+
     let outcome = state
         .auth
-        .sign_in_with_google(&state.pool, &body.id_token, &context)
+        .sign_in_with_provider(
+            &state.pool,
+            Provider::Google,
+            &body.id_token,
+            account_type,
+            &context,
+        )
+        .await?;
+
+    Ok(session_response(StatusCode::OK, &outcome, &state))
+}
+
+pub async fn facebook_sign_in(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<FederatedSignInRequest>,
+) -> Result<Response, AppError> {
+    // Parsed here so an unknown value is a 400 naming the options, rather than
+    // reaching the service as something it has to guess about.
+    let account_type = body
+        .account_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(AccountType::parse_request)
+        .transpose()?;
+
+    let outcome = state
+        .auth
+        .sign_in_with_provider(
+            &state.pool,
+            Provider::Facebook,
+            &body.id_token,
+            account_type,
+            &context,
+        )
         .await?;
 
     Ok(session_response(StatusCode::OK, &outcome, &state))
@@ -114,11 +257,75 @@ pub async fn link_google(
     State(state): State<AppState>,
     Context(context): Context,
     CurrentUser(caller): CurrentUser,
-    ValidJson(body): ValidJson<GoogleSignInRequest>,
+    ValidJson(body): ValidJson<FederatedSignInRequest>,
 ) -> Result<StatusCode, AppError> {
     state
         .auth
-        .link_google(&state.pool, caller.user.id, &body.id_token, &context)
+        .link_provider(
+            &state.pool,
+            caller.user.id,
+            Provider::Google,
+            &body.id_token,
+            &context,
+        )
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn link_facebook(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    ValidJson(body): ValidJson<FederatedSignInRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .auth
+        .link_provider(
+            &state.pool,
+            caller.user.id,
+            Provider::Facebook,
+            &body.id_token,
+            &context,
+        )
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordResetRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordResetConfirm {
+    pub token: String,
+    pub new_password: String,
+}
+
+/// 204 whether or not the address has an account: the response must not say.
+pub async fn request_password_reset(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<PasswordResetRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .auth
+        .request_password_reset(&state.pool, &body.email, &context)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn confirm_password_reset(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<PasswordResetConfirm>,
+) -> Result<StatusCode, AppError> {
+    state
+        .auth
+        .confirm_password_reset(&state.pool, &body.token, &body.new_password, &context)
         .await?;
 
     Ok(StatusCode::NO_CONTENT)

@@ -1,15 +1,21 @@
-//! Verification of Firebase-issued Google identity tokens.
+//! Verification of Firebase-issued identity tokens.
 //!
-//! Firebase does one job here and no other: it runs the Google sign-in dance in
-//! the browser and hands back an ID token. This module checks that token and
-//! then forgets it. Users, roles, sessions and every application record live in
-//! our own database — Firebase is not a directory, not a session store, and not
-//! consulted again after this call returns.
+//! Firebase does one job here and no other: it runs the provider's sign-in
+//! dance in the browser and hands back an ID token. This module checks that
+//! token and then forgets it. Users, roles, sessions and every application
+//! record live in our own database — Firebase is not a directory, not a session
+//! store, and not consulted again after this call returns.
 //!
 //! Only public keys are needed to verify, so no service-account credential is
 //! handled anywhere in this service, and there is no Admin SDK.
+//!
+//! Every check here is made against **one** provider, named by the caller and
+//! never read out of the token. A token says which provider signed the user in;
+//! letting it also choose which provider it will be checked as is how one
+//! provider's token gets accepted as another's.
 
 use cm_core::AppError;
+use cm_db::repo::oauth::Provider;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -118,12 +124,24 @@ struct FirebaseSection {
     identities: HashMap<String, Vec<String>>,
 }
 
+/// Firebase's own name for a provider. It appears twice in a token — as
+/// `sign_in_provider` and as a key of the `identities` map — and both must be
+/// checked against the provider the caller asked for.
+fn firebase_provider_id(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Google => "google.com",
+        Provider::Facebook => "facebook.com",
+    }
+}
+
 /// What a verified token tells us.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedIdentity {
-    /// Google's own account id. This is what keys `oauth_identities`, because
-    /// a direct Google OIDC integration would return the same value — dropping
-    /// Firebase later re-links nobody.
+    /// The provider's own account id — Google's subject, or Facebook's
+    /// app-scoped user id. This is what keys `oauth_identities`, because a
+    /// direct OIDC integration with the same provider returns the same value:
+    /// dropping Firebase later re-links nobody. For Facebook that holds only
+    /// while the Meta App ID stays the same, since the id is scoped to it.
     pub provider_subject: String,
     /// Firebase's own uid. Recorded for support, never matched on.
     pub firebase_uid: String,
@@ -215,37 +233,56 @@ impl FirebaseVerifier {
         })
     }
 
-    /// Check a Firebase ID token and extract the Google identity behind it.
-    pub async fn verify(&self, token: &str) -> Result<VerifiedIdentity, AppError> {
+    /// Check a Firebase ID token and extract the identity behind it.
+    ///
+    /// `provider` is the provider the *caller* is asking about — the endpoint
+    /// that was hit — never whatever the token happens to name. The two are
+    /// then required to agree.
+    pub async fn verify(
+        &self,
+        token: &str,
+        provider: Provider,
+    ) -> Result<VerifiedIdentity, AppError> {
         let claims = match &self.mode {
             Mode::Signed(fetcher) => self.verify_signed(token, fetcher).await?,
             Mode::Emulator => self.decode_unsigned(token)?,
         };
 
-        self.check_claims(&claims)?;
+        self.check_claims(&claims, provider)?;
 
-        // The provider's own subject, not Firebase's uid. Exactly one entry is
-        // required: a token whose Google identity list is empty or plural is
-        // not a shape we understand, and guessing which entry to trust is how
-        // an account gets linked to the wrong person.
+        // The provider's own subject, not Firebase's uid, and read from this
+        // provider's slot only.
+        //
+        // With email-based account linking left on in the Firebase console, one
+        // Firebase user accumulates several identities and this map carries all
+        // of them at once — so reading any slot other than the one that matches
+        // `sign_in_provider` would resolve a session to an account the person
+        // signing in never proved control of. Linking is required to be off;
+        // this reads the right slot regardless.
+        //
+        // Exactly one entry is required: a list that is empty or plural is not
+        // a shape we understand, and guessing which entry to trust is how an
+        // account gets linked to the wrong person.
         let identities = claims
             .firebase
             .identities
-            .get("google.com")
+            .get(firebase_provider_id(provider))
             .map(Vec::as_slice)
             .unwrap_or_default();
 
         let provider_subject = match identities {
             [only] if !only.trim().is_empty() => only.clone(),
             [] => {
-                return Err(AppError::invalid(
-                    "The sign-in token carries no Google identity.",
-                ))
+                return Err(AppError::invalid(format!(
+                    "The sign-in token carries no {} identity.",
+                    provider.display_name()
+                )))
             }
             _ => {
-                return Err(AppError::invalid(
-                    "The sign-in token carries more than one Google identity.",
-                ))
+                return Err(AppError::invalid(format!(
+                    "The sign-in token carries more than one {} identity.",
+                    provider.display_name()
+                )))
             }
         };
 
@@ -322,7 +359,7 @@ impl FirebaseVerifier {
     }
 
     /// The claim checks that apply in both modes.
-    fn check_claims(&self, claims: &FirebaseClaims) -> Result<(), AppError> {
+    fn check_claims(&self, claims: &FirebaseClaims, provider: Provider) -> Result<(), AppError> {
         let now = chrono::Utc::now().timestamp();
         let leeway = LEEWAY_SECS as i64;
 
@@ -355,9 +392,17 @@ impl FirebaseVerifier {
                 return Err(AppError::invalid("The sign-in token is inconsistent."));
             }
         }
-        // Without this, a token minted by any other provider enabled on the
-        // Firebase project would be accepted as a Google sign-in.
-        if claims.firebase.sign_in_provider != "google.com" {
+        // The load-bearing line. Without it a token minted by any other
+        // provider enabled on the Firebase project is accepted here — and once
+        // a second provider exists that is not hypothetical, because a linked
+        // Firebase user's `identities` map carries every provider's subject
+        // including the one this endpoint is about to trust.
+        //
+        // Note what this is NOT: a check that the token names *a* provider we
+        // support. It is a check that the token names *this* provider, the one
+        // the caller asked for. Relaxing it to a set membership test reopens
+        // exactly the hole it closes.
+        if claims.firebase.sign_in_provider != firebase_provider_id(provider) {
             return Err(AppError::invalid("That sign-in method is not supported."));
         }
 

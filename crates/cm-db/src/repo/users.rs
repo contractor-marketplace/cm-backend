@@ -245,6 +245,22 @@ pub async fn find_by_id(conn: &mut PgConnection, id: Uuid) -> Result<Option<User
     row.map(User::try_from).transpose()
 }
 
+/// Record that this account's address is verified. Idempotent, and the only
+/// writer of `email_verified_at`: the first proof of inbox control wins, and
+/// nothing ever un-verifies an address short of changing it.
+pub async fn mark_email_verified(conn: &mut PgConnection, user_id: Uuid) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE users SET email_verified_at = now(), updated_at = now() \
+          WHERE id = $1 AND email_verified_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(())
+}
+
 pub async fn roles(conn: &mut PgConnection, user_id: Uuid) -> Result<Vec<Role>, AppError> {
     let names: Vec<String> =
         sqlx::query_scalar("SELECT role FROM user_roles WHERE user_id = $1 ORDER BY role")

@@ -35,6 +35,7 @@ async fn seed_and_import(pool: &PgPool) {
             row.get(1).expect("name"),
             row.get(2).expect("lat").parse().expect("lat"),
             row.get(3).expect("lon").parse().expect("lon"),
+            None,
             "test",
         )
         .await
@@ -155,7 +156,7 @@ async fn a_protected_address_cannot_be_triangulated_through_the_radius_filter(po
     let near_truth = cm_db::repo::search::Near {
         lat: IBARRA_TRUE_POINT.0,
         lon: IBARRA_TRUE_POINT.1,
-        radius_m: 200.0,
+        radius_m: Some(200.0),
     };
     let found = cm_db::repo::search::list(
         &mut conn,
@@ -180,7 +181,7 @@ async fn a_protected_address_cannot_be_triangulated_through_the_radius_filter(po
     let near_centroid = cm_db::repo::search::Near {
         lat: HIGHLAND_PARK_CENTROID.0,
         lon: HIGHLAND_PARK_CENTROID.1,
-        radius_m: 200.0,
+        radius_m: Some(200.0),
     };
     let found = cm_db::repo::search::list(
         &mut conn,
@@ -524,7 +525,7 @@ async fn an_unclaimed_listing_publishes_its_licence_address(pool: PgPool) {
             near: Some(cm_db::repo::search::Near {
                 lat: IBARRA_TRUE_POINT.0,
                 lon: IBARRA_TRUE_POINT.1,
-                radius_m: 200.0,
+                radius_m: Some(200.0),
             }),
             ..Default::default()
         },

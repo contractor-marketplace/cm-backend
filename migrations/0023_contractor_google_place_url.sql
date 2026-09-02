@@ -1,0 +1,34 @@
+-- 0023 · A link back to the Google listing the reviews came from.
+--
+-- 0022 published the reviews but gave a visitor no way to check them. That is a
+-- gap in the attribution rather than a missing nicety: the profile asserts that
+-- some Google business belongs to this licence, and until now the only party
+-- who could audit that claim was us. A link lets the reader confirm the match
+-- themselves, and read the other 1,679 reviews the sample does not carry.
+--
+-- Separate from 0022 rather than folded into it because 0022 is already applied
+-- in production, and `an_edited_migration_is_rejected` exists precisely to stop
+-- an applied migration being rewritten under a deployment's feet.
+--
+-- WHICH URL
+--
+-- The URL is the one the scraper observed, stored verbatim, not one derived
+-- from the place id.
+--
+-- Deriving was tempting: `place_id` holds Google's hex feature id
+-- (`0x80c295f629847781:0xcf0793c06ba67152`), whose second half is the CID, and
+-- `https://maps.google.com/?cid=<decimal>` is shorter and more durable than the
+-- captured link with its `data=!4m8!...` blob. It was rejected because it could
+-- not be verified: Google Maps renders client-side, so the CID form, the
+-- `q=place_id:` form and the captured URL all return an identical
+-- `<title>Google Maps</title>` to a plain fetch. There is no way to confirm from
+-- here that a constructed URL resolves to the intended business, and a link that
+-- silently points at the wrong company is worse than a long one.
+--
+-- The captured URL also carries the business name in its path, so the target is
+-- legible in the status bar before anyone clicks it.
+
+ALTER TABLE contractors ADD COLUMN google_place_url text;
+
+-- No index: it is never a search key, only ever projected alongside the row it
+-- belongs to.

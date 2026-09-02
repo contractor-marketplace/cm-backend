@@ -1,15 +1,22 @@
 //! Direct messaging rules.
 //!
 //! Messaging is the surface most exposed to abuse, so the gate is deliberately
-//! narrow: you may only open a conversation with a contractor that has been
-//! **claimed** and has **opted in**, you may not do it more than a few times a
-//! day, and a block stops everything in both directions.
+//! narrow. It opens from either side, but never to a stranger:
+//!
+//!   * a homeowner may write to a contractor whose listing is **claimed** and
+//!     has **opted in**;
+//!   * a contractor who owns an **approved listing** may write to the poster of
+//!     an **open job**.
+//!
+//! Either way there is a real, identified party at both ends. Neither side can
+//! do it more than a few times a day, and a block stops everything in both
+//! directions.
 
 use cm_auth::ratelimit;
 use cm_core::{AppError, Secret};
 use cm_db::repo::audit::{ActorKind, AuditEvent};
 use cm_db::repo::messaging::{self, Conversation, ConversationSummary, Message, Report};
-use cm_db::repo::{audit, contractors};
+use cm_db::repo::{audit, contractors, jobs};
 use cm_db::PgPool;
 use uuid::Uuid;
 
@@ -85,7 +92,7 @@ pub async fn start_with_contractor(
     }
 
     let (conversation, created) =
-        messaging::find_or_create_dm(&mut tx, initiator, owner, Some(contractor_id)).await?;
+        messaging::find_or_create_dm(&mut tx, initiator, owner, Some(contractor_id), None).await?;
 
     if created {
         audit::record(
@@ -94,6 +101,88 @@ pub async fn start_with_contractor(
                 .actor(ActorKind::User, Some(initiator))
                 .subject(conversation.id)
                 .data(serde_json::json!({ "contractor_id": contractor_id }))
+                .request_id(request_id),
+        )
+        .await?;
+    }
+
+    tx.commit().await.map_err(AppError::internal)?;
+    Ok(conversation)
+}
+
+/// Open a conversation with the homeowner who posted a job.
+///
+/// The mirror of `start_with_contractor`, and the two gates are deliberately
+/// not symmetric because the two sides are not.
+///
+/// A homeowner may only write to a listing that is **claimed and opted in** —
+/// there has to be a person behind it who agreed to be contacted. A contractor
+/// may only write about an **open job**, which is the homeowner's own public
+/// invitation to be contacted, so no separate opt-in is needed.
+///
+/// What is symmetric is the requirement of a real identity: the contractor must
+/// own an approved listing. Without that, any account that signed up could
+/// message every homeowner who posted work, and the homeowner would have no
+/// licence to check them against — which is the one thing this product is for.
+/// The conversation is tagged with that listing, so the homeowner sees which
+/// business is writing.
+pub async fn start_with_job(
+    pool: &PgPool,
+    pepper: &Secret<String>,
+    initiator: Uuid,
+    job_id: Uuid,
+    request_id: Option<String>,
+) -> Result<Conversation, AppError> {
+    ratelimit::enforce(
+        pool,
+        pepper,
+        conversation_create_policy(),
+        &initiator.to_string(),
+        chrono::Utc::now(),
+    )
+    .await?;
+
+    let mut tx = pool.begin().await.map_err(AppError::internal)?;
+
+    // The listing this contractor owns. `claimed_by` returns it only for an
+    // approved claim, so an unapproved one cannot message anybody.
+    let Some(contractor_id) = contractors::claimed_by(&mut tx, initiator).await? else {
+        return Err(AppError::Forbidden);
+    };
+
+    // Closed and non-existent are the same answer on purpose. See
+    // `jobs::open_job_poster`.
+    let poster = jobs::open_job_poster(&mut tx, job_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if poster == initiator {
+        return Err(AppError::invalid(
+            "You cannot start a conversation with your own job.",
+        ));
+    }
+    if messaging::blocked_either_way(&mut tx, initiator, poster).await? {
+        // Same answer as every other refusal here: naming the block invites
+        // somebody to work around it.
+        return Err(AppError::Forbidden);
+    }
+
+    let (conversation, created) = messaging::find_or_create_dm(
+        &mut tx,
+        initiator,
+        poster,
+        Some(contractor_id),
+        Some(job_id),
+    )
+    .await?;
+
+    if created {
+        audit::record(
+            &mut tx,
+            AuditEvent::new("conversation.created", "conversations")
+                .actor(ActorKind::User, Some(initiator))
+                .subject(conversation.id)
+                .data(serde_json::json!({ "contractor_id": contractor_id, "job_id": job_id }))
                 .request_id(request_id),
         )
         .await?;
@@ -181,6 +270,42 @@ pub async fn poll(
         limit.clamp(1, MAX_PAGE),
     )
     .await
+}
+
+/// Remove a message you sent.
+///
+/// Soft, always. The row keeps its `seq` and its body becomes `[removed]`, for
+/// two reasons: a hole in the sequence would make the poll cursor ambiguous —
+/// a client could not tell "message 7 was deleted" from "message 7 has not
+/// arrived yet" — and a report is investigated against the conversation, so a
+/// hard delete would let someone erase the evidence against them after the
+/// other party had already reported it.
+///
+/// Only the sender. Not the recipient, and not a moderator: taking somebody
+/// else's words off the record is a different action from retracting your own,
+/// and it is not one this product offers.
+pub async fn delete_message(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    message_id: Uuid,
+    sender: Uuid,
+) -> Result<(), AppError> {
+    let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+
+    // 404 before anything else, so a non-participant cannot probe for the
+    // existence of a conversation by trying to delete out of it.
+    if !messaging::is_participant(&mut conn, conversation_id, sender).await? {
+        return Err(AppError::NotFound);
+    }
+
+    // The repo puts sender and conversation in the WHERE clause, so a
+    // participant deleting somebody else's message matches no row and is told
+    // the same thing as a stranger.
+    if !messaging::soft_delete(&mut conn, conversation_id, message_id, sender).await? {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(())
 }
 
 pub async fn mark_read(

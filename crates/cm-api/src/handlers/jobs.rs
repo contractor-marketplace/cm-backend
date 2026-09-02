@@ -81,6 +81,9 @@ const TRADE_OTHER: &str = "other";
 #[derive(Debug, serde::Serialize)]
 pub struct ListResponse {
     pub jobs: Vec<PublicJob>,
+    /// How many jobs match, and how they break down. The board could only ever
+    /// count the rows it had loaded, so it said "20+ jobs" for four hundred.
+    pub facets: jobs::Facets,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// Filters that were not understood and were dropped. Naming them beats a
@@ -141,6 +144,7 @@ pub async fn post_job(
 
 pub async fn list(
     State(state): State<AppState>,
+    Context(context): Context,
     Query(raw): Query<cm_domain::jobs::RawQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
@@ -163,17 +167,213 @@ pub async fn list(
         None => Vec::new(),
     };
 
-    let query = cm_domain::jobs::parse(&raw, trade_ids)?;
-    let page = jobs::list(
+    let mut query = cm_domain::jobs::parse(&raw, trade_ids)?;
+
+    // The same vocabulary the directory routes through: a contractor typing
+    // "water heater" is looking for plumbing work, and no job is titled "C-36".
+    if let Some(text) = query.filters.query.as_deref() {
+        query.filters.query_trade_ids = reference::trades_matching_text(&mut conn, text).await?;
+    }
+
+    let mut page = jobs::list(
         &mut conn,
         &query.filters,
+        query.sort,
         query.limit,
         query.cursor.as_ref(),
     )
     .await?;
 
+    // One query for the whole page, not one per job. Without this the board
+    // served `photos: []` for every listing while the detail page showed them,
+    // so a job with pictures looked like a job without any — which is the
+    // difference between a contractor replying and scrolling past.
+    let ids: Vec<Uuid> = page.jobs.iter().map(|job| job.id).collect();
+    let photos = job_photos::for_jobs(&mut conn, &ids).await?;
+    jobs::attach_photos(&mut page.jobs, photos, |key| state.store.url_for(key));
+
+    let facets = jobs::facets(&mut conn, &query.filters).await?;
+
+    // Best-effort, and never in the way: a board that 500s because logging
+    // failed is an outage, a missing impression is a gap in an analysis.
+    let events: Vec<cm_db::repo::search_events::Event> = page
+        .jobs
+        .iter()
+        .enumerate()
+        .map(|(index, job)| cm_db::repo::search_events::Event {
+            kind: cm_db::repo::search_events::Kind::Impression,
+            surface: cm_db::repo::search_events::Surface::Jobs,
+            subject_id: job.id,
+            actor_user_id: None,
+            position: (index + 1) as i32,
+            had_query: query.filters.query.is_some(),
+            sort: raw.sort.clone(),
+            request_id: context.request_id.clone(),
+        })
+        .collect();
+    if let Err(error) = cm_db::repo::search_events::record(&mut conn, &events).await {
+        tracing::warn!(%error, "could not record job impressions");
+    }
+
     Ok(Json(ListResponse {
         jobs: page.jobs,
+        facets,
+        next_cursor: page
+            .next_cursor
+            .as_ref()
+            .map(cm_domain::jobs::encode_cursor),
+        ignored_filters: query.ignored,
+    }))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MapResponse {
+    pub points: Vec<cm_db::repo::jobs::JobPoint>,
+    pub truncated: bool,
+    pub limit: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_filters: Vec<String>,
+}
+
+/// Every open job that matches, as pins.
+///
+/// Separate from the board for the reason the contractor map is separate from
+/// the directory: a board page holds twenty jobs, and a map drawn from it shows
+/// twenty pins however many matched. The two share `PREDICATE`, so they cannot
+/// disagree about which jobs exist — only about how many of them fit.
+pub async fn map(
+    State(state): State<AppState>,
+    Query(raw): Query<cm_domain::jobs::RawQuery>,
+) -> Result<Json<MapResponse>, AppError> {
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+
+    let trade_ids = match raw
+        .trade
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        Some(list) => {
+            let slugs: Vec<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|slug| !slug.is_empty())
+                .map(str::to_owned)
+                .collect();
+            reference::trade_ids_for_slugs(&mut conn, &slugs).await?
+        }
+        None => Vec::new(),
+    };
+
+    let query = cm_domain::jobs::parse(&raw, trade_ids)?;
+    let (points, truncated) =
+        jobs::map_points(&mut conn, &query.filters, jobs::MAX_MAP_POINTS).await?;
+
+    Ok(Json(MapResponse {
+        points,
+        truncated,
+        limit: jobs::MAX_MAP_POINTS,
+        ignored_filters: query.ignored,
+    }))
+}
+
+/// The board, ordered for the contractor asking.
+///
+/// A separate route rather than a flag on the public board, and deliberately:
+/// this module's whole first paragraph is that the board has no notion of who
+/// is asking, so there is no branch in it that could serve the wrong caller the
+/// wrong shape. A personalised order needs to know exactly that, so it lives
+/// where a session is required by construction instead of optional by
+/// extractor.
+///
+/// The default sort here is fit; everything else the board offers still works,
+/// so a contractor who wants the plain queue asks for `sort=newest` and gets
+/// the same rows in the same order as anybody else.
+pub async fn feed(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    Query(raw): Query<cm_domain::jobs::RawQuery>,
+) -> Result<Json<ListResponse>, AppError> {
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+
+    let Some(contractor_id) =
+        cm_db::repo::contractors::claimed_by(&mut conn, caller.user.id).await?
+    else {
+        // A homeowner, or a contractor account whose claim is not approved.
+        // There is no listing to fit work to, so there is no feed.
+        return Err(AppError::Forbidden);
+    };
+
+    let trade_ids = match raw
+        .trade
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        Some(list) => {
+            let slugs: Vec<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|slug| !slug.is_empty())
+                .map(str::to_owned)
+                .collect();
+            reference::trade_ids_for_slugs(&mut conn, &slugs).await?
+        }
+        None => Vec::new(),
+    };
+
+    let mut query = cm_domain::jobs::parse(&raw, trade_ids)?;
+    if let Some(text) = query.filters.query.as_deref() {
+        query.filters.query_trade_ids = reference::trades_matching_text(&mut conn, text).await?;
+    }
+    query.filters.viewer = cm_db::repo::contractors::viewer_for(&mut conn, contractor_id).await?;
+
+    // Fit unless the caller asked for something else.
+    let sort = match raw.sort.as_deref() {
+        None => cm_db::repo::jobs::Sort::ForMe,
+        Some(_) => query.sort,
+    };
+
+    let mut page = jobs::list(
+        &mut conn,
+        &query.filters,
+        sort,
+        query.limit,
+        query.cursor.as_ref(),
+    )
+    .await?;
+
+    let ids: Vec<Uuid> = page.jobs.iter().map(|job| job.id).collect();
+    let photos = job_photos::for_jobs(&mut conn, &ids).await?;
+    jobs::attach_photos(&mut page.jobs, photos, |key| state.store.url_for(key));
+
+    let facets = jobs::facets(&mut conn, &query.filters).await?;
+
+    let events: Vec<cm_db::repo::search_events::Event> = page
+        .jobs
+        .iter()
+        .enumerate()
+        .map(|(index, job)| cm_db::repo::search_events::Event {
+            kind: cm_db::repo::search_events::Kind::Impression,
+            surface: cm_db::repo::search_events::Surface::Jobs,
+            subject_id: job.id,
+            // The feed knows who is looking, which is what makes a click rate
+            // per contractor answerable rather than a rate over everybody.
+            actor_user_id: Some(caller.user.id),
+            position: (index + 1) as i32,
+            had_query: query.filters.query.is_some(),
+            sort: Some(raw.sort.clone().unwrap_or_else(|| "for_me".to_owned())),
+            request_id: context.request_id.clone(),
+        })
+        .collect();
+    if let Err(error) = cm_db::repo::search_events::record(&mut conn, &events).await {
+        tracing::warn!(%error, "could not record feed impressions");
+    }
+
+    Ok(Json(ListResponse {
+        jobs: page.jobs,
+        facets,
         next_cursor: page
             .next_cursor
             .as_ref()
@@ -284,7 +484,26 @@ pub async fn mine(
     CurrentUser(caller): CurrentUser,
 ) -> Result<Json<Vec<OwnerJob>>, AppError> {
     let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
-    Ok(Json(jobs::for_poster(&mut conn, caller.user.id).await?))
+    let mut mine = jobs::for_poster(&mut conn, caller.user.id).await?;
+
+    let ids: Vec<Uuid> = mine.iter().map(|job| job.public.id).collect();
+    let photos = job_photos::for_jobs(&mut conn, &ids).await?;
+    jobs::attach_photos(mine.iter_mut().map(|job| &mut job.public), photos, |key| {
+        state.store.url_for(key)
+    });
+
+    Ok(Json(mine))
+}
+
+/// Put a closed job back on the board. 409 for a cancelled one.
+pub async fn reopen(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    cm_domain::jobs::reopen(&state.pool, caller.user.id, id, context.request_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,5 +552,6 @@ pub async fn close(
 pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/jobs", axum::routing::get(list))
+        .route("/v1/jobs/map", axum::routing::get(map))
         .route("/v1/jobs/{id}", axum::routing::get(detail))
 }
