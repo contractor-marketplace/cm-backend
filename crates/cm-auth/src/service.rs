@@ -8,12 +8,16 @@ use crate::cookie;
 use crate::csrf;
 use crate::firebase::{FirebaseVerifier, Mode as FirebaseMode};
 use crate::hash;
+use crate::login_code;
+use crate::mail;
 use crate::password::PasswordHasherService;
 use crate::ratelimit;
 use crate::token;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cm_core::{new_id, AppError, AuthConfig, Origin, Secret};
 use cm_db::repo::audit::{ActorKind, AuditEvent};
+use cm_db::repo::auth_tokens::{self, CodeOutcome, Purpose};
+use cm_db::repo::email_outbox::{self, Kind as MailKind, NewEmail};
 use cm_db::repo::oauth::{self, Provider};
 use cm_db::repo::sessions::RevocationReason;
 use cm_db::repo::{audit, passwords, sessions, users};
@@ -82,6 +86,22 @@ enum Precheck {
 pub struct LoginOutcome {
     pub user: users::User,
     pub session: IssuedSession,
+}
+
+/// A sign-in that is waiting on the emailed code.
+#[derive(Debug, Clone)]
+pub struct Challenge {
+    pub challenge_id: Uuid,
+    /// Echoed so the UI can say where the code went.
+    pub email: String,
+}
+
+/// What presenting a correct password produced: a session outright, when the
+/// browser is remembered, or a code challenge when it is not.
+#[derive(Debug, Clone)]
+pub enum LoginResult {
+    Session(LoginOutcome),
+    Challenged(Challenge),
 }
 
 #[derive(Clone)]
@@ -202,7 +222,13 @@ impl AuthService {
             .ip_hash(self.ip_hash(context))
     }
 
-    /// Register a new account and sign it in.
+    /// Register a new account and email it a sign-in code.
+    ///
+    /// No session is created here. The account exists after this returns, but
+    /// signing in — this first time and every time from an unremembered
+    /// browser — goes through `verify_login_code`, which is also what marks
+    /// the address verified: proving the inbox is not an extra step after
+    /// registration, it *is* the last step of registration.
     pub async fn register(
         &self,
         pool: &PgPool,
@@ -211,7 +237,7 @@ impl AuthService {
         password: &str,
         account_type: users::AccountType,
         context: &RequestContext,
-    ) -> Result<LoginOutcome, AppError> {
+    ) -> Result<Challenge, AppError> {
         let now = Utc::now();
         ratelimit::enforce(
             pool,
@@ -237,22 +263,68 @@ impl AuthService {
         // connection for no reason.
         let password_hash = self.hasher.hash(password).await?;
 
+        // Account, credential, code and email in one transaction: a crash
+        // anywhere leaves either a complete challenge or no account, never an
+        // account whose code was lost.
         let mut tx = pool.begin().await.map_err(AppError::internal)?;
         let user = users::insert(&mut tx, new_id(), email, display_name, account_type).await?;
         passwords::insert(&mut tx, user.id, &password_hash).await?;
-        let session = self.issue_session(&mut tx, user.id, context, now).await?;
+        let challenge = self.issue_challenge(&mut tx, user.id, email).await?;
         audit::record(
             &mut tx,
             self.event("auth.registered", context)
                 .actor(ActorKind::User, Some(user.id))
                 .subject(user.id)
-                .data(serde_json::json!({ "session_id": session.session_id })),
+                .data(serde_json::json!({ "challenge_id": challenge.challenge_id })),
         )
         .await?;
         tx.commit().await.map_err(AppError::internal)?;
 
-        tracing::info!(user_id = %user.id, "account registered");
-        Ok(LoginOutcome { user, session })
+        tracing::info!(user_id = %user.id, "account registered, sign-in code queued");
+        Ok(challenge)
+    }
+
+    /// Create a code challenge for an account and queue its email.
+    ///
+    /// Runs inside the caller's transaction, so the token row and the outbox
+    /// row commit or vanish together.
+    async fn issue_challenge(
+        &self,
+        conn: &mut PgConnection,
+        user_id: Uuid,
+        email: &str,
+    ) -> Result<Challenge, AppError> {
+        let challenge_id = new_id();
+        let code = login_code::generate_code()?;
+        auth_tokens::issue(
+            conn,
+            challenge_id,
+            user_id,
+            Purpose::LoginCode,
+            &login_code::code_hash(&self.pepper, challenge_id, &code),
+            login_code::CODE_TTL_SECS,
+        )
+        .await?;
+
+        let rendered = mail::login_code(&code);
+        email_outbox::enqueue(
+            conn,
+            &NewEmail {
+                user_id,
+                recipient: email.to_owned(),
+                kind: MailKind::LoginCode,
+                subject: rendered.subject,
+                body_text: rendered.text,
+                body_html: Some(rendered.html),
+                unsubscribe_url: None,
+            },
+        )
+        .await?;
+
+        Ok(Challenge {
+            challenge_id,
+            email: email.to_owned(),
+        })
     }
 
     /// Authenticate with a password.
@@ -273,13 +345,17 @@ impl AuthService {
     ///    phases 1 and 3 the password can have been changed, the account
     ///    suspended, or the credential locked; acting on the phase-1 snapshot
     ///    would mint a session for a password the account no longer has.
+    ///
+    /// `device` is the raw remembered-device cookie, if the browser sent one.
+    /// A valid one skips the emailed code; it never skips the password.
     pub async fn login(
         &self,
         pool: &PgPool,
         email: &str,
         password: &str,
+        device: Option<&str>,
         context: &RequestContext,
-    ) -> Result<LoginOutcome, AppError> {
+    ) -> Result<LoginResult, AppError> {
         let now = Utc::now();
         ratelimit::enforce(
             pool,
@@ -356,6 +432,26 @@ impl AuthService {
             return Err(AppError::Unauthenticated);
         }
 
+        // The password is right. Whether it becomes a session now or a code
+        // challenge depends on the browser: a valid device cookie for this
+        // account says a code was completed here before.
+        let remembered = device
+            .map(|value| login_code::device_remembers(&self.pepper, value, user_id, now))
+            .unwrap_or(false);
+
+        if !remembered {
+            // Every challenge is an email; bounded per account, and before the
+            // transaction so the counter never rides a rollback.
+            ratelimit::enforce(
+                pool,
+                &self.pepper,
+                ratelimit::login_code_issue_per_user(),
+                &user_id.to_string(),
+                now,
+            )
+            .await?;
+        }
+
         // Phase 3: revalidate under the row lock, then act.
         let mut tx = pool.begin().await.map_err(AppError::internal)?;
         let user = self
@@ -363,24 +459,179 @@ impl AuthService {
             .await?;
 
         passwords::clear_failures(&mut tx, user_id).await?;
+
+        let result = if remembered {
+            let session = self.issue_session(&mut tx, user_id, context, now).await?;
+            audit::record(
+                &mut tx,
+                self.event("auth.login_succeeded", context)
+                    .actor(ActorKind::User, Some(user_id))
+                    .subject(user_id)
+                    .data(serde_json::json!({ "session_id": session.session_id })),
+            )
+            .await?;
+            LoginResult::Session(LoginOutcome { user, session })
+        } else {
+            let challenge = self.issue_challenge(&mut tx, user_id, &user.email).await?;
+            audit::record(
+                &mut tx,
+                self.event("auth.login_challenged", context)
+                    .actor(ActorKind::User, Some(user_id))
+                    .subject(user_id)
+                    .data(serde_json::json!({ "challenge_id": challenge.challenge_id })),
+            )
+            .await?;
+            LoginResult::Challenged(challenge)
+        };
+        tx.commit().await.map_err(AppError::internal)?;
+
+        // After the outcome exists, and outside any transaction: cost
+        // parameters move over time, and a correct password is the only chance
+        // to upgrade a stored hash without asking the person for it again.
+        self.upgrade_hash_if_needed(pool, user_id, &verified_hash, password)
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Exchange a challenge and its emailed code for a session.
+    ///
+    /// The attempt is spent on its own connection, not in the transaction that
+    /// acts on success — a failed guess must count even though nothing else
+    /// happens, and the atomic UPDATE in the repo is what caps racing guesses.
+    ///
+    /// Completing a code is also what verifies the address: it is the same
+    /// proof of inbox control a verification link would be.
+    pub async fn verify_login_code(
+        &self,
+        pool: &PgPool,
+        challenge_id: Uuid,
+        code: &str,
+        context: &RequestContext,
+    ) -> Result<(LoginOutcome, String), AppError> {
+        let now = Utc::now();
+        ratelimit::enforce(
+            pool,
+            &self.pepper,
+            ratelimit::login_code_verify_per_challenge(),
+            &challenge_id.to_string(),
+            now,
+        )
+        .await?;
+
+        let outcome = {
+            let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+            auth_tokens::verify_code(
+                &mut conn,
+                challenge_id,
+                &login_code::code_hash(&self.pepper, challenge_id, code.trim()),
+                login_code::MAX_CODE_ATTEMPTS,
+            )
+            .await?
+        };
+
+        let user_id = match outcome {
+            CodeOutcome::Matched { user_id } => user_id,
+            CodeOutcome::Wrong | CodeOutcome::Gone => {
+                let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+                audit::record(
+                    &mut conn,
+                    self.event("auth.login_code_failed", context)
+                        .actor(ActorKind::User, None)
+                        .data(serde_json::json!({ "challenge_id": challenge_id })),
+                )
+                .await?;
+                // One message for wrong, expired, consumed and never-existed:
+                // anything finer would let a caller probe which challenges are
+                // live.
+                return Err(AppError::invalid("That code is incorrect or has expired."));
+            }
+        };
+
+        let mut tx = pool.begin().await.map_err(AppError::internal)?;
+        let Some(user) = users::find_by_id(&mut tx, user_id).await? else {
+            return Err(AppError::Unauthenticated);
+        };
+        if !user.status.can_authenticate() {
+            return Err(AppError::Unauthenticated);
+        }
+
+        // The proof of inbox control this table was waiting for since 0005.
+        // The account is re-read afterwards so the outcome carries the
+        // verified state it just gained.
+        users::mark_email_verified(&mut tx, user_id).await?;
+        let Some(user) = users::find_by_id(&mut tx, user_id).await? else {
+            return Err(AppError::Unauthenticated);
+        };
         let session = self.issue_session(&mut tx, user_id, context, now).await?;
         audit::record(
             &mut tx,
             self.event("auth.login_succeeded", context)
                 .actor(ActorKind::User, Some(user_id))
                 .subject(user_id)
-                .data(serde_json::json!({ "session_id": session.session_id })),
+                .data(serde_json::json!({
+                    "session_id": session.session_id,
+                    "via": "login_code",
+                })),
         )
         .await?;
         tx.commit().await.map_err(AppError::internal)?;
 
-        // After the session exists, and outside any transaction: cost
-        // parameters move over time, and a correct password is the only chance
-        // to upgrade a stored hash without asking the person for it again.
-        self.upgrade_hash_if_needed(pool, user_id, &verified_hash, password)
-            .await?;
+        let device = login_code::device_value(
+            &self.pepper,
+            user_id,
+            now + ChronoDuration::from_std(login_code::DEVICE_TTL).map_err(AppError::internal)?,
+        );
 
-        Ok(LoginOutcome { user, session })
+        Ok((LoginOutcome { user, session }, device))
+    }
+
+    /// Re-send a challenge's code, as a fresh challenge.
+    ///
+    /// The old challenge is consumed by the new issue, so the response carries
+    /// a new id for the client to hold. An unknown or dead challenge gets the
+    /// same message as a wrong code, for the same reason.
+    pub async fn resend_login_code(
+        &self,
+        pool: &PgPool,
+        challenge_id: Uuid,
+        context: &RequestContext,
+    ) -> Result<Challenge, AppError> {
+        let now = Utc::now();
+
+        let user = {
+            let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+            let Some(user_id) = auth_tokens::challenge_user(&mut conn, challenge_id).await? else {
+                return Err(AppError::invalid("That code is incorrect or has expired."));
+            };
+            let Some(user) = users::find_by_id(&mut conn, user_id).await? else {
+                return Err(AppError::invalid("That code is incorrect or has expired."));
+            };
+            user
+        };
+
+        ratelimit::enforce(
+            pool,
+            &self.pepper,
+            ratelimit::login_code_issue_per_user(),
+            &user.id.to_string(),
+            now,
+        )
+        .await?;
+
+        let mut tx = pool.begin().await.map_err(AppError::internal)?;
+        let challenge = self.issue_challenge(&mut tx, user.id, &user.email).await?;
+        audit::record(
+            &mut tx,
+            self.event("auth.login_code_resent", context)
+                .actor(ActorKind::User, Some(user.id))
+                .subject(user.id)
+                .data(serde_json::json!({ "challenge_id": challenge.challenge_id })),
+        )
+        .await?;
+        tx.commit().await.map_err(AppError::internal)?;
+
+        Ok(challenge)
     }
 
     /// Phase 1: everything that needs the database, and nothing that does not.
@@ -510,6 +761,168 @@ impl AuthService {
         }
 
         audit::record(conn, event).await?;
+        Ok(())
+    }
+
+    /// How long a reset link lives.
+    const RESET_TTL_SECS: i64 = 3600;
+
+    /// Ask for a password-reset link.
+    ///
+    /// Returns `Ok(())` for every well-formed address, found or not — the
+    /// endpoint must not be an account enumerator. The found path does no
+    /// Argon2 work, only a token issue and two inserts, so the timing skew
+    /// between the branches is negligible and is not padded.
+    pub async fn request_password_reset(
+        &self,
+        pool: &PgPool,
+        email: &str,
+        context: &RequestContext,
+    ) -> Result<(), AppError> {
+        let now = Utc::now();
+        ratelimit::enforce(
+            pool,
+            &self.pepper,
+            ratelimit::password_reset_request_per_ip(),
+            context.client_ip.as_deref().unwrap_or("unknown"),
+            now,
+        )
+        .await?;
+
+        let email = email.trim();
+        if !looks_like_email(email) {
+            return Err(AppError::invalid("Enter a valid email address."));
+        }
+
+        // Bounded per target as well as per caller, so many addresses cannot
+        // take turns flooding one victim's inbox.
+        ratelimit::enforce(
+            pool,
+            &self.pepper,
+            ratelimit::password_reset_request_per_email(),
+            &email.to_lowercase(),
+            now,
+        )
+        .await?;
+
+        let user = {
+            let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+            users::find_by_email(&mut conn, email).await?
+        };
+        let Some(user) = user else {
+            // Indistinguishable from success, deliberately.
+            return Ok(());
+        };
+        if !user.status.can_authenticate() {
+            return Ok(());
+        }
+
+        // Token and email in one transaction: the link in the mail always
+        // matches a digest in the table.
+        let raw = token::generate()?;
+        let link = format!("{}/reset-password?token={raw}", self.site_origin.as_str());
+
+        let mut tx = pool.begin().await.map_err(AppError::internal)?;
+        auth_tokens::issue(
+            &mut tx,
+            new_id(),
+            user.id,
+            Purpose::PasswordReset,
+            &hash::digest_token(&raw),
+            Self::RESET_TTL_SECS,
+        )
+        .await?;
+        let rendered = mail::password_reset(&link);
+        email_outbox::enqueue(
+            &mut tx,
+            &NewEmail {
+                user_id: user.id,
+                recipient: user.email.clone(),
+                kind: MailKind::PasswordReset,
+                subject: rendered.subject,
+                body_text: rendered.text,
+                body_html: Some(rendered.html),
+                unsubscribe_url: None,
+            },
+        )
+        .await?;
+        audit::record(
+            &mut tx,
+            self.event("auth.password_reset_requested", context)
+                .actor(ActorKind::User, Some(user.id))
+                .subject(user.id),
+        )
+        .await?;
+        tx.commit().await.map_err(AppError::internal)?;
+
+        Ok(())
+    }
+
+    /// Complete a reset: the emailed link plus a new password.
+    ///
+    /// The token is peeked before it is consumed, so a weak new password
+    /// leaves the link alive; the consume itself is a single atomic UPDATE, so
+    /// racing confirmations spend it exactly once. Every session is revoked —
+    /// the reason for a reset is usually that the old credential leaked — and
+    /// the address is marked verified, because a completed reset is the same
+    /// proof of inbox control a code is.
+    pub async fn confirm_password_reset(
+        &self,
+        pool: &PgPool,
+        token: &str,
+        new_password: &str,
+        context: &RequestContext,
+    ) -> Result<(), AppError> {
+        const BAD_LINK: &str = "That reset link is invalid or has expired.";
+        let digest = hash::digest_token(token.trim());
+
+        let user = {
+            let mut conn = pool.acquire().await.map_err(AppError::internal)?;
+            let Some(user_id) =
+                auth_tokens::peek_link(&mut conn, &digest, Purpose::PasswordReset).await?
+            else {
+                return Err(AppError::invalid(BAD_LINK));
+            };
+            let Some(user) = users::find_by_id(&mut conn, user_id).await? else {
+                return Err(AppError::invalid(BAD_LINK));
+            };
+            user
+        };
+        if !user.status.can_authenticate() {
+            return Err(AppError::invalid(BAD_LINK));
+        }
+
+        PasswordHasherService::check_policy(new_password, &user.email)?;
+
+        // The expensive half, outside any connection.
+        let new_hash = self.hasher.hash(new_password).await?;
+
+        let mut tx = pool.begin().await.map_err(AppError::internal)?;
+        // Consumed inside the transaction that acts on it: a race spends the
+        // token once, and the loser is told the link is gone.
+        if auth_tokens::consume_link(&mut tx, &digest, Purpose::PasswordReset)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::invalid(BAD_LINK));
+        }
+
+        passwords::set_hash(&mut tx, user.id, &new_hash).await?;
+        let revoked =
+            sessions::revoke_all_for_user(&mut tx, user.id, RevocationReason::PasswordChange, None)
+                .await?;
+        users::mark_email_verified(&mut tx, user.id).await?;
+        audit::record(
+            &mut tx,
+            self.event("auth.password_reset_completed", context)
+                .actor(ActorKind::User, Some(user.id))
+                .subject(user.id)
+                .data(serde_json::json!({ "sessions_revoked": revoked })),
+        )
+        .await?;
+        tx.commit().await.map_err(AppError::internal)?;
+
+        tracing::info!(user_id = %user.id, sessions_revoked = revoked, "password reset completed");
         Ok(())
     }
 
@@ -873,6 +1286,19 @@ impl AuthService {
                 (user, "auth.federated_registered")
             }
         };
+
+        // The provider's verified-email claim is honoured only when it is a
+        // claim about *this account's* address — a linked identity can carry a
+        // different one, and verifying ours on the strength of theirs would
+        // verify an address nobody proved.
+        if identity.email_verified
+            && identity
+                .email
+                .as_deref()
+                .is_some_and(|claimed| claimed.trim().eq_ignore_ascii_case(user.email.trim()))
+        {
+            users::mark_email_verified(&mut tx, user.id).await?;
+        }
 
         let session = self.issue_session(&mut tx, user.id, context, now).await?;
         audit::record(

@@ -128,6 +128,27 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         idle_secs: u64,
     },
+    /// Deliver queued email from the outbox.
+    MailWorker {
+        /// Run one pass and exit, instead of looping.
+        #[arg(long)]
+        once: bool,
+        /// Override the Resend endpoint, for a staging or recorded service.
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long, default_value_t = 25)]
+        batch: i64,
+        /// Seconds to wait when a pass finds nothing. Short by default: sign-in
+        /// codes sit in this queue, and the idle poll is one indexed query.
+        #[arg(long, default_value_t = 5)]
+        idle_secs: u64,
+    },
+    /// Match new jobs against saved searches and queue the digests.
+    ///
+    /// Oneshot, run weekly by `cm-job-alerts.timer` — the cadence is the
+    /// product decision, and the timer is where it lives. The mail worker
+    /// delivers what this enqueues.
+    JobAlerts,
 }
 
 #[derive(Debug, Subcommand)]
@@ -175,6 +196,17 @@ fn main() -> ExitCode {
     if let Command::CheckConfig = cli.command {
         for (key, value) in config.redacted_summary() {
             println!("{key} = {value}");
+        }
+        // A gap is an absent value that only matters with real users, so it is
+        // a warning in development and fails the preflight in production —
+        // matching what `serve` will do, so the preflight and the boot cannot
+        // disagree.
+        let gaps = config.production_gaps();
+        for gap in &gaps {
+            eprintln!("gap: {gap}");
+        }
+        if !gaps.is_empty() && config.environment == cm_core::Environment::Production {
+            return ExitCode::from(EXIT_CONFIG);
         }
         return ExitCode::SUCCESS;
     }
@@ -244,6 +276,13 @@ fn main() -> ExitCode {
                 batch,
                 idle_secs,
             } => geocode_worker(config, once, provider, endpoint, batch, idle_secs).await,
+            Command::MailWorker {
+                once,
+                endpoint,
+                batch,
+                idle_secs,
+            } => mail_worker(config, once, endpoint, batch, idle_secs).await,
+            Command::JobAlerts => job_alerts(config).await,
             Command::CheckConfig => unreachable!("handled before the runtime starts"),
         }
     });
@@ -260,6 +299,17 @@ fn main() -> ExitCode {
 async fn serve(config: Config) -> Result<(), cm_core::AppError> {
     for (key, value) in config.redacted_summary() {
         tracing::info!(target: "cm_server::config", key, value, "configuration");
+    }
+
+    // The gaps `check-config` reports are refused here too: a production
+    // server quietly holding photos in memory or queueing sign-in codes
+    // nobody delivers is worse than one that will not start.
+    let gaps = config.production_gaps();
+    if !gaps.is_empty() && config.environment == cm_core::Environment::Production {
+        return Err(cm_core::AppError::unavailable(format!(
+            "refusing to serve with production gaps: {}",
+            gaps.join(" | ")
+        )));
     }
 
     let pool = cm_db::connect(&config.database).await?;
@@ -948,8 +998,14 @@ async fn prune(
     let pruned = result?;
     if !report_only {
         println!(
-            "pruned: {} session(s), {} geocode job(s), {} rate-limit window(s), {} audit row(s)",
-            pruned.sessions, pruned.geocode_jobs, pruned.rate_limit_windows, pruned.audit_rows
+            "pruned: {} session(s), {} geocode job(s), {} email(s), {} auth token(s), \
+             {} rate-limit window(s), {} audit row(s)",
+            pruned.sessions,
+            pruned.geocode_jobs,
+            pruned.emails,
+            pruned.auth_tokens,
+            pruned.rate_limit_windows,
+            pruned.audit_rows
         );
     }
 
@@ -1008,6 +1064,88 @@ async fn geocode_worker(
 
     pool.close().await;
     result
+}
+
+async fn mail_worker(
+    config: Config,
+    once: bool,
+    endpoint: Option<String>,
+    batch: i64,
+    idle_secs: u64,
+) -> Result<(), cm_core::AppError> {
+    // Built before the pool, so a bad configuration fails at startup rather
+    // than at the first send. No mail config means the memory mailer: fine in
+    // development (the code lands in the log), unreachable in production
+    // because `serve` and `check-config` refuse the gap.
+    let mailer = match &config.mail {
+        Some(mail) => {
+            cm_domain::mailer::Mailer::Resend(cm_domain::mailer::ResendMailer::new(mail, endpoint)?)
+        }
+        None => cm_domain::mailer::Mailer::memory(),
+    };
+    tracing::info!(mailer = %mailer.describe(), "mail worker starting");
+
+    let pool = cm_db::connect(&config.database).await?;
+
+    let worker_config = cm_domain::mail_worker::WorkerConfig {
+        batch: batch.clamp(1, 200),
+        worker_id: format!("mail-worker-{}", std::process::id()),
+        ..Default::default()
+    };
+
+    // The loop exits on SIGTERM between passes, so a deploy never interrupts a
+    // pass halfway and leaves rows claimed.
+    let result = tokio::select! {
+        result = async {
+            loop {
+                let stats =
+                    cm_domain::mail_worker::run_once(&pool, &mailer, &worker_config).await?;
+                if stats != cm_domain::mail_worker::Stats::default() {
+                    tracing::info!(
+                        requeued = stats.requeued,
+                        claimed = stats.claimed,
+                        sent = stats.sent,
+                        failed = stats.failed,
+                        "mail pass complete"
+                    );
+                }
+
+                if once {
+                    return Ok::<(), cm_core::AppError>(());
+                }
+                if stats.claimed == 0 {
+                    tokio::time::sleep(Duration::from_secs(idle_secs.clamp(1, 3600))).await;
+                }
+            }
+        } => result,
+        () = shutdown_signal(config.shutdown_grace) => {
+            tracing::info!("stopping the mail worker");
+            Ok(())
+        }
+    };
+
+    pool.close().await;
+    result
+}
+
+async fn job_alerts(config: Config) -> Result<(), cm_core::AppError> {
+    let pool = cm_db::connect(&config.database).await?;
+
+    let stats =
+        cm_domain::job_alerts::run(&pool, &config.auth.hash_pepper, &config.site_origin).await?;
+    tracing::info!(
+        jobs_considered = stats.jobs_considered,
+        jobs_matched = stats.jobs_matched,
+        digests = stats.digests,
+        "job-alert pass complete"
+    );
+    println!(
+        "job alerts: {} job(s) considered, {} matched, {} digest(s) queued",
+        stats.jobs_considered, stats.jobs_matched, stats.digests
+    );
+
+    pool.close().await;
+    Ok(())
 }
 
 /// Resolves on SIGTERM (systemd stop) or SIGINT (Ctrl-C).

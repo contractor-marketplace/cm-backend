@@ -55,6 +55,15 @@ pub fn build(state: AppState) -> Router {
         // Merged rather than listed inline: the upload body limit belongs to
         // these two routes and must travel with them, not with the router.
         .merge(handlers::jobs::photo_routes())
+        // Saved searches and their weekly alerts.
+        .route(
+            "/v1/saved-searches",
+            get(handlers::saved_searches::list).post(handlers::saved_searches::create),
+        )
+        .route(
+            "/v1/saved-searches/{id}",
+            axum::routing::delete(handlers::saved_searches::delete),
+        )
         // Claiming a listing.
         .route("/v1/contractors/{id}/claims", post(handlers::claims::open))
         .route("/v1/me/claims", get(handlers::claims::mine))
@@ -118,8 +127,30 @@ pub fn build(state: AppState) -> Router {
     let public = Router::new()
         .route("/v1/auth/register", post(handlers::auth::register))
         .route("/v1/auth/login", post(handlers::auth::login))
+        .route(
+            "/v1/auth/login/verify",
+            post(handlers::auth::verify_login_code),
+        )
+        .route(
+            "/v1/auth/login/resend",
+            post(handlers::auth::resend_login_code),
+        )
+        .route(
+            "/v1/auth/password-reset/request",
+            post(handlers::auth::request_password_reset),
+        )
+        .route(
+            "/v1/auth/password-reset/confirm",
+            post(handlers::auth::confirm_password_reset),
+        )
         .route("/v1/auth/google", post(handlers::auth::google_sign_in))
         .route("/v1/auth/facebook", post(handlers::auth::facebook_sign_in))
+        // Sessionless by design: mail clients POST the one-click unsubscribe
+        // with no cookies, and the HMAC token is the whole authorisation.
+        .route(
+            "/v1/saved-searches/{id}/unsubscribe",
+            post(handlers::saved_searches::unsubscribe),
+        )
         .route("/v1/contractors", get(handlers::contractors::list))
         .route("/v1/contractors/map", get(handlers::contractors::map))
         .route("/v1/contractors/{id}", get(handlers::contractors::detail))

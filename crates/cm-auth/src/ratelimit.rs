@@ -84,6 +84,48 @@ pub fn password_change_per_user() -> Policy {
     }
 }
 
+/// Every issued code is an email, so this bounds both the mail bill and how
+/// hard an account's inbox can be made to ring by someone with its password.
+pub fn login_code_issue_per_user() -> Policy {
+    Policy {
+        name: "login_code_issue:user",
+        limit: 6,
+        window: ChronoDuration::hours(1),
+    }
+}
+
+/// A backstop above the per-challenge attempt cap, keyed by challenge so it
+/// needs no account lookup before it can refuse. Cycling fresh challenges to
+/// reset it runs into `login_code_issue_per_user` instead.
+pub fn login_code_verify_per_challenge() -> Policy {
+    Policy {
+        name: "login_code_verify:challenge",
+        limit: 20,
+        window: ChronoDuration::minutes(15),
+    }
+}
+
+/// Every accepted request is an email to an arbitrary address, so the ceiling
+/// is low from one address…
+pub fn password_reset_request_per_ip() -> Policy {
+    Policy {
+        name: "password_reset_request:ip",
+        limit: 5,
+        window: ChronoDuration::hours(1),
+    }
+}
+
+/// …and low again per target, so a victim's inbox cannot be flooded from many
+/// addresses either. The subject is the lowercased email, peppered like every
+/// other bucket key before storage.
+pub fn password_reset_request_per_email() -> Policy {
+    Policy {
+        name: "password_reset_request:email",
+        limit: 3,
+        window: ChronoDuration::hours(1),
+    }
+}
+
 /// Count one request and return an error if the bucket is over its limit.
 ///
 /// Runs on the pool rather than in a caller's transaction, so the count
@@ -149,10 +191,15 @@ mod tests {
     fn policies_are_distinct_and_bounded() {
         let policies = [
             register_per_ip(),
+            suggest_per_ip(),
             login_per_ip(),
             federated_sign_in_per_ip(),
             link_identity_per_user(),
             password_change_per_user(),
+            login_code_issue_per_user(),
+            login_code_verify_per_challenge(),
+            password_reset_request_per_ip(),
+            password_reset_request_per_email(),
         ];
 
         for policy in policies {

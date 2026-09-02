@@ -45,8 +45,44 @@ pub fn router(pool: PgPool) -> Router {
 }
 
 pub fn router_with(pool: PgPool, overrides: &[(&str, &str)]) -> Router {
-    let state = AppState::new(pool, &config(overrides)).expect("build state");
-    cm_api::build(state)
+    let state = AppState::new(pool.clone(), &config(overrides)).expect("build state");
+    // The mailbox-peek route exists only in this test router, never in the
+    // production one: it is the inbox a browser-shaped test cannot otherwise
+    // open, and it lets `Client::register` finish the code challenge the way
+    // a person would — by reading the email.
+    cm_api::build(state).merge(mailbox_router(pool))
+}
+
+/// `GET /__test/latest-email?to=…` — the newest outbox row for a recipient.
+fn mailbox_router(pool: PgPool) -> Router {
+    use axum::extract::{Query, State};
+
+    async fn latest(
+        State(pool): State<PgPool>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> axum::Json<Value> {
+        let to = params.get("to").cloned().unwrap_or_default();
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT subject, body_text FROM email_outbox \
+              WHERE recipient = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&to)
+        .fetch_optional(&pool)
+        .await
+        .expect("read the test mailbox");
+
+        axum::Json(match row {
+            Some((subject, body_text)) => serde_json::json!({
+                "subject": subject,
+                "body_text": body_text,
+            }),
+            None => Value::Null,
+        })
+    }
+
+    Router::new()
+        .route("/__test/latest-email", axum::routing::get(latest))
+        .with_state(pool)
 }
 
 /// A router whose pool points at a port nothing is listening on, built lazily
@@ -142,6 +178,11 @@ impl Client {
     pub fn set_session(&mut self, token: &str) {
         self.jar
             .insert("__Host-cm_session".to_owned(), token.to_owned());
+    }
+
+    /// Plant an arbitrary cookie, for forgery tests.
+    pub fn jar_insert(&mut self, name: &str, value: &str) {
+        self.jar.insert(name.to_owned(), value.to_owned());
     }
 
     pub async fn get(&mut self, path: &str) -> TestResponse {
@@ -313,25 +354,76 @@ impl Client {
     }
 
     pub async fn register_as(&mut self, email: &str, account_type: &str) -> TestResponse {
-        self.post(
-            "/v1/auth/register",
-            serde_json::json!({
-                "email": email,
-                "display_name": "Test Person",
-                "password": PASSWORD,
-                "account_type": account_type,
-            }),
-        )
-        .await
+        let response = self
+            .post(
+                "/v1/auth/register",
+                serde_json::json!({
+                    "email": email,
+                    "display_name": "Test Person",
+                    "password": PASSWORD,
+                    "account_type": account_type,
+                }),
+            )
+            .await;
+
+        self.complete_challenge(response).await
     }
 
+    /// Log in, completing the emailed-code step when this browser is not yet
+    /// remembered. A client that has registered or verified before carries the
+    /// device cookie in its jar and logs in without the code, as a person
+    /// would.
     pub async fn login(&mut self, email: &str, password: &str) -> TestResponse {
+        let response = self
+            .post(
+                "/v1/auth/login",
+                serde_json::json!({ "email": email, "password": password }),
+            )
+            .await;
+
+        self.complete_challenge(response).await
+    }
+
+    /// If a response is a 202 code challenge, read the code from the test
+    /// mailbox and finish signing in; anything else passes through untouched.
+    async fn complete_challenge(&mut self, response: TestResponse) -> TestResponse {
+        if response.status != StatusCode::ACCEPTED {
+            return response;
+        }
+
+        let challenge_id = response.json["challenge_id"]
+            .as_str()
+            .expect("a challenge names itself")
+            .to_owned();
+        let email = response.json["email"]
+            .as_str()
+            .expect("a challenge names its recipient")
+            .to_owned();
+
+        let mail = self.get(&format!("/__test/latest-email?to={email}")).await;
+        let code = extract_code(
+            mail.json["body_text"]
+                .as_str()
+                .expect("the challenge email must exist"),
+        );
+
         self.post(
-            "/v1/auth/login",
-            serde_json::json!({ "email": email, "password": password }),
+            "/v1/auth/login/verify",
+            serde_json::json!({ "challenge_id": challenge_id, "code": code }),
         )
         .await
     }
+}
+
+/// The first run of six digits in an email body.
+pub fn extract_code(body: &str) -> String {
+    let bytes = body.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start..].len() >= 6 && bytes[start..start + 6].iter().all(u8::is_ascii_digit) {
+            return body[start..start + 6].to_owned();
+        }
+    }
+    panic!("no 6-digit code in the email body: {body}");
 }
 
 /// Wall-clock helper for the few assertions that need one.

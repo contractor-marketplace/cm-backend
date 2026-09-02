@@ -1,0 +1,13 @@
+[Unit]
+Description=Weekly job-alert digests
+
+[Timer]
+# Monday morning Pacific (16:00 UTC): the week's jobs land at the start of a
+# contractor's working week, not into a weekend inbox.
+OnCalendar=Mon *-*-* 16:00:00
+RandomizedDelaySec=15m
+# A box that was down on Monday still sends the digests when it returns.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

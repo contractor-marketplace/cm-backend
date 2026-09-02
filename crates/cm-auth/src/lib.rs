@@ -9,9 +9,13 @@ pub mod cookie;
 pub mod csrf;
 pub mod firebase;
 pub mod hash;
+pub mod login_code;
+pub mod mail;
 pub mod password;
 pub mod ratelimit;
 pub mod service;
 pub mod token;
 
-pub use service::{AuthService, Authenticated, IssuedSession, LoginOutcome, RequestContext};
+pub use service::{
+    AuthService, Authenticated, Challenge, IssuedSession, LoginOutcome, LoginResult, RequestContext,
+};

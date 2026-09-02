@@ -223,6 +223,8 @@ cm-server load-regions --file deploy/data/zcta_ca.csv --source census_2020_gazet
 cm-server seed-trades
 cm-server recompute-verification
 cm-server geocode-worker [--once]
+cm-server mail-worker [--once]   # drains the email outbox into Resend
+cm-server job-alerts             # matches new jobs to saved searches, weekly
 ```
 
 Roles are granted from a shell, never over HTTP. The first admin has to come
@@ -283,8 +285,13 @@ rolling deploy (migrate, then restart) is safe in both orders.
 | 0013 | `0013_homeowner_profiles.sql` | `homeowner_profiles` |
 | 0014 | `0014_messaging.sql` | `conversations`, `conversation_participants`, `messages` |
 | 0015 | `0015_safety.sql` | `user_blocks`, `message_reports` |
+| … | | 0016–0031 add the account split, jobs and their intake, published licence addresses, Facebook, Google reviews, the trade vocabulary, the quality score, the job board's search document, `search_events`, service areas and places |
+| 0032 | `0032_email_outbox.sql` | `email_outbox` |
+| 0033 | `0033_login_codes.sql` | `auth_tokens` gains the `login_code` purpose and an attempt counter |
+| 0034 | `0034_saved_searches.sql` | `saved_searches`, `jobs.alerts_matched_at` |
 
-`auth_tokens` is created but unused: password reset and email verification need
-a mail path that does not exist yet, so no endpoint issues or consumes a token.
-The table lands with the rest of the auth schema so those flows are a code
-change rather than a migration when the mail path is approved.
+`auth_tokens` was created in 0005 and left unused until the mail path existed;
+0033 added the `login_code` purpose and an attempt counter, and it now carries
+both the emailed sign-in codes and the password-reset links. Landing the table
+with the rest of the auth schema is what made those flows a code change rather
+than a migration when the time came.

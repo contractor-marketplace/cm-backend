@@ -34,6 +34,18 @@ pub async fn prune(
     })
     .await?;
 
+    let emails = drain(pool, |conn| {
+        Box::pin(maintenance::prune_emails(conn, now, grace_days, BATCH))
+    })
+    .await?;
+
+    let auth_tokens = drain(pool, |conn| {
+        Box::pin(cm_db::repo::auth_tokens::prune_expired(
+            conn, now, grace_days, BATCH,
+        ))
+    })
+    .await?;
+
     let rate_limit_windows = cm_auth::ratelimit::sweep(pool, now).await?;
 
     let audit_rows = match audit_days {
@@ -49,6 +61,8 @@ pub async fn prune(
     Ok(Pruned {
         sessions,
         geocode_jobs,
+        emails,
+        auth_tokens,
         rate_limit_windows,
         audit_rows,
     })

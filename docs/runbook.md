@@ -43,18 +43,53 @@ CM_SITE_ORIGIN=https://app.example.com
 CM_HASH_PEPPER=$(openssl rand -base64 48)
 CM_ENV=production
 CM_TRUST_PROXY_HEADERS=true
+CM_JOB_PHOTO_BUCKET=cm-job-photos
+# Mail. Production refuses to start without both: without them, sign-in codes
+# would be queued and never delivered, and nobody could log in.
+CM_RESEND_API_KEY=re_...
+CM_MAIL_FROM=Contractor Marketplace <no-reply@contractorsmarketplace.co>
 ENV
 chown root:cm /etc/cm-backend/env && chmod 0640 /etc/cm-backend/env
 
 # 4. Schema, then reference data, then the service.
+# check-config now also reports production gaps and exits 2 on them, so a
+# missing bucket or mail key fails here rather than at the first send.
 cm-server check-config          # proves the file parses before anything restarts
 DATABASE_URL=postgres://cm_migrate:...@127.0.0.1/cm cm-server migrate
 cm-server seed-trades          # trades, their aliases, and re-derives contractor trades
 cm-server load-regions --file deploy/data/zcta_ca.csv --source census_2020_gazetteer
 # Then the place hierarchy — see "Loading places" below. Order matters:
 # load-places reads the ZIP rows load-regions writes.
-systemctl enable --now cm-server cm-geocode-worker cm-verification.timer
+systemctl enable --now cm-server cm-geocode-worker cm-mail-worker \
+                       cm-verification.timer cm-job-alerts.timer
 ```
+
+## Mail
+
+Every email leaves through the outbox, so "is mail working" is one query:
+
+```sql
+SELECT status, count(*) FROM email_outbox GROUP BY status;
+```
+
+`queued` climbing while `sent` does not means the worker is down or Resend is
+refusing; `last_error` on a failed row says which. A row is retried with
+exponential backoff for eight attempts before it is given up on, and the outbox
+row's id is the provider idempotency key, so restarting the worker mid-batch
+cannot double-send.
+
+```bash
+journalctl -u cm-mail-worker -f            # sends, failures, stall recoveries
+systemctl start cm-job-alerts              # run the weekly digest by hand
+systemctl list-timers cm-job-alerts.timer  # when it next fires (Mondays)
+```
+
+**Deliverability.** The sending domain in `CM_MAIL_FROM` must show SPF and DKIM
+verified in the Resend dashboard, and a DMARC record should exist
+(`p=none; rua=...` is enough to start). After the first real send, open the
+message in Gmail → "Show original" and confirm SPF, DKIM and DMARC all PASS. Job
+alerts carry `List-Unsubscribe` and `List-Unsubscribe-Post`, which Gmail and
+Yahoo require of bulk senders; the auth emails are transactional and do not.
 
 ## Loading places
 

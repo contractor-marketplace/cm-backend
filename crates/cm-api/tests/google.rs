@@ -131,10 +131,7 @@ async fn a_google_account_is_never_matched_to_an_existing_account_by_email(pool:
 
     // A password account already holds the address.
     let mut password_user = Client::new(router.clone());
-    assert_eq!(
-        password_user.register(shared).await.status,
-        StatusCode::CREATED
-    );
+    assert_eq!(password_user.register(shared).await.status, StatusCode::OK);
 
     // Someone signs in with a Google account bearing the same address.
     let response = Client::new(router)

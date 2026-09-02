@@ -7,12 +7,14 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use cm_auth::cookie;
-use cm_auth::{IssuedSession, LoginOutcome};
+use cm_auth::login_code::{device_cookie, DEVICE_COOKIE};
+use cm_auth::{Challenge, IssuedSession, LoginOutcome, LoginResult};
 use cm_core::AppError;
 use cm_db::repo::oauth::Provider;
 use cm_db::repo::users::AccountType;
-use http::StatusCode;
+use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -29,6 +31,42 @@ pub struct RegisterRequest {
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyCodeRequest {
+    pub challenge_id: Uuid,
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResendCodeRequest {
+    pub challenge_id: Uuid,
+}
+
+/// A sign-in waiting on its emailed code. 202: the request was accepted, the
+/// session it asked for does not exist yet.
+#[derive(Debug, Serialize)]
+pub struct ChallengeResponse {
+    challenge_id: Uuid,
+    email: String,
+}
+
+fn challenge_response(challenge: Challenge) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(ChallengeResponse {
+            challenge_id: challenge.challenge_id,
+            email: challenge.email,
+        }),
+    )
+        .into_response()
+}
+
+/// The remembered-device cookie, if the browser sent one.
+fn device_from(headers: &HeaderMap) -> Option<String> {
+    let header = headers.get(http::header::COOKIE)?.to_str().ok()?;
+    cookie::read(header, DEVICE_COOKIE).map(str::to_owned)
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +122,7 @@ pub async fn register(
 ) -> Result<Response, AppError> {
     let account_type = cm_db::repo::users::AccountType::parse_request(&body.account_type)?;
 
-    let outcome = state
+    let challenge = state
         .auth
         .register(
             &state.pool,
@@ -96,20 +134,65 @@ pub async fn register(
         )
         .await?;
 
-    Ok(session_response(StatusCode::CREATED, &outcome, &state))
+    Ok(challenge_response(challenge))
 }
 
 pub async fn login(
     State(state): State<AppState>,
     Context(context): Context,
+    headers: HeaderMap,
     ValidJson(body): ValidJson<LoginRequest>,
 ) -> Result<Response, AppError> {
-    let outcome = state
+    let device = device_from(&headers);
+
+    let result = state
         .auth
-        .login(&state.pool, &body.email, &body.password, &context)
+        .login(
+            &state.pool,
+            &body.email,
+            &body.password,
+            device.as_deref(),
+            &context,
+        )
         .await?;
 
-    Ok(session_response(StatusCode::OK, &outcome, &state))
+    Ok(match result {
+        LoginResult::Session(outcome) => session_response(StatusCode::OK, &outcome, &state),
+        LoginResult::Challenged(challenge) => challenge_response(challenge),
+    })
+}
+
+/// Exchange a challenge and its emailed code for a session. The response also
+/// marks this browser as remembered, so the next login is one step.
+pub async fn verify_login_code(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<VerifyCodeRequest>,
+) -> Result<Response, AppError> {
+    let (outcome, device) = state
+        .auth
+        .verify_login_code(&state.pool, body.challenge_id, &body.code, &context)
+        .await?;
+
+    Ok(with_cookies(
+        session_response(StatusCode::OK, &outcome, &state),
+        [device_cookie(&device)],
+    ))
+}
+
+/// Re-send a challenge's code. The reply carries a fresh challenge id — the
+/// old code and id stop working the moment this succeeds.
+pub async fn resend_login_code(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<ResendCodeRequest>,
+) -> Result<Response, AppError> {
+    let challenge = state
+        .auth
+        .resend_login_code(&state.pool, body.challenge_id, &context)
+        .await?;
+
+    Ok(challenge_response(challenge))
 }
 
 pub async fn google_sign_in(
@@ -205,6 +288,44 @@ pub async fn link_facebook(
             &body.id_token,
             &context,
         )
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordResetRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordResetConfirm {
+    pub token: String,
+    pub new_password: String,
+}
+
+/// 204 whether or not the address has an account: the response must not say.
+pub async fn request_password_reset(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<PasswordResetRequest>,
+) -> Result<StatusCode, AppError> {
+    state
+        .auth
+        .request_password_reset(&state.pool, &body.email, &context)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn confirm_password_reset(
+    State(state): State<AppState>,
+    Context(context): Context,
+    ValidJson(body): ValidJson<PasswordResetConfirm>,
+) -> Result<StatusCode, AppError> {
+    state
+        .auth
+        .confirm_password_reset(&state.pool, &body.token, &body.new_password, &context)
         .await?;
 
     Ok(StatusCode::NO_CONTENT)

@@ -65,8 +65,10 @@ fn database_url(pool: &PgPool) -> String {
     }
 }
 
+/// Register and complete the emailed-code step, ending signed in the way a
+/// person would — code read from the outbox, which is the test's mailbox.
 async fn an_account(service: &AuthService, pool: &PgPool, email: &str) -> uuid::Uuid {
-    service
+    let challenge = service
         .register(
             pool,
             email,
@@ -76,9 +78,28 @@ async fn an_account(service: &AuthService, pool: &PgPool, email: &str) -> uuid::
             &context(),
         )
         .await
-        .expect("register")
-        .user
-        .id
+        .expect("register");
+
+    let body: String = sqlx::query_scalar(
+        "SELECT body_text FROM email_outbox WHERE recipient = $1 \
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .expect("the challenge email exists");
+    let code = body
+        .as_bytes()
+        .windows(6)
+        .position(|window| window.iter().all(u8::is_ascii_digit))
+        .map(|start| body[start..start + 6].to_owned())
+        .expect("a 6-digit code in the body");
+
+    let (outcome, _device) = service
+        .verify_login_code(pool, challenge.challenge_id, &code, &context())
+        .await
+        .expect("the emailed code signs in");
+    outcome.user.id
 }
 
 /// A password replaced while a login is in flight must not produce a session.
@@ -103,7 +124,7 @@ async fn a_password_replaced_mid_login_cannot_produce_a_session(pool: PgPool) {
         let pool = pool.clone();
         async move {
             service
-                .login(&pool, "race@example.test", PASSWORD, &context())
+                .login(&pool, "race@example.test", PASSWORD, None, &context())
                 .await
         }
     });
@@ -253,6 +274,7 @@ async fn queued_hashing_does_not_occupy_database_connections(pool: PgPool) {
                         &pool,
                         "storm@example.test",
                         "not the right password",
+                        None,
                         &context(),
                     )
                     .await;
@@ -311,6 +333,7 @@ async fn a_failed_login_still_counts_against_the_rate_limit(pool: PgPool) {
                 &pool,
                 "counted@example.test",
                 "not the right password",
+                None,
                 &context(),
             )
             .await;
@@ -356,7 +379,7 @@ async fn a_refused_login_leaves_no_partial_state(pool: PgPool) {
         .expect("replace");
 
     let error = service
-        .login(&pool, "clean@example.test", PASSWORD, &context())
+        .login(&pool, "clean@example.test", PASSWORD, None, &context())
         .await
         .expect_err("the old password must not work");
     assert_eq!(error.code(), "unauthenticated");
@@ -366,14 +389,21 @@ async fn a_refused_login_leaves_no_partial_state(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("count");
-    assert_eq!(succeeded, 0);
+    assert_eq!(
+        succeeded, 1,
+        "only the registration's code sign-in; the refused login must not add one"
+    );
 
-    // The account is otherwise untouched and the new password works.
-    let outcome = service
-        .login(&pool, "clean@example.test", REPLACEMENT, &context())
+    // The account is otherwise untouched and the new password works: from an
+    // unremembered browser, a correct password becomes a code challenge.
+    let result = service
+        .login(&pool, "clean@example.test", REPLACEMENT, None, &context())
         .await
         .expect("the new password must work");
-    assert_eq!(outcome.user.id, user_id);
+    assert!(
+        matches!(result, cm_auth::LoginResult::Challenged(_)),
+        "an unremembered browser gets the code step: {result:?}"
+    );
 
     let mut conn = pool.acquire().await.expect("connection");
     assert_eq!(

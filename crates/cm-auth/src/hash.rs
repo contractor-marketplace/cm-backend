@@ -41,6 +41,32 @@ pub fn rate_limit_bucket(pepper: &Secret<String>, bucket: &str) -> Vec<u8> {
     peppered(pepper, "ratelimit", bucket)
 }
 
+/// The unsubscribe token for a saved search, as it appears in email footers
+/// and `List-Unsubscribe` headers.
+///
+/// Stateless on purpose: an unsubscribe link must keep working from an email
+/// found years later, and a stored token would be one more row to expire or
+/// lose. Being derived, it also survives everything short of a pepper
+/// rotation.
+pub fn unsubscribe_token(pepper: &Secret<String>, saved_search_id: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    URL_SAFE_NO_PAD.encode(peppered(
+        pepper,
+        "unsubscribe:saved_search",
+        saved_search_id,
+    ))
+}
+
+/// Whether a presented unsubscribe token is the real one, in constant time.
+pub fn verify_unsubscribe(pepper: &Secret<String>, saved_search_id: &str, presented: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    unsubscribe_token(pepper, saved_search_id)
+        .as_bytes()
+        .ct_eq(presented.as_bytes())
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

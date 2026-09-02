@@ -31,6 +31,8 @@ pub const MAX_BATCHES: usize = 40;
 pub struct Pruned {
     pub sessions: u64,
     pub geocode_jobs: u64,
+    pub emails: u64,
+    pub auth_tokens: u64,
     pub rate_limit_windows: u64,
     pub audit_rows: u64,
 }
@@ -89,6 +91,33 @@ pub async fn prune_geocode_jobs(
     Ok(result.rows_affected())
 }
 
+/// Delete outbox emails that reached a terminal state more than `grace_days`
+/// ago. Sent bodies still carry the codes and links they delivered, so keeping
+/// them past the grace would be keeping credentials.
+pub async fn prune_emails(
+    conn: &mut PgConnection,
+    now: DateTime<Utc>,
+    grace_days: i64,
+    batch: i64,
+) -> Result<u64, AppError> {
+    let result = sqlx::query(
+        "DELETE FROM email_outbox WHERE ctid IN ( \
+             SELECT ctid FROM email_outbox \
+              WHERE status IN ('sent', 'failed') \
+                AND updated_at < $1 - make_interval(days => $2) \
+              LIMIT $3 \
+         )",
+    )
+    .bind(now)
+    .bind(grace_days as i32)
+    .bind(batch)
+    .execute(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(result.rows_affected())
+}
+
 /// Delete audit rows older than `days`. Only ever called when an operator asks.
 pub async fn prune_audit(
     conn: &mut PgConnection,
@@ -127,6 +156,8 @@ pub async fn growth_report(conn: &mut PgConnection) -> Result<Vec<(String, i64)>
              UNION ALL SELECT 'audit_log', count(*) FROM audit_log \
              UNION ALL SELECT 'rate_limit_counters', count(*) FROM rate_limit_counters \
              UNION ALL SELECT 'geocode_queue', count(*) FROM geocode_queue \
+             UNION ALL SELECT 'email_outbox', count(*) FROM email_outbox \
+             UNION ALL SELECT 'auth_tokens', count(*) FROM auth_tokens \
              UNION ALL SELECT 'messages', count(*) FROM messages \
              UNION ALL SELECT 'license_record_versions', count(*) FROM license_record_versions \
          ) t ORDER BY t.rows DESC, t.name",

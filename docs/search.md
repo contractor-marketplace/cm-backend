@@ -473,9 +473,10 @@ is answered by a table of words and two similarity directions, which leaves
 nothing for a vector index to close and nothing to justify the extension,
 embedding pipeline, provider dependency and CI image that would arrive with it.
 
-**Saved searches and job alerts.** Needs a mail path, which the system
-deliberately does not have; `auth_tokens` has been waiting on the same thing
-since 0005.
+**Saved searches and job alerts.** Built, once the mail path existed. Filters
+are typed columns in `saved_searches`, matched against new jobs by the same
+clauses as the predicate above; `cm-server job-alerts` renders one weekly digest
+per user into the email outbox. See §16a of `docs/architecture.md`.
 
 **A search cluster.** No Elasticsearch, no Redis, no separate search service. At
 50,000 contractors, Postgres with the indexes above answers every query here at

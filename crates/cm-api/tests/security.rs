@@ -284,7 +284,7 @@ async fn registration_is_limited_per_address(pool: PgPool) {
             .with_peer("198.51.100.7:5000")
             .register(&format!("user{n}@example.test"))
             .await;
-        assert_eq!(response.status, StatusCode::CREATED, "registration {n}");
+        assert_eq!(response.status, StatusCode::OK, "registration {n}");
     }
 
     let limited = Client::new(router.clone())
@@ -303,7 +303,7 @@ async fn registration_is_limited_per_address(pool: PgPool) {
         .with_peer("198.51.100.8:5000")
         .register("elsewhere@example.test")
         .await;
-    assert_eq!(elsewhere.status, StatusCode::CREATED);
+    assert_eq!(elsewhere.status, StatusCode::OK);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

@@ -248,6 +248,41 @@ from another.
   is the absence of anything else. `contractor` is granted only when a moderator
   approves a claim.
 
+### The emailed sign-in code
+
+A password alone never produces a session on a browser the account has not used
+before. Registration and any login from an unrecognised browser answer **202
+with a challenge id**, and a **6-digit code** goes to the address; spending it
+at `POST /v1/auth/login/verify` is what mints the session.
+
+The code compensates for its own small keyspace at every layer: stored as an
+HMAC under the pepper and bound to its challenge id (so a database leak cannot
+brute a million values, and a code for one challenge is noise for another),
+ten-minute expiry, **five attempts** enforced inside the same UPDATE that checks
+it, single-use, and superseded the moment a new one is issued. Wrong, expired,
+consumed and never-existed all return one message, so the endpoint cannot be
+used to probe which challenges are live.
+
+Completing a code sets `users.email_verified_at`. **That is the whole of email
+verification** — there is no second link-based flow, because the code already
+proves the same thing. A completed password reset sets it too, and a federated
+sign-in sets it when the provider's verified claim is about the account's own
+address.
+
+**Remembered devices** keep everyday logins one step: `__Host-cm_device` is a
+signed statement — this browser completed a code for this account, until this
+date — carrying a user id, an expiry and an HMAC over both. Stateless, so there
+is nothing to store or revoke; it only skips the code and never the password;
+and it survives logout, because it says "this browser is known", not "this
+person is signed in".
+
+**Password reset** is a classic emailed link: a 256-bit token stored as its
+digest in `auth_tokens`, one hour, single-use, consumed by the same atomic
+UPDATE that reads it. The request endpoint answers 204 for every well-formed
+address so it cannot enumerate accounts, and is bounded twice — per caller
+address and per target address, the second so a victim's inbox cannot be
+flooded from many clients. Completing a reset revokes **every** session.
+
 There is deliberately **no HTTP endpoint that grants a role**. The first admin
 comes from `cm-server admin grant-role` over SSH: shell access to the box is a
 stronger prerequisite than any check that could be written.
@@ -812,13 +847,62 @@ hitting the provider's account ceiling instead.
 
 ---
 
+## 16a. Mail, and the outbox that carries it
+
+The first mail path in the product, added once a Resend account existed for
+`contractorsmarketplace.co`. Three flows use it: sign-in codes, password-reset
+links, and the weekly job-alert digest.
+
+**Nothing in a request handler talks to a provider.** A handler writes an
+`email_outbox` row **in the same transaction that creates the reason for it**,
+so a code and its email commit together or not at all — a crash cannot leave an
+account holding a token whose mail was lost, and a Resend outage delays mail
+rather than dropping it. Bodies are rendered at enqueue time, because the values
+they carry exist only in that transaction; the worker is dumb by construction:
+claim, POST, mark.
+
+`cm-server mail-worker` drains the outbox with the geocode worker's shape —
+`FOR UPDATE SKIP LOCKED`, exponential backoff to an hour, eight attempts, stall
+recovery for a worker that died mid-flight, and no pooled connection held across
+the HTTP call. The outbox row's id travels as Resend's `Idempotency-Key`, so a
+resend after an ambiguous failure cannot become a second email.
+
+**The mailer is an enum, not a trait** — `Resend | Memory` — for the same reason
+`Store` is: exactly two implementations and no plausible third. Development and
+tests get `Memory`, which logs mail instead of sending it, so the whole flow is
+exercised end-to-end with no API key and no network. Production cannot reach it:
+`check-config` and `serve` both refuse to start when `CM_RESEND_API_KEY` /
+`CM_MAIL_FROM` are unset in production, which is also the moment
+`Config::production_gaps()` stopped being dead code and became the interlock its
+doc comment always claimed.
+
+**Saved searches and the weekly digest.** `saved_searches` holds the board's
+filters as typed columns, never a JSON blob: the alert pass matches new jobs
+against them with the same clauses the live board's `PREDICATE` uses, and a test
+asserts on real rows that the two agree — a blob could be neither indexed,
+validated, nor kept honest. `jobs.alerts_matched_at` is the queue: NULL means
+"not yet considered", so the INSERT is the enqueue and job posting needed no
+change; the migration backfilled it, so nothing posted before alerts existed
+ever alerts. `cm-server job-alerts` runs Monday mornings on a timer, claims
+unmatched jobs, renders **one digest per user** however many of their searches
+fired, and enqueues it. Pure SQL from end to end, so a crash is a clean rollback.
+
+Unsubscribe is a stateless HMAC over the search id — an emailed link has to keep
+working years later, and a stored token is one more row to lose. It rides both
+the footer and the `List-Unsubscribe` / `List-Unsubscribe-Post` headers Gmail
+and Yahoo require of bulk senders, is sessionless as RFC 8058 expects, and turns
+`notify` off while keeping the search: somebody who stops the email usually
+still wants the search.
+
+---
+
 ## 17. Deliberate omissions
 
 Stated so they read as decisions rather than gaps.
 
 | Not built | Why |
 |---|---|
-| Email verification, password reset | No mail path yet. The UI says so rather than showing a badge implying an address is confirmed |
+| A separate "verify your email" flow | The sign-in code already proves inbox control, so a second link-based flow would verify nothing new |
 | Account linking UI | The `/v1/auth/link/*` endpoints exist and nothing reaches them; deferred |
 | Messaging UI | Endpoints and schema exist; deferred |
 | Phone OTP / mail-code claims | In the vocabulary, no delivery mechanism. Only manual review is offered |

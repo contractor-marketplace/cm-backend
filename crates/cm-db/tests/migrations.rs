@@ -336,6 +336,94 @@ async fn account_type_matches_the_rust_enum(pool: PgPool) {
     );
 }
 
+/// The outbox vocabularies in the database and in Rust must agree — the same
+/// two-hand-written-lists drift the account-type check guards against.
+#[sqlx::test(migrations = "../../migrations")]
+async fn email_outbox_enums_match_the_rust_enums(pool: PgPool) {
+    for (column, mut from_rust) in [
+        (
+            "kind",
+            cm_db::repo::email_outbox::Kind::ALL
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "status",
+            cm_db::repo::email_outbox::MessageStatus::ALL
+                .iter()
+                .map(|status| status.as_str())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(c.oid) \
+             FROM pg_constraint c \
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) \
+             WHERE c.contype = 'c' AND c.conrelid = 'email_outbox'::regclass \
+               AND a.attname = $1",
+        )
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("check constraint on {column}: {e}"));
+
+        let mut literals = literals_in(&definition);
+        literals.sort_unstable();
+        from_rust.sort_unstable();
+
+        assert_eq!(
+            literals, from_rust,
+            "{column}: constraint definition was: {definition}"
+        );
+    }
+}
+
+/// A saved search's facet vocabularies must be the job table's, verbatim: the
+/// reverse match compares these columns to `jobs.timeline` and
+/// `jobs.build_type` directly, so a value allowed on one side and not the
+/// other is a search that can never fire.
+#[sqlx::test(migrations = "../../migrations")]
+async fn saved_search_enums_match_the_job_columns(pool: PgPool) {
+    for (column, mut from_rust) in [
+        (
+            "timeline",
+            cm_db::repo::jobs::JobTimeline::ALL
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "build_type",
+            cm_db::repo::jobs::BuildType::ALL
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(c.oid) \
+             FROM pg_constraint c \
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) \
+             WHERE c.contype = 'c' AND c.conrelid = 'saved_searches'::regclass \
+               AND a.attname = $1",
+        )
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("check constraint on {column}: {e}"));
+
+        let mut literals = literals_in(&definition);
+        literals.sort_unstable();
+        from_rust.sort_unstable();
+
+        assert_eq!(
+            literals, from_rust,
+            "{column}: constraint definition was: {definition}"
+        );
+    }
+}
+
 /// An owner-supplied address is all four parts or none.
 ///
 /// This is what makes the per-column COALESCE in `geocodable_address` safe. If

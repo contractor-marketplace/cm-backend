@@ -1,0 +1,16 @@
+[Unit]
+Description=Contractor marketplace weekly job-alert digests
+After=network-online.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=cm
+Group=cm
+EnvironmentFile=/etc/cm-backend/env
+ExecStart=/usr/local/bin/cm-server job-alerts
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=256M

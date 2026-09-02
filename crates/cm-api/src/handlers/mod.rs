@@ -7,6 +7,7 @@ pub mod jobs;
 pub mod me;
 pub mod messaging;
 pub mod profiles;
+pub mod saved_searches;
 
 use axum::response::Response;
 use http::header::SET_COOKIE;
