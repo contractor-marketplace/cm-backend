@@ -136,7 +136,7 @@ async fn a_licence_going_inactive_removes_the_badge(pool: PgPool) {
     cm_db::repo::users::insert(
         &mut conn,
         owner,
-        "owner@example.test",
+        Some("owner@example.test"),
         "Owner",
         cm_db::repo::users::AccountType::Contractor,
     )
@@ -365,7 +365,7 @@ async fn a_second_claim_on_a_claimed_listing_is_refused(pool: PgPool) {
     cm_db::repo::users::insert(
         &mut conn,
         owner,
-        "owner@example.test",
+        Some("owner@example.test"),
         "Owner",
         cm_db::repo::users::AccountType::Contractor,
     )

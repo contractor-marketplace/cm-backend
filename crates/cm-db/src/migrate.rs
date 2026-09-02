@@ -123,7 +123,7 @@ mod tests {
         let versions: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
         assert_eq!(
             versions,
-            (1..=34).collect::<Vec<i64>>(),
+            (1..=35).collect::<Vec<i64>>(),
             "extensions and reference data, then accounts, credentials, sessions, \
              audit, rate limits, federated identity, the licence register, \
              contractors, geocoding, claims, profiles, messaging, safety, \
@@ -139,9 +139,10 @@ mod tests {
              and which places exist and which ZIP codes belong to them, \
              and the outbox that carries the product's first email, and the \
              sign-in codes that email made possible, and the saved searches \
-             whose weekly digests were the reason to build any of it"
+             whose weekly digests were the reason to build any of it, and the \
+             licence to exist without an email address at all"
         );
-        assert_eq!(embedded_version(), 34);
+        assert_eq!(embedded_version(), 35);
     }
 
     #[test]

@@ -73,7 +73,7 @@ async fn an_account(pool: &PgPool, email: &str) -> uuid::Uuid {
     cm_db::repo::users::insert(
         &mut conn,
         cm_core::new_id(),
-        email,
+        Some(email),
         "Operator Target",
         cm_db::repo::users::AccountType::Homeowner,
     )

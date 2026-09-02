@@ -114,7 +114,7 @@ async fn messaging_is_refused_unless_the_listing_is_claimed_and_open(pool: PgPoo
     cm_db::repo::users::insert(
         &mut conn,
         owner,
-        "owner@example.test",
+        Some("owner@example.test"),
         "Owner",
         cm_db::repo::users::AccountType::Contractor,
     )

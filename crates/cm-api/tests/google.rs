@@ -452,58 +452,71 @@ async fn a_shared_email_across_providers_is_a_conflict_not_a_merge(pool: PgPool)
     assert_eq!(accounts, 1);
 }
 
-/// Facebook accounts can carry no email at all — a phone-number signup, or a
-/// declined email permission. There is nowhere to put such a user yet, so the
-/// refusal has to say so rather than fail obscurely.
+/// A Facebook account with no email anywhere still gets in.
+///
+/// Registered with a phone number, or the email permission declined: there is
+/// genuinely no address, in the token or the popup. Since 0035 that person is
+/// admitted — the account keys on the provider subject, contact happens in the
+/// app, and an address can be added from the account page when they want
+/// notifications. This used to be a 400 telling them to go use the email form.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_facebook_token_without_an_email_is_refused_with_advice(pool: PgPool) {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-
-    let now = chrono::Utc::now().timestamp();
-    let claims = json!({
-        "sub": "firebase-fb-2",
-        "user_id": "firebase-fb-2",
-        "auth_time": now - 30,
-        "iat": now - 30,
-        "exp": now + 3600,
-        "iss": format!("https://securetoken.google.com/{PROJECT}"),
-        "aud": PROJECT,
-        "firebase": {
-            "sign_in_provider": "facebook.com",
-            "identities": { "facebook.com": ["fb-2"] }
-        }
-    });
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
-    let id_token = format!("{header}.{}.", URL_SAFE_NO_PAD.encode(claims.to_string()));
-
+async fn a_facebook_account_without_an_email_still_gets_in(pool: PgPool) {
     let response = Client::new(emulator_router(pool.clone()))
         .post(
             "/v1/auth/facebook",
-            json!({ "id_token": id_token, "account_type": "homeowner" }),
+            json!({
+                "id_token": production_token("facebook.com", "fb-2", None),
+                "account_type": "homeowner"
+            }),
         )
         .await;
 
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+    assert_eq!(response.json["user"]["email"], serde_json::Value::Null);
+    assert_eq!(response.json["user"]["email_verified"], false);
+
+    let (email, display_name): (Option<String>, String) =
+        sqlx::query_as("SELECT email, display_name FROM users")
+            .fetch_one(&pool)
+            .await
+            .expect("user row");
+    assert_eq!(email, None);
     assert_eq!(
-        response.status,
-        StatusCode::BAD_REQUEST,
-        "{:?}",
-        response.json
+        display_name, "Facebook user",
+        "a placeholder name beats blocking the person for the lack of one"
     );
-    assert!(
-        response.json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("email address"),
-        "the message has to name the problem: {:?}",
-        response.json
-    );
+}
+
+/// Two email-less accounts coexist: the unique index is on the normalised
+/// address, and NULLs never collide. Without this property, the second
+/// no-email sign-up ever would 409 against the first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_accounts_without_emails_do_not_collide(pool: PgPool) {
+    let router = emulator_router(pool.clone());
+
+    for subject in ["fb-a", "fb-b"] {
+        let response = Client::new(router.clone())
+            .post(
+                "/v1/auth/facebook",
+                json!({
+                    "id_token": production_token("facebook.com", subject, None),
+                    "account_type": "homeowner"
+                }),
+            )
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{subject}: {:?}",
+            response.json
+        );
+    }
 
     let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
         .fetch_one(&pool)
         .await
         .expect("count");
-    assert_eq!(accounts, 0);
+    assert_eq!(accounts, 2);
 }
 
 /// Signing up with a provider button creates the side the person chose.

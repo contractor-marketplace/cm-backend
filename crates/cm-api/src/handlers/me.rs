@@ -17,7 +17,9 @@ pub struct MeResponse {
 #[derive(Debug, Serialize)]
 pub struct UserView {
     id: Uuid,
-    email: String,
+    /// Null for a federated account whose provider shared no address; the
+    /// account page offers to add one.
+    email: Option<String>,
     display_name: String,
     status: UserStatus,
     /// Which side of the marketplace. Every client needs this to decide what

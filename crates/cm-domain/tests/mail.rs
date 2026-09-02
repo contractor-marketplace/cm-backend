@@ -13,7 +13,7 @@ async fn a_user(pool: &PgPool, email: &str) -> Uuid {
     users::insert(
         &mut conn,
         new_id(),
-        email,
+        Some(email),
         "Test User",
         AccountType::Homeowner,
     )

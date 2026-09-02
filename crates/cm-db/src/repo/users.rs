@@ -147,7 +147,7 @@ impl std::fmt::Display for Role {
 #[derive(Debug, Clone)]
 pub struct User {
     pub id: Uuid,
-    pub email: String,
+    pub email: Option<String>,
     pub display_name: String,
     pub status: UserStatus,
     /// Which side of the marketplace. Fixed at registration.
@@ -159,7 +159,7 @@ pub struct User {
 #[derive(sqlx::FromRow)]
 struct UserRow {
     id: Uuid,
-    email: String,
+    email: Option<String>,
     display_name: String,
     status: String,
     account_type: String,
@@ -190,11 +190,13 @@ const SELECT_USER: &str = "SELECT id, email, display_name, status, account_type,
 ///
 /// `email` must already be trimmed: the CHECK constraint rejects surrounding
 /// whitespace rather than quietly storing it, and `email_norm` — the generated
-/// column the unique index is built on — handles case only.
+/// column the unique index is built on — handles case only. `None` is a
+/// federated account whose provider shared no address (0035): it collides with
+/// nothing — the unique index ignores NULLs — and adds an address later.
 pub async fn insert(
     conn: &mut PgConnection,
     id: Uuid,
-    email: &str,
+    email: Option<&str>,
     display_name: &str,
     account_type: AccountType,
 ) -> Result<User, AppError> {

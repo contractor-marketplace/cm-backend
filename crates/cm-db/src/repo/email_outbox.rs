@@ -15,16 +15,26 @@ pub enum Kind {
     LoginCode,
     PasswordReset,
     JobAlert,
+    /// The code proving control of an added or changed address (0035). Its own
+    /// kind because "your sign-in code" is the wrong sentence on an email that
+    /// is not about signing in.
+    EmailVerify,
 }
 
 impl Kind {
-    pub const ALL: [Self; 3] = [Self::LoginCode, Self::PasswordReset, Self::JobAlert];
+    pub const ALL: [Self; 4] = [
+        Self::LoginCode,
+        Self::PasswordReset,
+        Self::JobAlert,
+        Self::EmailVerify,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LoginCode => "login_code",
             Self::PasswordReset => "password_reset",
             Self::JobAlert => "job_alert",
+            Self::EmailVerify => "email_verify",
         }
     }
 }

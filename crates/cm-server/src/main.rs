@@ -434,11 +434,15 @@ async fn admin(config: Config, command: AdminCommand) -> Result<(), cm_core::App
         AdminCommand::ShowRoles { .. } => {
             let roles = users::roles(&mut conn, user.id).await?;
             if roles.is_empty() {
-                println!("{} ({}) has no roles", user.email, user.id);
+                println!(
+                    "{} ({}) has no roles",
+                    user.email.as_deref().unwrap_or("<no email>"),
+                    user.id
+                );
             } else {
                 println!(
                     "{} ({}): {}",
-                    user.email,
+                    user.email.as_deref().unwrap_or("<no email>"),
                     user.id,
                     roles
                         .iter()
@@ -483,9 +487,16 @@ async fn admin(config: Config, command: AdminCommand) -> Result<(), cm_core::App
 
             let verb = if granting { "granted" } else { "revoked" };
             if changed {
-                println!("{verb} {role} for {} ({})", user.email, user.id);
+                println!(
+                    "{verb} {role} for {} ({})",
+                    user.email.as_deref().unwrap_or("<no email>"),
+                    user.id
+                );
             } else {
-                println!("no change: {} already reflects {role} {verb}", user.email);
+                println!(
+                    "no change: {} already reflects {role} {verb}",
+                    user.email.as_deref().unwrap_or("<no email>")
+                );
             }
         }
     }

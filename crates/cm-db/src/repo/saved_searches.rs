@@ -173,6 +173,13 @@ pub struct AlertMatch {
 ///   timeline             — PREDICATE $8
 ///   build_type           — PREDICATE $9
 ///   budget_max_cents     — PREDICATE $10
+///
+/// Delivery requires a **verified** address, not merely a stored one. Since
+/// 0035 an account can hold an address nobody proved — the copy a provider
+/// popup showed, forwarded by the browser — and mailing an unproved address
+/// turns saved searches into a way to send digests to someone else's inbox.
+/// Verified-only also keeps the `email` column non-null here by implication,
+/// so the row type stays `String`.
 // ponytail: sequential scan over saved_searches per batch; add array/GiST
 // indexes when searches reach tens of thousands.
 pub async fn matches_for_jobs(
@@ -193,6 +200,7 @@ pub async fn matches_for_jobs(
             AND (s.build_type IS NULL OR j.build_type = s.build_type) \
             AND (s.budget_min_cents IS NULL OR j.budget_max_cents >= s.budget_min_cents) \
            JOIN users u ON u.id = s.user_id AND u.status = 'active' \
+            AND u.email_verified_at IS NOT NULL \
           WHERE j.id = ANY ($1) AND j.status = 'open' \
             AND j.posted_by_user_id <> s.user_id \
           ORDER BY s.user_id, j.created_at",

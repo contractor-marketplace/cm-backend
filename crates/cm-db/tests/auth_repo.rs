@@ -14,7 +14,7 @@ async fn a_user(pool: &PgPool, email: &str) -> uuid::Uuid {
     users::insert(
         &mut conn,
         new_id(),
-        email,
+        Some(email),
         "Test Person",
         users::AccountType::Homeowner,
     )
@@ -32,7 +32,7 @@ async fn concurrent_registration_of_one_address_produces_one_account(pool: PgPoo
         users::insert(
             &mut conn,
             new_id(),
-            "race@example.test",
+            Some("race@example.test"),
             "Racer",
             users::AccountType::Homeowner,
         )

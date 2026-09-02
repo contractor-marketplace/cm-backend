@@ -706,7 +706,7 @@ async fn a_homeowner_account_cannot_be_recorded_as_a_claimant(pool: PgPool) {
     cm_db::repo::users::insert(
         &mut conn,
         homeowner,
-        "homeowner@example.test",
+        Some("homeowner@example.test"),
         "Homeowner",
         cm_db::repo::users::AccountType::Homeowner,
     )
@@ -800,7 +800,7 @@ async fn a_contractor_account_cannot_be_recorded_as_a_job_poster(pool: PgPool) {
     cm_db::repo::users::insert(
         &mut conn,
         contractor,
-        "contractor@example.test",
+        Some("contractor@example.test"),
         "Contractor",
         cm_db::repo::users::AccountType::Contractor,
     )

@@ -147,7 +147,7 @@ async fn filters_narrow_the_directory(pool: PgPool) {
     cm_db::repo::users::insert(
         &mut conn,
         owner,
-        "owner@example.test",
+        Some("owner@example.test"),
         "Owner",
         cm_db::repo::users::AccountType::Contractor,
     )

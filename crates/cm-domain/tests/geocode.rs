@@ -210,7 +210,7 @@ async fn a_claimed_listing_that_opts_in_publishes_its_exact_point(pool: PgPool) 
     cm_db::repo::users::insert(
         &mut conn,
         user_id,
-        "owner@example.test",
+        Some("owner@example.test"),
         "Owner",
         cm_db::repo::users::AccountType::Contractor,
     )

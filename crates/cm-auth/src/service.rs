@@ -267,7 +267,8 @@ impl AuthService {
         // anywhere leaves either a complete challenge or no account, never an
         // account whose code was lost.
         let mut tx = pool.begin().await.map_err(AppError::internal)?;
-        let user = users::insert(&mut tx, new_id(), email, display_name, account_type).await?;
+        let user =
+            users::insert(&mut tx, new_id(), Some(email), display_name, account_type).await?;
         passwords::insert(&mut tx, user.id, &password_hash).await?;
         let challenge = self.issue_challenge(&mut tx, user.id, email).await?;
         audit::record(
@@ -472,7 +473,13 @@ impl AuthService {
             .await?;
             LoginResult::Session(LoginOutcome { user, session })
         } else {
-            let challenge = self.issue_challenge(&mut tx, user_id, &user.email).await?;
+            let Some(address) = user.email.as_deref() else {
+                // A password credential implies an email account; a row without
+                // one here is corrupt, and minting a code with nowhere to send
+                // it would strand the person mid-login.
+                return Err(AppError::internal("password account with no email"));
+            };
+            let challenge = self.issue_challenge(&mut tx, user_id, address).await?;
             audit::record(
                 &mut tx,
                 self.event("auth.login_challenged", context)
@@ -620,7 +627,10 @@ impl AuthService {
         .await?;
 
         let mut tx = pool.begin().await.map_err(AppError::internal)?;
-        let challenge = self.issue_challenge(&mut tx, user.id, &user.email).await?;
+        let Some(address) = user.email.as_deref() else {
+            return Err(AppError::internal("challenged account with no email"));
+        };
+        let challenge = self.issue_challenge(&mut tx, user.id, address).await?;
         audit::record(
             &mut tx,
             self.event("auth.login_code_resent", context)
@@ -837,7 +847,12 @@ impl AuthService {
             &mut tx,
             &NewEmail {
                 user_id: user.id,
-                recipient: user.email.clone(),
+                recipient: match user.email.clone() {
+                    Some(address) => address,
+                    // Found by email, so this cannot be None; answered like an
+                    // unknown address rather than proving anything to a caller.
+                    None => return Ok(()),
+                },
                 kind: MailKind::PasswordReset,
                 subject: rendered.subject,
                 body_text: rendered.text,
@@ -892,7 +907,10 @@ impl AuthService {
             return Err(AppError::invalid(BAD_LINK));
         }
 
-        PasswordHasherService::check_policy(new_password, &user.email)?;
+        PasswordHasherService::check_policy(
+            new_password,
+            user.email.as_deref().unwrap_or_default(),
+        )?;
 
         // The expensive half, outside any connection.
         let new_hash = self.hasher.hash(new_password).await?;
@@ -1067,7 +1085,7 @@ impl AuthService {
             let Some(credential) = passwords::find(&mut conn, user_id).await? else {
                 return Err(AppError::invalid("This account has no password set."));
             };
-            (user.email, credential.password_hash)
+            (user.email.unwrap_or_default(), credential.password_hash)
         };
 
         // Phase 2: nothing from the pool is held here.
@@ -1229,9 +1247,11 @@ impl AuthService {
                 // Facebook makes the fully-absent case real rather than
                 // theoretical: an account created from a phone number, or one
                 // that declined the email permission, has no address anywhere.
-                // There is nowhere to put such a user yet — `users.email` is
-                // NOT NULL — so they are turned away with a message that says
-                // what to do.
+                // Such a person still gets in (0035): the account exists with
+                // no email, authenticates by this provider subject forever,
+                // and adds an address from the account page when they want
+                // notifications. Contact happens in the app; recovery is the
+                // provider subject, and support beyond that.
                 let client_email = client_email
                     .map(str::trim)
                     .filter(|value| looks_like_email(value));
@@ -1249,14 +1269,7 @@ impl AuthService {
                 let email = identity
                     .email
                     .clone()
-                    .or_else(|| client_email.map(str::to_owned))
-                    .ok_or_else(|| {
-                        AppError::invalid(format!(
-                            "That {} account has no email address. Sign up with an email \
-                             address instead.",
-                            provider.display_name()
-                        ))
-                    })?;
+                    .or_else(|| client_email.map(str::to_owned));
                 // Answers, permanently, what production tokens actually carry
                 // — the question that made this outage take two rounds to fix.
                 tracing::info!(
@@ -1264,7 +1277,13 @@ impl AuthService {
                     email_source,
                     "federated first arrival"
                 );
-                let display_name = email.split('@').next().unwrap_or("New user").to_owned();
+                // From the address when there is one; from the provider when
+                // there is not. "Google user" is a placeholder the person can
+                // edit, which beats blocking them for the lack of one.
+                let display_name = match email.as_deref() {
+                    Some(address) => address.split('@').next().unwrap_or("New user").to_owned(),
+                    None => format!("{} user", provider.display_name()),
+                };
 
                 // Which side of the marketplace this account is on has to come
                 // from the person, not from a token — a token cannot know, and
@@ -1289,22 +1308,27 @@ impl AuthService {
                     ))
                 })?;
 
-                let user =
-                    users::insert(&mut tx, new_id(), email.trim(), &display_name, account_type)
-                        .await
-                        .map_err(|error| match error {
-                            // Method-agnostic on purpose: the colliding account may
-                            // itself be federated (a Google account, hit by a Facebook
-                            // sign-up sharing the address), and "sign in with your
-                            // password" is wrong advice for an account that has none.
-                            // Naming the link feature waits for the account page that
-                            // reaches it — Phase D restores the fuller wording.
-                            AppError::Conflict { .. } => AppError::conflict(
-                                "An account already uses that email address. Sign in to \
+                let user = users::insert(
+                    &mut tx,
+                    new_id(),
+                    email.as_deref().map(str::trim),
+                    &display_name,
+                    account_type,
+                )
+                .await
+                .map_err(|error| match error {
+                    // Method-agnostic on purpose: the colliding account may
+                    // itself be federated (a Google account, hit by a Facebook
+                    // sign-up sharing the address), and "sign in with your
+                    // password" is wrong advice for an account that has none.
+                    // Naming the link feature waits for the account page that
+                    // reaches it — Phase D restores the fuller wording.
+                    AppError::Conflict { .. } => AppError::conflict(
+                        "An account already uses that email address. Sign in to \
                                  that account instead.",
-                            ),
-                            other => other,
-                        })?;
+                    ),
+                    other => other,
+                })?;
 
                 oauth::insert(
                     &mut tx,
@@ -1327,10 +1351,11 @@ impl AuthService {
         // different one, and verifying ours on the strength of theirs would
         // verify an address nobody proved.
         if identity.email_verified
-            && identity
-                .email
-                .as_deref()
-                .is_some_and(|claimed| claimed.trim().eq_ignore_ascii_case(user.email.trim()))
+            && identity.email.as_deref().is_some_and(|claimed| {
+                user.email
+                    .as_deref()
+                    .is_some_and(|own| claimed.trim().eq_ignore_ascii_case(own.trim()))
+            })
         {
             users::mark_email_verified(&mut tx, user.id).await?;
         }
