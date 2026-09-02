@@ -805,3 +805,123 @@ async fn a_client_address_is_ignored_for_a_returning_identity(pool: PgPool) {
         "a sign-in must not rewrite the account's address"
     );
 }
+
+/// The account page can say which sign-ins are attached: /v1/me names the
+/// connected providers, and only the names — subjects stay server-side.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_account_page_knows_which_providers_are_connected(pool: PgPool) {
+    let router = emulator_router(pool.clone());
+
+    let mut federated = Client::new(router.clone());
+    let signed_in = federated
+        .post(
+            "/v1/auth/google",
+            json!({
+                "id_token": production_token("google.com", "prov-1", Some("marisol@example.test")),
+                "account_type": "homeowner"
+            }),
+        )
+        .await;
+    assert_eq!(signed_in.status, StatusCode::OK, "{:?}", signed_in.json);
+
+    let me = federated.get("/v1/me").await;
+    assert_eq!(
+        me.json["connected_providers"],
+        json!(["google"]),
+        "{:?}",
+        me.json
+    );
+
+    // A password account reports none.
+    let mut password_user = Client::new(router);
+    assert_eq!(
+        password_user.register("plain@example.test").await.status,
+        StatusCode::OK
+    );
+    let me = password_user.get("/v1/me").await;
+    assert_eq!(me.json["connected_providers"], json!([]), "{:?}", me.json);
+}
+
+/// "Forgot password" doubles as "set a first password": a federated account
+/// has no credential row, and the reset upsert is exactly how it gets one —
+/// after which the email form works alongside the provider button.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reset_gives_a_federated_account_its_first_password(pool: PgPool) {
+    let router = emulator_router(pool.clone());
+    let mut client = Client::new(router.clone());
+
+    let signed_in = client
+        .post(
+            "/v1/auth/google",
+            json!({
+                "id_token": production_token("google.com", "prov-2", Some("marisol@example.test")),
+                "account_type": "homeowner"
+            }),
+        )
+        .await;
+    assert_eq!(signed_in.status, StatusCode::OK, "{:?}", signed_in.json);
+
+    // The email login path knows nothing of this account's password — there
+    // is none — and answers its uniform refusal.
+    let mut visitor = Client::new(router.clone());
+    let refused = visitor
+        .post(
+            "/v1/auth/login",
+            json!({ "email": "marisol@example.test", "password": PASSWORD }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+
+    // Reset issues a token to the address on file; spending it upserts the
+    // first credential.
+    let requested = visitor
+        .post(
+            "/v1/auth/password-reset/request",
+            json!({ "email": "marisol@example.test" }),
+        )
+        .await;
+    assert_eq!(
+        requested.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        requested.json
+    );
+
+    let token = {
+        let mail = visitor
+            .get("/__test/latest-email?to=marisol@example.test")
+            .await;
+        let body = mail.json["body_text"].as_str().expect("a reset email");
+        let start = body.find("token=").expect("a link") + "token=".len();
+        body[start..]
+            .split_whitespace()
+            .next()
+            .expect("a token")
+            .to_owned()
+    };
+    let confirmed = visitor
+        .post(
+            "/v1/auth/password-reset/confirm",
+            json!({ "token": token, "new_password": PASSWORD }),
+        )
+        .await;
+    assert_eq!(
+        confirmed.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        confirmed.json
+    );
+
+    // Both doors now open: the password works, and the provider still does.
+    let by_password = visitor
+        .post(
+            "/v1/auth/login",
+            json!({ "email": "marisol@example.test", "password": PASSWORD }),
+        )
+        .await;
+    assert!(
+        by_password.status == StatusCode::OK || by_password.status == StatusCode::ACCEPTED,
+        "a session or a code challenge, never a refusal: {:?}",
+        by_password.json
+    );
+}

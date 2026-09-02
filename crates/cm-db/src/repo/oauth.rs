@@ -27,6 +27,15 @@ impl Provider {
         }
     }
 
+    /// For a value read back out of the database.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "google" => Some(Self::Google),
+            "facebook" => Some(Self::Facebook),
+            _ => None,
+        }
+    }
+
     /// How the provider names itself to a user, for messages they will read.
     pub fn display_name(self) -> &'static str {
         match self {
@@ -95,6 +104,28 @@ pub async fn exists_for_user(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The providers connected to an account, for the account page.
+///
+/// Names only — the subjects stay server-side. A page needs to render
+/// "Google: connected" and offer the other button, nothing more.
+pub async fn providers_for_user(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+) -> Result<Vec<Provider>, AppError> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT provider FROM oauth_identities WHERE user_id = $1 ORDER BY provider",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(AppError::internal)?;
+
+    rows.iter()
+        .map(|value| Provider::parse(value))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| AppError::internal("unknown provider in oauth_identities"))
+}
+
 pub async fn insert(
     conn: &mut PgConnection,
     id: Uuid,

@@ -1,8 +1,11 @@
 //! `GET /v1/me`.
 
 use crate::extract::CurrentUser;
+use crate::state::AppState;
+use axum::extract::State;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use cm_core::AppError;
 use cm_db::repo::users::{AccountType, Role, UserStatus};
 use serde::Serialize;
 use uuid::Uuid;
@@ -11,6 +14,9 @@ use uuid::Uuid;
 pub struct MeResponse {
     user: UserView,
     roles: Vec<Role>,
+    /// Which sign-in providers are attached — "google", "facebook". Names
+    /// only; the account page renders connect buttons for the rest.
+    connected_providers: Vec<&'static str>,
     session: SessionView,
 }
 
@@ -39,16 +45,27 @@ pub struct SessionView {
     csrf_token: String,
 }
 
-pub async fn get_me(CurrentUser(caller): CurrentUser) -> Json<MeResponse> {
-    Json(MeResponse {
+pub async fn get_me(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+) -> Result<Json<MeResponse>, AppError> {
+    let mut conn = state.pool.acquire().await.map_err(AppError::internal)?;
+    let connected_providers = cm_db::repo::oauth::providers_for_user(&mut conn, caller.user.id)
+        .await?
+        .into_iter()
+        .map(|provider| provider.as_str())
+        .collect();
+
+    Ok(Json(MeResponse {
         user: user_view(&caller.user),
         roles: caller.roles.clone(),
+        connected_providers,
         session: SessionView {
             id: caller.session_id,
             expires_at: caller.session_expires_at,
             csrf_token: caller.csrf_token.clone(),
         },
-    })
+    }))
 }
 
 pub(crate) fn user_view(user: &cm_db::repo::users::User) -> UserView {
