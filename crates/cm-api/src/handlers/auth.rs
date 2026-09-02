@@ -208,6 +208,61 @@ pub async fn resend_login_code(
     Ok(challenge_response(challenge))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EmailChangeRequest {
+    /// Absent means "confirm the address already on file" — what a federated
+    /// account does, since it never travels the login-code path.
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmEmailRequest {
+    pub challenge_id: Uuid,
+    pub code: String,
+    /// The address the code was issued for. Bound into the code's digest, so
+    /// a different value here reads as a wrong code, not a different target.
+    pub email: String,
+}
+
+/// Start proving an email address. 202: the code is on its way to it.
+pub async fn request_email_change(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    ValidJson(body): ValidJson<EmailChangeRequest>,
+) -> Result<Response, AppError> {
+    let challenge = state
+        .auth
+        .request_email_verification(&state.pool, caller.user.id, body.email.as_deref(), &context)
+        .await?;
+
+    Ok(challenge_response(challenge))
+}
+
+/// Spend the code: the address is written and verified in one step, and the
+/// refreshed user comes back so the page can re-render without a second fetch.
+pub async fn confirm_email_change(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    ValidJson(body): ValidJson<ConfirmEmailRequest>,
+) -> Result<Response, AppError> {
+    let user = state
+        .auth
+        .confirm_email(
+            &state.pool,
+            caller.user.id,
+            body.challenge_id,
+            &body.code,
+            &body.email,
+            &context,
+        )
+        .await?;
+
+    Ok(Json(user_view(&user)).into_response())
+}
+
 pub async fn google_sign_in(
     State(state): State<AppState>,
     Context(context): Context,

@@ -220,6 +220,36 @@ pub async fn insert(
     row.try_into()
 }
 
+/// Set a proved address on an account.
+///
+/// Called only after the emailed code came back, so the address and its
+/// verification are one write — there is no state where the new address is
+/// stored but unproved. The unique index arbitrates collisions here exactly as
+/// it does at registration, and with the same message.
+pub async fn update_email(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    email: &str,
+) -> Result<User, AppError> {
+    let row: UserRow = sqlx::query_as(
+        "UPDATE users SET email = $2, email_verified_at = now(), updated_at = now() \
+          WHERE id = $1 \
+      RETURNING id, email, display_name, status, account_type, email_verified_at, created_at",
+    )
+    .bind(user_id)
+    .bind(email)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|error| match &error {
+        sqlx::Error::Database(db) if db.constraint() == Some("users_email_norm_key") => {
+            AppError::conflict("That email address is already registered.")
+        }
+        _ => AppError::internal(error),
+    })?;
+
+    row.try_into()
+}
+
 /// Look an account up by email.
 ///
 /// Normalisation is applied in SQL by the same expression the generated column

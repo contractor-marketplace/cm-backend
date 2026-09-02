@@ -35,6 +35,14 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/auth/logout-all", post(handlers::auth::logout_all))
         .route("/v1/auth/password", post(handlers::auth::change_password))
         .route("/v1/auth/link/google", post(handlers::auth::link_google))
+        // Prove control of an address: issue a code to it, then spend it. The
+        // way a federated account — which never travels the login-code path —
+        // verifies, adds or changes its email.
+        .route("/v1/me/email", post(handlers::auth::request_email_change))
+        .route(
+            "/v1/me/email/verify",
+            post(handlers::auth::confirm_email_change),
+        )
         .route(
             "/v1/auth/link/facebook",
             post(handlers::auth::link_facebook),

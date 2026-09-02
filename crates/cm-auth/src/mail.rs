@@ -241,6 +241,43 @@ font-variant-numeric:tabular-nums;color:{INK};\">{code}</td></tr>\
     }
 }
 
+/// The code proving control of an added or changed address.
+///
+/// Distinct from the sign-in code on purpose: "your sign-in code" on an email
+/// that is not about signing in reads as somebody else trying to get in.
+pub fn email_verify(code: &str) -> Rendered {
+    let body = format!(
+        "{label}{heading}{lead}\
+<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"margin:8px 0 4px 0;\">\
+<tr><td style=\"background-color:{SUNKEN};border:1px solid {RULE};border-radius:{RADIUS_INNER};padding:20px 30px;\
+font-family:{FONT_MONO};font-size:30px;line-height:36px;font-weight:500;letter-spacing:0.24em;\
+font-variant-numeric:tabular-nums;color:{INK};\">{code}</td></tr>\
+</table>{note}",
+        label = label("Account"),
+        heading = heading("Confirm this email address"),
+        lead = paragraph(
+            "Enter this code on your account page to confirm the address and \
+             turn on email notifications."
+        ),
+        note = footnote(
+            "This code expires in 10 minutes and can be used once. If you did not \
+             add this address to an account, you can ignore this email — nothing \
+             will be sent here again."
+        ),
+    );
+
+    Rendered {
+        subject: format!("{code} confirms your email address"),
+        text: format!(
+            "Your confirmation code is:\n\n    {code}\n\n\
+             Enter it on your account page to confirm this address. It expires \
+             in 10 minutes. If you did not add this address to an account, you \
+             can ignore this email.",
+        ),
+        html: shell(&format!("{code} — confirms this address"), &body),
+    }
+}
+
 /// The password-reset link. `link` is the full URL on the site.
 pub fn password_reset(link: &str) -> Rendered {
     let body = format!(

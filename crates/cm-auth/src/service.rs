@@ -328,6 +328,198 @@ impl AuthService {
         })
     }
 
+    /// Start proving an email address: issue a code to it.
+    ///
+    /// `new_email` present is add-or-change; absent is "confirm the address
+    /// already on file", which a federated account needs because it never
+    /// travels the login-code path that verifies everyone else. The address is
+    /// bound into the code's digest rather than stored anywhere, so confirming
+    /// re-supplies it and a tampered address simply fails the code check.
+    ///
+    /// Deliberately no collision precheck: two concurrent claims of one
+    /// address are arbitrated by the unique index at the write, exactly as
+    /// registration does it. The cost is one wasted email in the losing race;
+    /// the alternative is a TOCTOU check pretending to be a guarantee.
+    pub async fn request_email_verification(
+        &self,
+        pool: &PgPool,
+        user_id: Uuid,
+        new_email: Option<&str>,
+        context: &RequestContext,
+    ) -> Result<Challenge, AppError> {
+        let now = Utc::now();
+        ratelimit::enforce(
+            pool,
+            &self.pepper,
+            ratelimit::login_code_issue_per_user(),
+            &user_id.to_string(),
+            now,
+        )
+        .await?;
+
+        let mut tx = pool.begin().await.map_err(AppError::internal)?;
+        let Some(user) = users::find_by_id(&mut tx, user_id).await? else {
+            return Err(AppError::Unauthenticated);
+        };
+
+        let target = match new_email.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(address) => {
+                if !looks_like_email(address) {
+                    return Err(AppError::invalid("Enter a valid email address."));
+                }
+                address.to_owned()
+            }
+            None => user.email.clone().ok_or_else(|| {
+                AppError::invalid("This account has no email address yet — enter one to confirm.")
+            })?,
+        };
+
+        // Bounded per target as well as per caller, so an account cannot take
+        // turns flooding one victim's inbox with confirmation codes — the same
+        // pairing the reset-request path uses.
+        ratelimit::enforce(
+            pool,
+            &self.pepper,
+            ratelimit::password_reset_request_per_email(),
+            &target.to_lowercase(),
+            now,
+        )
+        .await?;
+
+        let challenge_id = new_id();
+        let code = login_code::generate_code()?;
+        auth_tokens::issue(
+            &mut tx,
+            challenge_id,
+            user_id,
+            Purpose::EmailVerify,
+            &login_code::email_verify_hash(&self.pepper, challenge_id, &code, &target),
+            login_code::CODE_TTL_SECS,
+        )
+        .await?;
+
+        let rendered = mail::email_verify(&code);
+        email_outbox::enqueue(
+            &mut tx,
+            &NewEmail {
+                user_id,
+                recipient: target.clone(),
+                kind: MailKind::EmailVerify,
+                subject: rendered.subject,
+                body_text: rendered.text,
+                body_html: Some(rendered.html),
+                unsubscribe_url: None,
+            },
+        )
+        .await?;
+
+        audit::record(
+            &mut tx,
+            self.event("auth.email_verify_requested", context)
+                .actor(ActorKind::User, Some(user_id))
+                .subject(user_id)
+                .data(serde_json::json!({
+                    "challenge_id": challenge_id,
+                    "address_is_new": new_email.is_some(),
+                })),
+        )
+        .await?;
+        tx.commit().await.map_err(AppError::internal)?;
+
+        Ok(Challenge {
+            challenge_id,
+            email: target,
+        })
+    }
+
+    /// Finish proving an address: the code came back from the inbox.
+    ///
+    /// `email` must be the address the challenge was issued for — it is bound
+    /// into the digest, so anything else reads as a wrong code. On success the
+    /// address is written and verified in one statement; a collision with
+    /// another account is the standard 409, and the spent challenge means the
+    /// person re-requests rather than retrying into it.
+    pub async fn confirm_email(
+        &self,
+        pool: &PgPool,
+        user_id: Uuid,
+        challenge_id: Uuid,
+        code: &str,
+        email: &str,
+        context: &RequestContext,
+    ) -> Result<users::User, AppError> {
+        let now = Utc::now();
+        ratelimit::enforce(
+            pool,
+            &self.pepper,
+            ratelimit::login_code_verify_per_challenge(),
+            &challenge_id.to_string(),
+            now,
+        )
+        .await?;
+
+        let email = email.trim();
+        let mut tx = pool.begin().await.map_err(AppError::internal)?;
+
+        let outcome = auth_tokens::verify_code(
+            &mut tx,
+            challenge_id,
+            Purpose::EmailVerify,
+            &login_code::email_verify_hash(&self.pepper, challenge_id, code.trim(), email),
+            login_code::MAX_CODE_ATTEMPTS,
+        )
+        .await?;
+
+        let owner = match outcome {
+            CodeOutcome::Matched { user_id } => user_id,
+            CodeOutcome::Wrong | CodeOutcome::Gone => {
+                audit::record(
+                    &mut tx,
+                    self.event("auth.email_verify_failed", context)
+                        .actor(ActorKind::User, Some(user_id))
+                        .subject(user_id)
+                        .data(serde_json::json!({ "challenge_id": challenge_id })),
+                )
+                .await?;
+                tx.commit().await.map_err(AppError::internal)?;
+                return Err(AppError::invalid("That code is incorrect or has expired."));
+            }
+        };
+        // A challenge is spendable only by the account it was issued to. The
+        // id is unguessable, so this is belt rather than load-bearing — but a
+        // cross-account spend would verify an address onto the wrong user.
+        if owner != user_id {
+            return Err(AppError::Unauthenticated);
+        }
+
+        let user = if users::find_by_id(&mut tx, user_id)
+            .await?
+            .ok_or(AppError::Unauthenticated)?
+            .email
+            .as_deref()
+            .is_some_and(|current| current.eq_ignore_ascii_case(email))
+        {
+            users::mark_email_verified(&mut tx, user_id).await?;
+            users::find_by_id(&mut tx, user_id)
+                .await?
+                .ok_or(AppError::Unauthenticated)?
+        } else {
+            users::update_email(&mut tx, user_id, email).await?
+        };
+
+        audit::record(
+            &mut tx,
+            self.event("auth.email_verified", context)
+                .actor(ActorKind::User, Some(user_id))
+                .subject(user_id)
+                .data(serde_json::json!({ "challenge_id": challenge_id })),
+        )
+        .await?;
+        tx.commit().await.map_err(AppError::internal)?;
+
+        Ok(user)
+    }
+
     /// Authenticate with a password.
     ///
     /// Every failure returns the same error. The only way to tell the cases
@@ -531,6 +723,7 @@ impl AuthService {
             auth_tokens::verify_code(
                 &mut conn,
                 challenge_id,
+                Purpose::LoginCode,
                 &login_code::code_hash(&self.pepper, challenge_id, code.trim()),
                 login_code::MAX_CODE_ATTEMPTS,
             )

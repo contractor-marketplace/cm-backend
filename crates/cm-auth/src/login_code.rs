@@ -55,6 +55,25 @@ pub fn code_hash(pepper: &Secret<String>, challenge_id: Uuid, code: &str) -> Vec
     crate::hash::peppered(pepper, "login_code", &format!("{challenge_id}:{code}"))
 }
 
+/// The digest of an email-verification code, bound to the address it proves.
+///
+/// The address rides inside the hash rather than in a table column: confirming
+/// re-supplies it, and a tampered address simply fails the code check. That is
+/// the whole storage story for "which address was this code sent to" — no
+/// schema, no column, nothing to clean up.
+pub fn email_verify_hash(
+    pepper: &Secret<String>,
+    challenge_id: Uuid,
+    code: &str,
+    address: &str,
+) -> Vec<u8> {
+    crate::hash::peppered(
+        pepper,
+        "email_verify",
+        &format!("{challenge_id}:{code}:{}", address.to_lowercase()),
+    )
+}
+
 /// The value of a remembered-device cookie: `user_id.expires_unix.signature`.
 pub fn device_value(pepper: &Secret<String>, user_id: Uuid, expires_at: DateTime<Utc>) -> String {
     let expires = expires_at.timestamp();

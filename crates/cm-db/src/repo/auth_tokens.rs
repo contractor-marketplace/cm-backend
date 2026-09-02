@@ -89,6 +89,7 @@ pub enum CodeOutcome {
 pub async fn verify_code(
     conn: &mut PgConnection,
     challenge_id: Uuid,
+    purpose: Purpose,
     code_hash: &[u8],
     max_attempts: i32,
 ) -> Result<CodeOutcome, AppError> {
@@ -100,13 +101,14 @@ pub async fn verify_code(
                     ELSE NULL \
                 END, \
                 updated_at = now() \
-          WHERE id = $1 AND purpose = 'login_code' \
+          WHERE id = $1 AND purpose = $4 \
             AND consumed_at IS NULL AND expires_at > now() \
       RETURNING user_id, (token_hash = $2)",
     )
     .bind(challenge_id)
     .bind(code_hash)
     .bind(max_attempts)
+    .bind(purpose.as_str())
     .fetch_optional(&mut *conn)
     .await
     .map_err(AppError::internal)?;
