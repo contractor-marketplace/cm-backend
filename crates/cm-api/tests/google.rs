@@ -71,6 +71,17 @@ fn production_token(
     subject: &str,
     identities_email: Option<&str>,
 ) -> String {
+    production_token_named(firebase_provider, subject, identities_email, None)
+}
+
+/// The same shape with the `name` claim Google attaches to essentially every
+/// token: the person's profile name, signed by the provider.
+fn production_token_named(
+    firebase_provider: &str,
+    subject: &str,
+    identities_email: Option<&str>,
+    name: Option<&str>,
+) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
@@ -79,7 +90,7 @@ fn production_token(
     if let Some(email) = identities_email {
         identities["email"] = json!([email]);
     }
-    let claims = json!({
+    let mut claims = json!({
         "sub": format!("firebase-{subject}"),
         "user_id": format!("firebase-{subject}"),
         "auth_time": now - 30,
@@ -92,6 +103,9 @@ fn production_token(
             "identities": identities
         }
     });
+    if let Some(name) = name {
+        claims["name"] = json!(name);
+    }
 
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
     let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
@@ -923,5 +937,67 @@ async fn a_reset_gives_a_federated_account_its_first_password(pool: PgPool) {
         by_password.status == StatusCode::OK || by_password.status == StatusCode::ACCEPTED,
         "a session or a code challenge, never a refusal: {:?}",
         by_password.json
+    );
+}
+
+/// The account is named after its person, not their address.
+///
+/// Google signs the person's profile name into the token; losing it meant an
+/// account created from marisol@… greeted its owner as "marisol", and one
+/// created with no address at all as "Google user". The token's claim also
+/// outranks the browser's copy — same precedence the email takes, and for the
+/// same reason: what the provider signed beats what the client asserts.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_tokens_name_claim_becomes_the_display_name(pool: PgPool) {
+    let mut client = Client::new(emulator_router(pool.clone()));
+
+    let response = client
+        .post(
+            "/v1/auth/google",
+            json!({
+                "id_token": production_token_named(
+                    "google.com",
+                    "named-subject-1",
+                    Some("marisol@example.test"),
+                    Some("Marisol Vega"),
+                ),
+                "account_type": "homeowner",
+                "display_name": "Browser Asserted"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+    assert_eq!(
+        response.json["user"]["display_name"], "Marisol Vega",
+        "the signed name wins: {:?}",
+        response.json
+    );
+}
+
+/// With no name in the token, the popup's copy fills in — the same standing as
+/// a name typed into the email form, which is any string anybody likes. Only
+/// with no name anywhere does the address's local part stand in.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_popups_name_fills_in_when_the_token_carries_none(pool: PgPool) {
+    let mut client = Client::new(emulator_router(pool.clone()));
+
+    let response = client
+        .post(
+            "/v1/auth/google",
+            json!({
+                "id_token": production_token("google.com", "named-subject-2", None),
+                "account_type": "homeowner",
+                "email": "marisol@example.test",
+                "display_name": "Marisol Vega"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json);
+    assert_eq!(
+        response.json["user"]["display_name"], "Marisol Vega",
+        "{:?}",
+        response.json
     );
 }

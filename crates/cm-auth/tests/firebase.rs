@@ -118,6 +118,7 @@ impl TokenBuilder {
                 "user_id": "firebase-uid-123",
                 "email": "marisol@example.test",
                 "email_verified": true,
+                "name": "Marisol Vega",
                 "auth_time": now - 30,
                 "iat": now - 30,
                 "exp": now + 3600,
@@ -214,6 +215,7 @@ async fn a_valid_token_yields_the_google_subject_not_the_firebase_uid() {
             email: Some("marisol@example.test".to_owned()),
             email_from_identities: false,
             email_verified: true,
+            name: Some("Marisol Vega".to_owned()),
         },
         "the identity key must be Google's subject, so dropping Firebase later re-links nobody"
     );

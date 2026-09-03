@@ -1385,6 +1385,7 @@ impl AuthService {
     /// entirely, so the field cannot be used to flip an existing account's
     /// side of the marketplace — which is not a thing this product allows at
     /// all, by any route.
+    #[allow(clippy::too_many_arguments)] // the client hints are optional and first-arrival-only; a struct would just rename the list
     pub async fn sign_in_with_provider(
         &self,
         pool: &PgPool,
@@ -1392,6 +1393,7 @@ impl AuthService {
         id_token: &str,
         intended_account_type: Option<users::AccountType>,
         client_email: Option<&str>,
+        client_display_name: Option<&str>,
         context: &RequestContext,
     ) -> Result<LoginOutcome, AppError> {
         let now = Utc::now();
@@ -1470,13 +1472,38 @@ impl AuthService {
                     email_source,
                     "federated first arrival"
                 );
-                // From the address when there is one; from the provider when
-                // there is not. "Google user" is a placeholder the person can
-                // edit, which beats blocking them for the lack of one.
-                let display_name = match email.as_deref() {
-                    Some(address) => address.split('@').next().unwrap_or("New user").to_owned(),
-                    None => format!("{} user", provider.display_name()),
-                };
+                // What to call the person, best source first. The token's
+                // `name` claim is the provider's own profile name under the
+                // provider's signature — "Michael Mansour" — and losing it to
+                // a fallback is how an account ends up greeting its owner as
+                // "Google user". The popup's copy comes next at exactly the
+                // trust of a name typed into the email form, which is none and
+                // needs none: display names are self-asserted everywhere in
+                // this product. Only with no name anywhere does it degrade to
+                // the address's local part, then to the provider placeholder.
+                //
+                // First arrival only, like everything else in this branch — a
+                // returning account's chosen name is its own.
+                //
+                // Truncated to the schema's cap (0003: 120 characters) rather
+                // than refused: nobody should be turned away at the door over
+                // the length of a name a provider chose to send.
+                let display_name = identity
+                    .name
+                    .clone()
+                    .or_else(|| {
+                        client_display_name
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| match email.as_deref() {
+                        Some(address) => address.split('@').next().unwrap_or("New user").to_owned(),
+                        None => format!("{} user", provider.display_name()),
+                    })
+                    .chars()
+                    .take(120)
+                    .collect::<String>();
 
                 // Which side of the marketplace this account is on has to come
                 // from the person, not from a token — a token cannot know, and

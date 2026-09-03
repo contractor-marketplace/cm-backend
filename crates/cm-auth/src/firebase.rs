@@ -109,6 +109,10 @@ struct FirebaseClaims {
     email: Option<String>,
     #[serde(default)]
     email_verified: Option<bool>,
+    /// The person's name as the provider knows it — "Michael Mansour", not a
+    /// handle. Google populates it; Facebook usually does; nothing requires it.
+    #[serde(default)]
+    name: Option<String>,
     auth_time: i64,
     exp: i64,
     iat: i64,
@@ -152,6 +156,14 @@ pub struct VerifiedIdentity {
     /// two rounds to diagnose.
     pub email_from_identities: bool,
     pub email_verified: bool,
+    /// The person's name from the token, when the provider put one there.
+    ///
+    /// Not identity and not trusted as such — it seeds `display_name` on first
+    /// arrival, a field the email sign-up form lets anybody type anyway. It is
+    /// simply the best available spelling of what to call someone: "Michael
+    /// Mansour" from the provider's profile, where the fallbacks can only offer
+    /// the email's local part or "Google user".
+    pub name: Option<String>,
 }
 
 pub struct FirebaseVerifier {
@@ -324,6 +336,12 @@ impl FirebaseVerifier {
             email,
             email_from_identities,
             email_verified: claims.email_verified.unwrap_or(false),
+            name: claims
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
         })
     }
 

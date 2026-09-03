@@ -100,6 +100,17 @@ pub struct FederatedSignInRequest {
     /// same way, by the emailed code.
     #[serde(default)]
     pub email: Option<String>,
+
+    /// The name the provider profile showed during the popup.
+    ///
+    /// Same standing as `email` above: a first-arrival hint, never identity.
+    /// The service prefers the token's own `name` claim — the provider's
+    /// profile name under the provider's signature — and reads this only when
+    /// the token carries none. Display names are self-asserted everywhere in
+    /// this product, so nothing is trusted here that the email form does not
+    /// already accept from anyone.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +297,7 @@ pub async fn google_sign_in(
             &body.id_token,
             account_type,
             body.email.as_deref(),
+            body.display_name.as_deref(),
             &context,
         )
         .await?;
@@ -316,6 +328,7 @@ pub async fn facebook_sign_in(
             &body.id_token,
             account_type,
             body.email.as_deref(),
+            body.display_name.as_deref(),
             &context,
         )
         .await?;
