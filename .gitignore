@@ -10,3 +10,4 @@
 # query validation to be reviewed before generated metadata enters the repo.
 # M0 uses only runtime-checked queries, so nothing here is generated yet.
 /.sqlx
+.DS_Store
