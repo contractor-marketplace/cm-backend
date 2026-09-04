@@ -3,6 +3,11 @@
 A description of what was done in this session and what state the code is in as
 a result. Context only.
 
+> For the current behaviour of every sign-in and sign-up path from every
+> account state — with the test pinning each cell — see
+> [`auth-matrix.md`](auth-matrix.md). That table is maintained; this record is
+> history.
+
 ---
 
 ## Starting state
