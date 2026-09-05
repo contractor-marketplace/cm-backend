@@ -318,18 +318,21 @@ that will not be lost (add a second admin under App Roles):
 5. Copy App ID and App Secret into the Firebase console → Authentication →
    Sign-in method → Facebook. The secret lives only there, on purpose.
 
-Verify from any shell, no Facebook session needed — ask Firebase for the URL
-it will send people to, and confirm Facebook serves it a login rather than an
-error:
+Verify from any shell that **Firebase** carries the new app — ask it for the
+URL it sends people to and check the `client_id`:
 
 ```bash
 curl -s -X POST "https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key=$NEXT_PUBLIC_FIREBASE_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"providerId":"facebook.com","continueUri":"https://contractorsmarketplace-8d703.firebaseapp.com/__/auth/handler"}'
-# then fetch the returned authUri: a redirect toward login.php is healthy;
-# HTTP 400 "Sorry, something went wrong" means the app is refusing the dialog
-# (wrong use case, Development mode, or missing Live-mode gates above).
 ```
+
+Do **not** try to judge the Meta side by fetching that URL with curl: Facebook
+answers any logged-out non-browser client with a 400 "Sorry, something went
+wrong" — a control test against Spotify's production app fails identically —
+so the fetch proves nothing about the app. The only real check of the Meta
+side is a person with a role on the app clicking the button (unpublished apps
+serve their role-holders), and then a person without one after publishing.
 
 The support mailbox on the deletion page is
 `support@contractorsmarketplace.co`; the domain's MX is registrar email
