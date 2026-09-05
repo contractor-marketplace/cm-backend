@@ -287,3 +287,50 @@ There is no dual-pepper transition implemented. Rotate during a quiet window.
 - Copying backups off the host.
 - Creating the first admin: `cm-server admin grant-role --email you@example.com
   --role admin`, from a shell. There is no endpoint that can create an admin.
+
+## Recreating the Meta app (Facebook Login)
+
+Needed when the Meta developer account is lost — which happened once — or when
+Meta disables an app. The entire configuration lives in two consoles; nothing
+in either repo changes.
+
+**Cost of a new app:** Facebook subjects are app-scoped IDs, so a new App ID
+orphans every existing `oauth_identities` row with `provider = 'facebook'` —
+those users can never reach their accounts through Facebook again. Count them
+first (`SELECT count(*) FROM oauth_identities WHERE provider = 'facebook'`)
+and treat a non-zero answer as a decision, not a step.
+
+In [developers.facebook.com](https://developers.facebook.com), on an account
+that will not be lost (add a second admin under App Roles):
+
+1. Create app → use case **"Authenticate and request data from users with
+   Facebook Login"** (the consumer one, NOT "Facebook Login for Business",
+   which silently refuses ordinary users).
+2. App Settings → Basic: privacy policy
+   `https://www.contractorsmarketplace.co/privacy`, data deletion → URL
+   `https://www.contractorsmarketplace.co/data-deletion`, app icon, category.
+   These are the Live-mode gates.
+3. Facebook Login → Settings: Client OAuth Login **on**, Web OAuth Login
+   **on**, Valid OAuth Redirect URIs =
+   `https://contractorsmarketplace-8d703.firebaseapp.com/__/auth/handler`.
+4. Switch **App Mode to Live**. In Development mode only role-holders can sign
+   in, and everyone else gets a silent bounce to facebook.com.
+5. Copy App ID and App Secret into the Firebase console → Authentication →
+   Sign-in method → Facebook. The secret lives only there, on purpose.
+
+Verify from any shell, no Facebook session needed — ask Firebase for the URL
+it will send people to, and confirm Facebook serves it a login rather than an
+error:
+
+```bash
+curl -s -X POST "https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key=$NEXT_PUBLIC_FIREBASE_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"providerId":"facebook.com","continueUri":"https://contractorsmarketplace-8d703.firebaseapp.com/__/auth/handler"}'
+# then fetch the returned authUri: a redirect toward login.php is healthy;
+# HTTP 400 "Sorry, something went wrong" means the app is refusing the dialog
+# (wrong use case, Development mode, or missing Live-mode gates above).
+```
+
+The support mailbox on the deletion page is
+`support@contractorsmarketplace.co`; the domain's MX is registrar email
+forwarding, so confirm a forward rule for that address actually exists.
