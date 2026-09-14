@@ -4,9 +4,12 @@
 //! register. Approving one is the only way a listing becomes editable, and —
 //! together with an active licence — the only way it becomes verified.
 //!
-//! Nothing here trusts the claimant's own evidence on its own. What they submit
-//! is stored as an assertion; what makes the decision is a typed
-//! `verification_checks` row written by whoever or whatever actually checked.
+//! Early-launch posture: `open` approves the claim itself, on the claimant's
+//! own assertion, to remove the moderation bottleneck from go-to-market. The
+//! evidence they submit is still stored verbatim, the audit log marks the
+//! approval as automatic, and the verified badge still demands an active CSLB
+//! licence — so trust in the *badge* is unchanged; only ownership of the
+//! listing page is granted on say-so.
 
 use cm_core::AppError;
 use cm_db::repo::audit::{ActorKind, AuditEvent};
@@ -15,7 +18,16 @@ use cm_db::repo::{audit, contractors, users};
 use cm_db::PgPool;
 use uuid::Uuid;
 
-/// Open a claim on a listing.
+/// Open a claim on a listing — and, in this early-launch phase, approve it in
+/// the same transaction.
+///
+/// Auto-approval is a go-to-market decision, not a security one: ownership of
+/// the listing is granted on the claimant's own assertion, with no moderator
+/// in the loop. What keeps this honest is that the verified badge is NOT
+/// granted here — `verification::recompute` still requires an active CSLB
+/// licence, so an auto-approved claim on a dead licence stays unverified.
+/// The moderation path (`decide`, the admin queue, the endpoints) is kept
+/// intact; restoring manual review means deleting the approval block below.
 pub async fn open(
     pool: &PgPool,
     contractor_id: Uuid,
@@ -51,12 +63,58 @@ pub async fn open(
                 "contractor_id": contractor_id,
                 "method": method.as_str(),
             }))
+            .request_id(request_id.clone()),
+    )
+    .await?;
+
+    // ── auto-approval (early-launch) ────────────────────────────────────────
+    // `decided_by` is the claimant: nobody else decided this, and pretending
+    // an admin did would falsify the record. Two simultaneous claims on one
+    // listing both reach here; the partial unique index
+    // `contractor_claims_one_approved_per_contractor` lets exactly one UPDATE
+    // through and maps the loser to a 409 in the repo.
+    claims::decide(
+        &mut tx,
+        claim.id,
+        ClaimStatus::Approved,
+        Some(user_id),
+        Some("auto-approved at launch; no moderator reviewed this claim"),
+    )
+    .await?;
+    if !contractors::attach_claimant(&mut tx, contractor_id, user_id).await? {
+        return Err(AppError::conflict("This listing has already been claimed."));
+    }
+    users::grant_role(&mut tx, user_id, users::Role::Contractor, None).await?;
+
+    // No `verification_checks` row: that table records checks somebody
+    // actually performed, and nobody performed one. The audit entry below is
+    // the record that this approval was automatic.
+    let outcome = crate::verification::recompute(&mut tx, contractor_id).await?;
+
+    audit::record(
+        &mut tx,
+        AuditEvent::new("claim.approved", "contractor_claims")
+            .actor(ActorKind::User, Some(user_id))
+            .subject(claim.id)
+            .data(serde_json::json!({
+                "contractor_id": contractor_id,
+                "claimant": user_id,
+                "auto_approved": true,
+                "verified": outcome.verified,
+                "verification_reason": outcome.reason,
+            }))
             .request_id(request_id),
     )
     .await?;
 
+    // Re-read inside the transaction so the caller sees the approved row,
+    // not the pending one loaded before the decision.
+    let approved = claims::find(&mut tx, claim.id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
     tx.commit().await.map_err(AppError::internal)?;
-    Ok(claim)
+    Ok(approved)
 }
 
 /// Withdraw one's own pending claim.

@@ -31,55 +31,19 @@ async fn an_approved_claim_grants_ownership_and_the_badge(pool: PgPool) {
         )
         .await;
     assert_eq!(opened.status, StatusCode::CREATED, "{:?}", opened.json);
-    assert_eq!(opened.json["status"], "pending");
-    let claim_id = opened.json["id"].as_str().expect("id").to_owned();
 
-    // Not verified yet: a claim nobody has decided is an assertion.
-    let mut anyone = Client::new(router.clone());
-    let before = anyone.get(&format!("/v1/contractors/{id}")).await;
-    assert_eq!(before.json["verified"], false);
-    assert_eq!(before.json["is_claimed"], false);
-
-    let mut admin = Client::new(router.clone());
-    admin.register("admin@example.test").await;
-    make_admin(&pool, "admin@example.test").await;
-    // The role only takes effect on the next request, which re-reads it.
-    let queue = admin.get("/v1/admin/claims").await;
-    assert_eq!(queue.status, StatusCode::OK, "{:?}", queue.json);
-    assert_eq!(queue.json.as_array().expect("array").len(), 1);
-
-    let decided = admin
-        .post(
-            &format!("/v1/admin/claims/{claim_id}/decide"),
-            json!({ "approve": true, "note": "licence and phone check passed" }),
-        )
-        .await;
-    assert_eq!(decided.status, StatusCode::OK, "{:?}", decided.json);
-    assert_eq!(decided.json["verified"], true);
-    assert!(decided.json["verification_reason"]
-        .as_str()
-        .expect("reason")
-        .contains("1047382"));
-
-    // The claim in the response must reflect the decision that was just made.
-    // This asserted nothing until it was added, and the endpoint was returning
-    // the claim as it stood BEFORE the decision — so every approval and every
-    // rejection reported back as still `pending` with no `decided_at`, and a
-    // moderator's client would have shown that nothing happened.
-    assert_eq!(
-        decided.json["claim"]["status"], "approved",
-        "the decision response returned a stale claim: {:?}",
-        decided.json["claim"]
-    );
+    // Early-launch: the claim is approved in the same request, with the
+    // decision attributed to the claimant, never to a phantom moderator.
+    assert_eq!(opened.json["status"], "approved");
     assert!(
-        !decided.json["claim"]["decided_at"].is_null(),
-        "a decided claim must carry the time it was decided"
-    );
-    assert_eq!(
-        decided.json["claim"]["decision_note"],
-        "licence and phone check passed"
+        !opened.json["decided_at"].is_null(),
+        "an auto-approved claim must carry the time it was decided"
     );
 
+    // Ownership and the badge follow immediately — the badge only because
+    // this fixture's licence is active. See the expired-licence test for the
+    // half auto-approval does NOT grant.
+    let mut anyone = Client::new(router.clone());
     let after = anyone.get(&format!("/v1/contractors/{id}")).await;
     assert_eq!(after.json["verified"], true);
     assert_eq!(after.json["is_claimed"], true);
@@ -87,6 +51,15 @@ async fn an_approved_claim_grants_ownership_and_the_badge(pool: PgPool) {
     // The claimant now holds the contractor role.
     let me = claimant.get("/v1/me").await;
     assert_eq!(me.json["roles"], json!(["contractor"]));
+
+    // Nothing waits for a moderator.
+    let mut admin = Client::new(router.clone());
+    admin.register("admin@example.test").await;
+    make_admin(&pool, "admin@example.test").await;
+    // The role only takes effect on the next request, which re-reads it.
+    let queue = admin.get("/v1/admin/claims").await;
+    assert_eq!(queue.status, StatusCode::OK, "{:?}", queue.json);
+    assert_eq!(queue.json.as_array().expect("array").len(), 0);
 }
 
 /// A licence that is not active never produces a badge, however good the claim.
@@ -104,25 +77,24 @@ async fn an_expired_licence_is_never_verified(pool: PgPool) {
             json!({ "method": "manual_review" }),
         )
         .await;
-    let claim_id = opened.json["id"].as_str().expect("id").to_owned();
 
-    let mut admin = Client::new(router.clone());
-    admin.register("admin@example.test").await;
-    make_admin(&pool, "admin@example.test").await;
+    // Auto-approval grants ownership, never the badge: the licence is expired.
+    assert_eq!(opened.status, StatusCode::CREATED, "{:?}", opened.json);
+    assert_eq!(opened.json["status"], "approved");
 
-    let decided = admin
-        .post(
-            &format!("/v1/admin/claims/{claim_id}/decide"),
-            json!({ "approve": true }),
-        )
+    let after = Client::new(router.clone())
+        .get(&format!("/v1/contractors/{id}"))
         .await;
+    assert_eq!(after.json["verified"], false);
+    assert_eq!(after.json["is_claimed"], true);
 
-    assert_eq!(decided.status, StatusCode::OK);
-    assert_eq!(decided.json["verified"], false);
-    assert!(decided.json["verification_reason"]
-        .as_str()
-        .expect("reason")
-        .contains("expired"));
+    let reason: String =
+        sqlx::query_scalar("SELECT verification_reason FROM contractors WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("reason");
+    assert!(reason.contains("expired"), "{reason}");
 }
 
 /// An import that changes a licence must move the badge with it.
@@ -169,67 +141,40 @@ async fn a_licence_going_inactive_removes_the_badge(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn two_simultaneous_approvals_produce_exactly_one_owner(pool: PgPool) {
+async fn two_simultaneous_claims_produce_exactly_one_owner(pool: PgPool) {
     seed_directory(&pool).await;
     let id = contractor_id(&pool, "1047382").await;
     let router = router(pool.clone());
 
-    // Two people claim the same listing.
+    // Two people claim the same listing at the same instant. With
+    // auto-approval the race moved from the moderation queue to the open
+    // itself: both pass the "is it claimed" pre-check, and the partial unique
+    // index `contractor_claims_one_approved_per_contractor` decides who owns.
     let mut first = Client::new(router.clone());
     first.register_contractor("first@example.test").await;
     let mut second = Client::new(router.clone());
     second.register_contractor("second@example.test").await;
 
-    let a = first
-        .post(
-            &format!("/v1/contractors/{id}/claims"),
-            json!({ "method": "manual_review" }),
-        )
-        .await;
-    let b = second
-        .post(
-            &format!("/v1/contractors/{id}/claims"),
-            json!({ "method": "manual_review" }),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::CREATED);
-    assert_eq!(
-        b.status,
-        StatusCode::CREATED,
-        "two pending claims are allowed"
-    );
-
-    let claim_a = a.json["id"].as_str().expect("id").to_owned();
-    let claim_b = b.json["id"].as_str().expect("id").to_owned();
-
-    let mut admin = Client::new(router.clone());
-    admin.register("admin@example.test").await;
-    make_admin(&pool, "admin@example.test").await;
-    admin.get("/v1/me").await;
-
-    // Approve both at once.
-    let approve = |claim: String| {
-        let mut client = Client::new(router.clone());
-        let session = admin.session_cookie().expect("session").to_owned();
-        let csrf = admin.csrf_token().expect("csrf").to_owned();
-        client.set_session(&session);
-        client.set_csrf(&csrf);
+    let claim = |client: &Client| {
+        let mut racer = Client::new(router.clone());
+        let session = client.session_cookie().expect("session").to_owned();
+        let csrf = client.csrf_token().expect("csrf").to_owned();
+        racer.set_session(&session);
+        racer.set_csrf(&csrf);
+        let path = format!("/v1/contractors/{id}/claims");
         tokio::spawn(async move {
-            client
-                .post(
-                    &format!("/v1/admin/claims/{claim}/decide"),
-                    json!({ "approve": true }),
-                )
+            racer
+                .post(&path, json!({ "method": "manual_review" }))
                 .await
                 .status
         })
     };
 
-    let (first_status, second_status) = tokio::join!(approve(claim_a), approve(claim_b));
+    let (first_status, second_status) = tokio::join!(claim(&first), claim(&second));
     let statuses = [first_status.expect("join"), second_status.expect("join")];
 
     let successes = statuses.iter().filter(|s| s.is_success()).count();
-    assert_eq!(successes, 1, "exactly one approval may win: {statuses:?}");
+    assert_eq!(successes, 1, "exactly one claim may win: {statuses:?}");
     assert!(
         statuses.contains(&StatusCode::CONFLICT),
         "the loser is told, not silently ignored: {statuses:?}"
@@ -307,7 +252,7 @@ async fn a_claim_needs_a_session_and_moderation_needs_a_role(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_claimant_may_withdraw_only_their_own_pending_claim(pool: PgPool) {
+async fn withdrawal_applies_only_to_pending_claims(pool: PgPool) {
     seed_directory(&pool).await;
     let id = contractor_id(&pool, "1047382").await;
     let router = router(pool.clone());
@@ -333,15 +278,8 @@ async fn a_claimant_may_withdraw_only_their_own_pending_claim(pool: PgPool) {
         StatusCode::NOT_FOUND
     );
 
-    assert_eq!(
-        claimant
-            .post(&format!("/v1/me/claims/{claim_id}/withdraw"), json!({}))
-            .await
-            .status,
-        StatusCode::NO_CONTENT
-    );
-
-    // Withdrawing twice is a conflict, not a second withdrawal.
+    // Under auto-approval no claim is ever pending, so withdrawal of one's
+    // own (now approved) claim is a conflict, not a way to un-own a listing.
     assert_eq!(
         claimant
             .post(&format!("/v1/me/claims/{claim_id}/withdraw"), json!({}))
@@ -351,7 +289,7 @@ async fn a_claimant_may_withdraw_only_their_own_pending_claim(pool: PgPool) {
     );
 
     let mine = claimant.get("/v1/me/claims").await;
-    assert_eq!(mine.json[0]["status"], "withdrawn");
+    assert_eq!(mine.json[0]["status"], "approved");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -389,29 +327,17 @@ async fn a_second_claim_on_a_claimed_listing_is_refused(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_decision_is_auditable_end_to_end(pool: PgPool) {
+async fn an_auto_approval_is_auditable_end_to_end(pool: PgPool) {
     seed_directory(&pool).await;
     let id = contractor_id(&pool, "1047382").await;
     let router = router(pool.clone());
 
     let mut claimant = Client::new(router.clone());
     claimant.register_contractor("claimant@example.test").await;
-    let opened = claimant
+    claimant
         .post(
             &format!("/v1/contractors/{id}/claims"),
             json!({ "method": "manual_review" }),
-        )
-        .await;
-    let claim_id = opened.json["id"].as_str().expect("id").to_owned();
-
-    let mut admin = Client::new(router);
-    admin.register("admin@example.test").await;
-    make_admin(&pool, "admin@example.test").await;
-    admin.get("/v1/me").await;
-    admin
-        .post(
-            &format!("/v1/admin/claims/{claim_id}/decide"),
-            json!({ "approve": true }),
         )
         .await;
 
@@ -427,21 +353,24 @@ async fn a_decision_is_auditable_end_to_end(pool: PgPool) {
         );
     }
 
-    // The evidence row names who decided and what the badge became.
+    // The approval names itself as automatic and records what the badge
+    // became, so "who approved this and why" is answerable later.
     let data: serde_json::Value =
         sqlx::query_scalar("SELECT data FROM audit_log WHERE action = 'claim.approved'")
             .fetch_one(&pool)
             .await
             .expect("row");
+    assert_eq!(data["auto_approved"], true);
     assert_eq!(data["verified"], true);
     assert!(data["verification_reason"].is_string());
 
-    let checks: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM verification_checks WHERE contractor_id = $1 AND kind = 'manual_review'",
-    )
-    .bind(id)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
-    assert_eq!(checks, 1);
+    // No verification check is fabricated: that table records checks somebody
+    // actually performed, and nobody performed one here.
+    let checks: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM verification_checks WHERE contractor_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(checks, 0);
 }
