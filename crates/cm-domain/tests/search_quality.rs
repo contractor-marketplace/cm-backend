@@ -416,7 +416,7 @@ async fn seed_corpus(pool: &PgPool) {
         cm_domain::location::republish(&mut conn, upserted.id)
             .await
             .expect("locate");
-        cm_domain::verification::recompute(&mut conn, upserted.id, Some(run_id))
+        cm_domain::verification::recompute(&mut conn, upserted.id)
             .await
             .expect("verify");
 

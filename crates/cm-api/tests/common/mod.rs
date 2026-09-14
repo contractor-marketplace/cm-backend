@@ -562,7 +562,7 @@ pub async fn seed_directory(pool: &PgPool) {
         cm_domain::location::republish(&mut conn, upserted.id)
             .await
             .expect("locate");
-        cm_domain::verification::recompute(&mut conn, upserted.id, Some(run_id))
+        cm_domain::verification::recompute(&mut conn, upserted.id)
             .await
             .expect("verify");
     }
@@ -587,7 +587,7 @@ pub async fn force_claim(pool: &PgPool, contractor_id: uuid::Uuid, user_id: uuid
     cm_db::repo::contractors::attach_claimant(&mut conn, contractor_id, user_id)
         .await
         .expect("claim");
-    cm_domain::verification::recompute(&mut conn, contractor_id, None)
+    cm_domain::verification::recompute(&mut conn, contractor_id)
         .await
         .expect("verify");
 }

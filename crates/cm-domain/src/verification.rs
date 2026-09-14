@@ -4,12 +4,15 @@
 //! that mentions the field is rejected outright rather than ignored — silently
 //! ignoring it teaches a client that it worked.
 //!
-//! A badge is a claim about the world, and the world moves. The reason and the
-//! import it came from are stored with it, so "why is this contractor verified"
-//! is answerable later by someone who was not there.
+//! A badge is a claim about the world, and the world moves. The reason is
+//! stored with it in plain English naming the licence, so "why is this
+//! contractor verified" is answerable later by someone who was not there.
+//! The licence row behind it carries `last_seen_at`, and the import run behind
+//! that carries CSLB's snapshot date and the file's hash, so the full chain
+//! back to a download survives without this module logging anything.
 
 use chrono::Utc;
-use cm_core::{new_id, AppError};
+use cm_core::AppError;
 use cm_db::repo::contractors;
 use cm_db::repo::licenses::{self, LicenseStatus};
 use sqlx::PgConnection;
@@ -26,12 +29,15 @@ pub struct Outcome {
 ///
 /// Called from exactly three places: a claim decision, an import, and the
 /// nightly re-check. Every one of them passes a transaction, so the badge and
-/// the evidence for it commit together.
-pub async fn recompute(
-    conn: &mut PgConnection,
-    contractor_id: Uuid,
-    source_run_id: Option<Uuid>,
-) -> Result<Outcome, AppError> {
+/// the reason for it commit together.
+///
+/// This used to also write a `verification_checks` row on every pass. It ran
+/// nightly against licence rows that only move at import time, so it logged
+/// one row per contractor per night restating the same import, for ever, with
+/// no prune. Nothing read them. `verification_checks` is still the record of
+/// checks a *person* performed — a claim decision, a phone code — which is
+/// what a check log is for.
+pub async fn recompute(conn: &mut PgConnection, contractor_id: Uuid) -> Result<Outcome, AppError> {
     let claimed = contractors::location_inputs(conn, contractor_id)
         .await?
         .map(|inputs| inputs.is_claimed)
@@ -40,29 +46,6 @@ pub async fn recompute(
     let facts = licenses::facts_for_contractor(conn, contractor_id).await?;
 
     let outcome = decide(claimed, facts.as_ref());
-
-    // The observation is recorded whether or not it changed anything, so the
-    // history shows what was true at each import rather than only the changes.
-    if let Some(facts) = &facts {
-        let passed = facts.status == LicenseStatus::Active && !is_expired(facts);
-        sqlx::query(
-            "INSERT INTO verification_checks \
-                 (id, contractor_id, kind, outcome, evidence, source_run_id, observed_at) \
-             VALUES ($1, $2, 'cslb_license_active', $3, $4, $5, now())",
-        )
-        .bind(new_id())
-        .bind(contractor_id)
-        .bind(if passed { "pass" } else { "fail" })
-        .bind(serde_json::json!({
-            "license_no": facts.license_no,
-            "status": facts.status.as_str(),
-            "expiration_date": facts.expiration_date,
-        }))
-        .bind(source_run_id)
-        .execute(&mut *conn)
-        .await
-        .map_err(AppError::internal)?;
-    }
 
     contractors::set_verification(conn, contractor_id, outcome.verified, &outcome.reason).await?;
 
@@ -161,7 +144,7 @@ pub async fn recompute_all(pool: &cm_db::PgPool, page: i64) -> Result<u64, AppEr
 
         let mut tx = pool.begin().await.map_err(AppError::internal)?;
         for id in &ids {
-            recompute(&mut tx, *id, None).await?;
+            recompute(&mut tx, *id).await?;
         }
         tx.commit().await.map_err(AppError::internal)?;
         processed += ids.len() as u64;

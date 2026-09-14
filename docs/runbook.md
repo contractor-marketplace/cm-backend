@@ -162,6 +162,20 @@ handlers running against a schema they were not written for.
 A database *ahead* of the binary is fine and keeps serving — every migration is
 additive, so the middle of a rolling deploy is a valid state.
 
+**0036 is the one exception, and it only runs once.** It deletes the derived
+`cslb_license_active` rows the old nightly recompute left behind — on the order
+of 50k per night the timer ran, so plan for a migration that takes minutes
+rather than seconds, and **take the backup first** (`deploy/backup.sh`); this
+is the only migration in the set that destroys rows. It is still safe for an
+older binary to keep serving through: nothing reads those rows, and the `kind`
+is deliberately left in the CHECK constraint so an old binary's writes would
+still be accepted. Afterwards, reclaim the space rather than waiting for
+autovacuum:
+
+```bash
+psql "$DATABASE_URL" -c "VACUUM (ANALYZE) verification_checks;"
+```
+
 ## Importing CSLB data
 
 The file comes from the CSLB Public Data Portal's **Master List** (License
@@ -265,7 +279,7 @@ names `/usr/bin/gcloud` explicitly.
 | Everyone is logged out after a deploy | `CM_HASH_PEPPER` changed. It keys CSRF tokens; sessions survive, CSRF tokens do not. |
 | One client is rate-limited unfairly | `CM_TRUST_PROXY_HEADERS` is false, so every request is attributed to Caddy's loopback address. Set it true — the service ignores the header from any non-loopback peer regardless. |
 | Contractors missing from map search | `SELECT count(*) FROM contractors WHERE public_point IS NULL` and the geocode queue. |
-| A badge looks wrong | `SELECT verified, verification_reason FROM contractors WHERE id = ...` — the reason is stored. Then `verification_checks` for that contractor. |
+| A badge looks wrong | `SELECT verified, verification_reason FROM contractors WHERE id = ...` — the reason is stored, in English, naming the licence. Then the licence row (`last_seen_at`) and the `license_import_runs` entry behind it for the download it came from. `verification_checks` holds only checks a person performed, so it is usually empty. |
 
 ## Rotating the pepper
 

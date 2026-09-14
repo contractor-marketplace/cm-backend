@@ -170,7 +170,7 @@ pub async fn decide(
     .await?;
 
     // The single authority. Never a value from the request.
-    let outcome = crate::verification::recompute(&mut tx, claim.contractor_id, None).await?;
+    let outcome = crate::verification::recompute(&mut tx, claim.contractor_id).await?;
 
     audit::record(
         &mut tx,

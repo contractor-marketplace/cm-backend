@@ -312,12 +312,21 @@ async fn a_detail_page_resolves_by_id_or_slug_and_shows_its_evidence(pool: PgPoo
     assert_eq!(by_id.json["license_status"], "active");
     assert_eq!(by_id.json["verified"], false);
 
-    // The evidence behind the badge is visible, so "why is this not verified"
-    // is answerable from the page itself.
-    assert!(!by_id.json["verification"]
-        .as_array()
-        .expect("array")
-        .is_empty());
+    // "Why is this not verified" is answerable from the page itself. It is
+    // answered in a sentence naming the licence, not in a list of check rows:
+    // those record what a person did — a claim decision, a phone code — and
+    // nobody has done anything to this listing yet.
+    let reason = by_id.json["verification_reason"]
+        .as_str()
+        .expect("an unverified listing still says why");
+    assert!(reason.contains("1047382"), "{reason}");
+    assert!(
+        by_id.json["verification"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "an untouched listing has no human checks against it"
+    );
 
     let slug = by_id.json["slug"].as_str().expect("slug").to_owned();
     let by_slug = client.get(&format!("/v1/contractors/{slug}")).await;

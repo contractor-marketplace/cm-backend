@@ -669,7 +669,7 @@ async fn flush(
             }
         }
 
-        crate::verification::recompute(&mut tx, upserted.id, Some(run_id)).await?;
+        crate::verification::recompute(&mut tx, upserted.id).await?;
     }
 
     tx.commit().await.map_err(AppError::internal)?;
