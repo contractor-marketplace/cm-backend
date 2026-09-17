@@ -116,6 +116,16 @@ fn facebook_token(app_scoped_id: &str, email: &str) -> String {
     provider_token("facebook.com", app_scoped_id, email)
 }
 
+/// The providers every side-handling test below runs against, as
+/// `(firebase_provider, route)`.
+///
+/// One entry today. Facebook is wired end to end but unpublished
+/// (`facebookLoginEnabled` in cm-frontend/lib/firebase.ts); when it ships,
+/// add `("facebook.com", "/v1/auth/facebook")` here and every test that loops
+/// over this list runs on that route too — `sign_in_with_provider` is one
+/// function with the provider as a parameter, so that is the whole expansion.
+const PROVIDERS: &[(&str, &str)] = &[("google.com", "/v1/auth/google")];
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_first_google_sign_in_creates_an_account_and_a_session(pool: PgPool) {
     let mut client = Client::new(emulator_router(pool.clone()));
@@ -609,40 +619,52 @@ async fn federated_sign_in_without_an_account_refuses_rather_than_guessing(pool:
 ///
 /// An account not being able to change sides is the rule this product is built
 /// on, so a field that could flip it through a sign-in endpoint would be the
-/// most direct way to break that rule.
+/// most direct way to break that rule. Both directions, because a check that
+/// only ever refused "contractor" would pass a one-directional test.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_account_type_field_cannot_re_type_an_existing_account(pool: PgPool) {
     let router = emulator_router(pool.clone());
 
-    let created = Client::new(router.clone())
-        .post(
-            "/v1/auth/google",
-            json!({ "id_token": token("stable-1", "stays@example.test"),
-                    "account_type": "homeowner" }),
-        )
-        .await;
-    assert_eq!(created.status, StatusCode::OK, "{:?}", created.json);
-    assert_eq!(created.json["user"]["account_type"], "homeowner");
+    for (provider, route) in PROVIDERS.iter().copied() {
+        for (created_as, claimed_later) in
+            [("homeowner", "contractor"), ("contractor", "homeowner")]
+        {
+            let subject = format!("stable-{created_as}");
+            let email = format!("{created_as}@{provider}.example.test");
 
-    // The same identity returning, now claiming the other side.
-    let returning = Client::new(router)
-        .post(
-            "/v1/auth/google",
-            json!({ "id_token": token("stable-1", "stays@example.test"),
-                    "account_type": "contractor" }),
-        )
-        .await;
-    assert_eq!(returning.status, StatusCode::OK, "{:?}", returning.json);
-    assert_eq!(
-        returning.json["user"]["account_type"], "homeowner",
-        "a returning identity keeps its side, whatever the request claims"
-    );
+            let created = Client::new(router.clone())
+                .post(
+                    route,
+                    json!({ "id_token": provider_token(provider, &subject, &email),
+                            "account_type": created_as }),
+                )
+                .await;
+            assert_eq!(created.status, StatusCode::OK, "{:?}", created.json);
+            assert_eq!(created.json["user"]["account_type"], created_as);
 
-    let stored: String = sqlx::query_scalar("SELECT account_type FROM users")
-        .fetch_one(&pool)
-        .await
-        .expect("account type");
-    assert_eq!(stored, "homeowner");
+            // The same identity returning, now claiming the other side.
+            let returning = Client::new(router.clone())
+                .post(
+                    route,
+                    json!({ "id_token": provider_token(provider, &subject, &email),
+                            "account_type": claimed_later }),
+                )
+                .await;
+            assert_eq!(returning.status, StatusCode::OK, "{:?}", returning.json);
+            assert_eq!(
+                returning.json["user"]["account_type"], created_as,
+                "a returning identity keeps its side, whatever the request claims"
+            );
+
+            let stored: String =
+                sqlx::query_scalar("SELECT account_type FROM users WHERE email_norm = lower($1)")
+                    .bind(&email)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("account type");
+            assert_eq!(stored, created_as);
+        }
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -999,5 +1021,155 @@ async fn the_popups_name_fills_in_when_the_token_carries_none(pool: PgPool) {
         response.json["user"]["display_name"], "Marisol Vega",
         "{:?}",
         response.json
+    );
+}
+
+/// A federated sign-in whose address is already taken is refused for the
+/// missing side, never for the address.
+///
+/// The side-check precedes the insert in `sign_in_with_provider`, so the
+/// unique index never gets to fire on a sign-in. Reordering those two blocks
+/// would turn this 400 into a 409 — and a 409 here tells an unauthenticated
+/// caller which addresses hold accounts.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_federated_sign_in_against_a_taken_address_is_refused_for_the_missing_side(pool: PgPool) {
+    let router = emulator_router(pool.clone());
+    assert_eq!(
+        Client::new(router.clone())
+            .register("taken@example.test")
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    for (provider, route) in PROVIDERS.iter().copied() {
+        let response = Client::new(router.clone())
+            .post(
+                route,
+                json!({ "id_token": provider_token(provider, "stranger", "taken@example.test") }),
+            )
+            .await;
+
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{route}: {:?}",
+            response.json
+        );
+        assert_eq!(response.json["error"]["code"], "invalid_request");
+        let message = response.json["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            message.contains("No account here yet"),
+            "{route}: refused for the missing side, not the address: {message}"
+        );
+    }
+
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    let identities: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_identities")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        (users, identities),
+        (1, 0),
+        "nothing was created or attached"
+    );
+}
+
+/// Status is enforced on the federated door exactly as on the password one:
+/// a suspended account can neither sign in again nor keep using the session
+/// it already had.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_suspended_federated_account_cannot_sign_in_or_keep_its_session(pool: PgPool) {
+    let router = emulator_router(pool.clone());
+
+    for (provider, route) in PROVIDERS.iter().copied() {
+        let email = format!("suspended@{provider}.example.test");
+        let mut client = Client::new(router.clone());
+        let created = client
+            .post(
+                route,
+                json!({ "id_token": provider_token(provider, "suspended-1", &email),
+                        "account_type": "homeowner" }),
+            )
+            .await;
+        assert_eq!(created.status, StatusCode::OK, "{:?}", created.json);
+        assert_eq!(client.get("/v1/me").await.status, StatusCode::OK);
+
+        sqlx::query("UPDATE users SET status = 'suspended' WHERE email_norm = lower($1)")
+            .bind(&email)
+            .execute(&pool)
+            .await
+            .expect("suspend");
+
+        assert_eq!(
+            client.get("/v1/me").await.status,
+            StatusCode::UNAUTHORIZED,
+            "{route}: the live session stops working immediately"
+        );
+
+        let again = Client::new(router.clone())
+            .post(
+                route,
+                json!({ "id_token": provider_token(provider, "suspended-1", &email) }),
+            )
+            .await;
+        assert_eq!(
+            again.status,
+            StatusCode::UNAUTHORIZED,
+            "{route}: {:?}",
+            again.json
+        );
+        assert_eq!(again.json["error"]["code"], "unauthenticated");
+    }
+}
+
+/// An account created with no address reserves none: the unique index
+/// ignores NULLs, so any later email registration is a separate account.
+///
+/// Two accounts, one human, by design — linking prevents it going forward and
+/// nothing merges them. This pins that the fork is real rather than a 409.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_address_less_federated_account_reserves_no_address(pool: PgPool) {
+    let router = emulator_router(pool.clone());
+
+    for (provider, route) in PROVIDERS.iter().copied() {
+        let created = Client::new(router.clone())
+            .post(
+                route,
+                json!({ "id_token": production_token(provider, "no-address", None),
+                        "account_type": "contractor" }),
+            )
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::OK,
+            "{route}: {:?}",
+            created.json
+        );
+        assert!(
+            created.json["user"]["email"].is_null(),
+            "{route}: created with no address"
+        );
+    }
+
+    let registered = Client::new(router.clone())
+        .register("later@example.test")
+        .await;
+    assert_eq!(registered.status, StatusCode::OK, "{:?}", registered.json);
+
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        users,
+        PROVIDERS.len() as i64 + 1,
+        "the email registration is its own account, not a merge"
     );
 }

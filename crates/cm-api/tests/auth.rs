@@ -102,6 +102,50 @@ async fn a_duplicate_address_is_refused(pool: PgPool) {
     assert_eq!(again.json["error"]["code"], "conflict");
 }
 
+/// A refused registration never re-sides the account it collided with.
+///
+/// Registration only ever INSERTs, so the requested side dies with the failed
+/// row. This pins that: a registration path that ever learned to UPDATE would
+/// turn a duplicate-address 409 into a way to flip an existing account's side.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cross_side_duplicate_leaves_the_existing_account_on_its_side(pool: PgPool) {
+    let router = router(pool.clone());
+
+    for (first, second) in [("homeowner", "contractor"), ("contractor", "homeowner")] {
+        let email = format!("{first}@example.test");
+        assert_eq!(
+            Client::new(router.clone())
+                .register_as(&email, first)
+                .await
+                .status,
+            StatusCode::OK
+        );
+
+        let again = Client::new(router.clone())
+            .register_as(&email, second)
+            .await;
+        assert_eq!(again.status, StatusCode::CONFLICT, "{:?}", again.json);
+        assert_eq!(again.json["error"]["code"], "conflict");
+
+        let stored: String =
+            sqlx::query_scalar("SELECT account_type FROM users WHERE email_norm = lower($1)")
+                .bind(&email)
+                .fetch_one(&pool)
+                .await
+                .expect("the original account");
+        assert_eq!(
+            stored, first,
+            "the refused side must not touch the stored one"
+        );
+    }
+
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(users, 2, "nothing beyond the two originals was created");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn registration_rejects_weak_or_malformed_input(pool: PgPool) {
     let router = router(pool);
