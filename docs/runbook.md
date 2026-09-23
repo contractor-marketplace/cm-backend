@@ -78,6 +78,13 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 # missing bucket or mail key fails here rather than at the first send.
 cm-server check-config          # proves the file parses before anything restarts
 DATABASE_URL=postgres://cm_migrate:...@127.0.0.1/cm cm-server migrate
+# `migrate` loads the whole config, so it needs the service env as well as the
+# migrate role's URL. On the box the URL lives in
+# /home/cm-deploy/.config/cm-migrate.env (0600). As root:
+#   set -a; . /etc/cm-backend/env; . /home/cm-deploy/.config/cm-migrate.env; set +a
+#   cm-server migrate
+# Never pipe this command's output under `set -e`: the pipe hides its exit
+# status, and a restart that follows a failed migrate serves nothing.
 cm-server seed-trades          # trades, their aliases, and re-derives contractor trades
 cm-server load-regions --file deploy/data/zcta_ca.csv --source census_2020_gazetteer
 # Then the place hierarchy — see "Loading places" below. Order matters:
