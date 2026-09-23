@@ -24,7 +24,19 @@ app.example.com {
 		reverse_proxy 127.0.0.1:3000
 	}
 
-	header {
+	# Firebase Auth's hosted pages on our own hostname, so Google's account
+	# chooser names this site rather than the Firebase project id.
+	# NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN in the front end must match this host.
+	# The popup flow frames /__/auth/iframe, so the site-wide X-Frame-Options
+	# below is excluded for this path.
+	handle /__/auth/* {
+		reverse_proxy https://contractorsmarketplace-8d703.firebaseapp.com {
+			header_up Host {upstream_hostport}
+		}
+	}
+
+	@not_firebase_auth not path /__/auth/*
+	header @not_firebase_auth {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"

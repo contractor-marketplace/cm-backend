@@ -348,7 +348,10 @@ that will not be lost (add a second admin under App Roles):
    These are the Live-mode gates.
 3. Facebook Login → Settings: Client OAuth Login **on**, Web OAuth Login
    **on**, Valid OAuth Redirect URIs =
-   `https://contractorsmarketplace-8d703.firebaseapp.com/__/auth/handler`.
+   `https://contractorsmarketplace.co/__/auth/handler`. The handler is on
+   our domain because Caddy proxies `/__/auth/*` to Firebase Hosting (see
+   `deploy/Caddyfile`); the front end's `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`
+   must be the same host.
 4. Switch **App Mode to Live**. In Development mode only role-holders can sign
    in, and everyone else gets a silent bounce to facebook.com.
 5. Copy App ID and App Secret into the Firebase console → Authentication →
@@ -360,7 +363,7 @@ URL it sends people to and check the `client_id`:
 ```bash
 curl -s -X POST "https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key=$NEXT_PUBLIC_FIREBASE_API_KEY" \
   -H 'content-type: application/json' \
-  -d '{"providerId":"facebook.com","continueUri":"https://contractorsmarketplace-8d703.firebaseapp.com/__/auth/handler"}'
+  -d '{"providerId":"facebook.com","continueUri":"https://contractorsmarketplace.co/__/auth/handler"}'
 ```
 
 Do **not** try to judge the Meta side by fetching that URL with curl: Facebook

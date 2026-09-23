@@ -219,7 +219,7 @@ Frontend, in the gitignored `cm-frontend/.env.local`:
 
 ```
 NEXT_PUBLIC_FIREBASE_API_KEY=<placeholder — not yet filled in>
-NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=contractorsmarketplace-8d703.firebaseapp.com
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=contractorsmarketplace.co
 NEXT_PUBLIC_FIREBASE_PROJECT_ID=contractorsmarketplace-8d703
 NEXT_PUBLIC_FIREBASE_APP_ID=1:861026173329:web:4f44d4f049c79031515a30
 ```
