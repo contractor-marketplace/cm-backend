@@ -43,13 +43,35 @@ CM_SITE_ORIGIN=https://app.example.com
 CM_HASH_PEPPER=$(openssl rand -base64 48)
 CM_ENV=production
 CM_TRUST_PROXY_HEADERS=true
-CM_JOB_PHOTO_BUCKET=cm-job-photos
+CM_JOB_PHOTO_BUCKET=cm-job-photos-6b1e669f
 # Mail. Production refuses to start without both: without them, sign-in codes
 # would be queued and never delivered, and nobody could log in.
 CM_RESEND_API_KEY=re_...
 CM_MAIL_FROM=Contractor Marketplace <no-reply@contractorsmarketplace.co>
 ENV
 chown root:cm /etc/cm-backend/env && chmod 0640 /etc/cm-backend/env
+
+# 3b. The photo bucket. Browsers fetch objects straight from GCS, so the
+# bucket must be readable by anyone. Two things stand in the way and BOTH
+# must be done: the allUsers grant, and the organisation's public-access
+# prevention policy, which silently overrides that grant (uploads succeed,
+# every <img> 403s). The policy override is per project, once.
+gcloud storage buckets create gs://cm-job-photos-6b1e669f \
+  --location=us-west2 --uniform-bucket-level-access
+gcloud storage buckets add-iam-policy-binding gs://cm-job-photos-6b1e669f \
+  --member=allUsers --role=roles/storage.objectViewer
+gcloud storage buckets add-iam-policy-binding gs://cm-job-photos-6b1e669f \
+  --member=serviceAccount:cm-uploads@project-6b1e669f-e8a9-436d-a46.iam.gserviceaccount.com \
+  --role=roles/storage.objectAdmin
+gcloud resource-manager org-policies disable-enforce storage.publicAccessPrevention \
+  --project=project-6b1e669f-e8a9-436d-a46
+# Every other bucket in the project then relies on its own IAM alone, so pin
+# the backup bucket closed explicitly rather than by inheritance.
+gcloud storage buckets update gs://cm-db-backups-6b1e669f --public-access-prevention
+# Proof, without credentials: a public bucket answers a missing object with
+# 404. A private one answers 403. Takes a minute or two to propagate.
+curl -s -o /dev/null -w '%{http_code}\n' \
+  https://storage.googleapis.com/cm-job-photos-6b1e669f/nope.jpg
 
 # 4. Schema, then reference data, then the service.
 # check-config now also reports production gaps and exits 2 on them, so a
