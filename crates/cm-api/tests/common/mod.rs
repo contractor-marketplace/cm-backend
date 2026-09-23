@@ -649,3 +649,12 @@ pub async fn seed_jobs(
     }
     ids
 }
+
+/// A 1x1 PNG. Smallest thing that survives the normaliser.
+pub fn a_tiny_png() -> Vec<u8> {
+    const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(PIXEL)
+        .expect("a valid base64 pixel")
+}

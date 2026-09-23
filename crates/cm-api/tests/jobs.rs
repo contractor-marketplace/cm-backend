@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{router, seed_directory, seed_jobs, user_id, Client};
+use common::{a_tiny_png, router, seed_directory, seed_jobs, user_id, Client};
 use http::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
@@ -41,15 +41,6 @@ fn a_job_with_every_unsure() -> serde_json::Value {
         "budget": "unsure",
         "timeline": "unsure"
     })
-}
-
-/// A 1x1 PNG. Smallest thing that survives the normaliser.
-fn a_tiny_png() -> Vec<u8> {
-    const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(PIXEL)
-        .expect("a valid base64 pixel")
 }
 
 #[sqlx::test(migrations = "../../migrations")]

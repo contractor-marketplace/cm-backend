@@ -6,7 +6,9 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use cm_core::AppError;
 use cm_db::repo::contractors::{self, AddressVisibility, ProfileUpdate, PublicContractor};
-use cm_db::repo::{claims, reference, reviews, search, search_events, service_areas, suggest};
+use cm_db::repo::{
+    claims, contractor_photos, reference, reviews, search, search_events, service_areas, suggest,
+};
 use cm_domain::search as search_input;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -294,6 +296,9 @@ pub struct DetailResponse {
     /// than this array, which is a sample. A client that renders "N reviews"
     /// should use the count, not `reviews.len()`.
     reviews: Vec<reviews::PublicReview>,
+    /// Photographs of their work, uploaded by the claimant. Empty for an
+    /// unclaimed listing, which is almost all of them.
+    photos: Vec<contractor_photos::Photo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -343,12 +348,26 @@ pub async fn detail(
     let reviews =
         reviews::list_for_contractor(&mut conn, contractor.id, reviews::MAX_PER_CONTRACTOR).await?;
 
+    // Keys become URLs here, like the profile photo above: the row reader has
+    // no object store, and must not grow one.
+    let photos = contractor_photos::for_contractor(&mut conn, contractor.id)
+        .await?
+        .into_iter()
+        .map(|row| contractor_photos::Photo {
+            id: row.id,
+            url: state.store.url_for(&row.storage_key),
+            width: row.width,
+            height: row.height,
+        })
+        .collect();
+
     Ok(Json(DetailResponse {
         contractor,
         verification_reason,
         license_data_as_of,
         verification,
         reviews,
+        photos,
     }))
 }
 
@@ -559,35 +578,34 @@ pub async fn update_profile(
     Ok(Json(found.remove(0)))
 }
 
-/// Set the listing's profile photo. Multipart, claimant only.
-pub async fn set_photo(
-    State(state): State<AppState>,
-    CurrentUser(caller): CurrentUser,
-    Path(contractor_id): Path<Uuid>,
-    mut form: axum::extract::Multipart,
-) -> Result<Json<cm_domain::contractors::ProfilePhoto>, AppError> {
-    let mut bytes: Option<Vec<u8>> = None;
-
+/// The one `file` field of a multipart upload, or a 400 saying what was missing.
+async fn file_field(mut form: axum::extract::Multipart) -> Result<Vec<u8>, AppError> {
     while let Some(field) = form
         .next_field()
         .await
         .map_err(|error| AppError::invalid(format!("That upload could not be read: {error}")))?
     {
         if field.name() == Some("file") {
-            bytes = Some(
-                field
-                    .bytes()
-                    .await
-                    .map_err(|error| {
-                        AppError::invalid(format!("That upload could not be read: {error}"))
-                    })?
-                    .to_vec(),
-            );
-            break;
+            return Ok(field
+                .bytes()
+                .await
+                .map_err(|error| {
+                    AppError::invalid(format!("That upload could not be read: {error}"))
+                })?
+                .to_vec());
         }
     }
+    Err(AppError::invalid("Attach a photo in a \"file\" field."))
+}
 
-    let bytes = bytes.ok_or_else(|| AppError::invalid("Attach a photo in a \"file\" field."))?;
+/// Set the listing's profile photo. Multipart, claimant only.
+pub async fn set_photo(
+    State(state): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+    form: axum::extract::Multipart,
+) -> Result<Json<cm_domain::contractors::ProfilePhoto>, AppError> {
+    let bytes = file_field(form).await?;
 
     let photo = cm_domain::contractors::set_photo(
         &state.pool,
@@ -612,9 +630,55 @@ pub async fn remove_photo(
     Ok(http::StatusCode::NO_CONTENT)
 }
 
+/// Add a photograph of the claimant's work. Multipart, one file per request,
+/// for the reason the job composer does it that way: a batch fails as a unit.
+pub async fn add_work_photo(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    Path(contractor_id): Path<Uuid>,
+    form: axum::extract::Multipart,
+) -> Result<(http::StatusCode, Json<contractor_photos::Photo>), AppError> {
+    let bytes = file_field(form).await?;
+
+    let photo = cm_domain::contractors::add_work_photo(
+        &state.pool,
+        &state.store,
+        state.auth.pepper(),
+        caller.user.id,
+        contractor_id,
+        &bytes,
+        context.request_id,
+    )
+    .await?;
+
+    Ok((http::StatusCode::CREATED, Json(photo)))
+}
+
+pub async fn remove_work_photo(
+    State(state): State<AppState>,
+    Context(context): Context,
+    CurrentUser(caller): CurrentUser,
+    Path((contractor_id, photo_id)): Path<(Uuid, Uuid)>,
+) -> Result<http::StatusCode, AppError> {
+    cm_domain::contractors::remove_work_photo(
+        &state.pool,
+        &state.store,
+        caller.user.id,
+        contractor_id,
+        photo_id,
+        context.request_id,
+    )
+    .await?;
+    Ok(http::StatusCode::NO_CONTENT)
+}
+
 /// A profile photo is one image, so the limit is lower than the job composer's
 /// twelve megabytes — it is a logo or a van, not a set of site photographs.
 const MAX_PHOTO_BYTES: usize = 8 * 1024 * 1024;
+
+/// Work photos ARE site photographs, so they get the job composer's ceiling.
+const MAX_WORK_PHOTO_BYTES: usize = 12 * 1024 * 1024;
 
 /// The photo routes, with the upload limit attached to them and nowhere else.
 #[derive(Debug, Serialize)]
@@ -729,10 +793,20 @@ async fn require_claimant(
 }
 
 pub fn photo_routes() -> axum::Router<AppState> {
-    axum::Router::new().route(
-        "/v1/contractors/{id}/photo",
-        axum::routing::post(set_photo)
-            .layer(axum::extract::DefaultBodyLimit::max(MAX_PHOTO_BYTES))
-            .delete(remove_photo),
-    )
+    axum::Router::new()
+        .route(
+            "/v1/contractors/{id}/photo",
+            axum::routing::post(set_photo)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_PHOTO_BYTES))
+                .delete(remove_photo),
+        )
+        .route(
+            "/v1/contractors/{id}/photos",
+            axum::routing::post(add_work_photo)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_WORK_PHOTO_BYTES)),
+        )
+        .route(
+            "/v1/contractors/{id}/photos/{photo_id}",
+            axum::routing::delete(remove_work_photo),
+        )
 }

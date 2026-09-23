@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod auth_tokens;
 pub mod claims;
+pub mod contractor_photos;
 pub mod contractors;
 pub mod email_outbox;
 pub mod geocode;
