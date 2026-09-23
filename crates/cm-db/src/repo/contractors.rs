@@ -392,13 +392,18 @@ pub async fn geocodable_address(
 }
 
 /// Attach a claim. Returns false if the listing was claimed in the meantime.
+///
+/// Claiming opens the listing to messages. A contractor who has just claimed
+/// their listing expects to be reachable, and the toggle on "Your Listing" is
+/// there to close it again, not to discover that it was never open.
 pub async fn attach_claimant(
     conn: &mut PgConnection,
     contractor_id: Uuid,
     user_id: Uuid,
 ) -> Result<bool, AppError> {
     let result = sqlx::query(
-        "UPDATE contractors SET claimed_by_user_id = $2, claimed_at = now(), updated_at = now() \
+        "UPDATE contractors SET claimed_by_user_id = $2, claimed_at = now(), accepts_dm = true, \
+                updated_at = now() \
           WHERE id = $1 AND claimed_by_user_id IS NULL",
     )
     .bind(contractor_id)

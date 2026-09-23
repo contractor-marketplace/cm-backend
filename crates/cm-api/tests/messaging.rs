@@ -107,7 +107,8 @@ async fn messaging_is_refused_unless_the_listing_is_claimed_and_open(pool: PgPoo
         .await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
 
-    // Claimed but not opted in.
+    // Claimed, then opted out. Claiming opens the listing, so the closed state
+    // is one the owner chose.
     let claimed = contractor_id(&pool, "1047382").await;
     let owner = cm_core::new_id();
     let mut conn = pool.acquire().await.expect("connection");
@@ -122,6 +123,11 @@ async fn messaging_is_refused_unless_the_listing_is_claimed_and_open(pool: PgPoo
     .expect("user");
     drop(conn);
     force_claim(&pool, claimed, owner).await;
+    sqlx::query("UPDATE contractors SET accepts_dm = false WHERE id = $1")
+        .bind(claimed)
+        .execute(&pool)
+        .await
+        .expect("opt out");
 
     let refused = homeowner
         .post("/v1/conversations", json!({ "contractor_id": claimed }))

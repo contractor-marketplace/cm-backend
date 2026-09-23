@@ -47,6 +47,8 @@ async fn an_approved_claim_grants_ownership_and_the_badge(pool: PgPool) {
     let after = anyone.get(&format!("/v1/contractors/{id}")).await;
     assert_eq!(after.json["verified"], true);
     assert_eq!(after.json["is_claimed"], true);
+    // Claiming opens the listing to messages; the owner can close it later.
+    assert_eq!(after.json["accepts_dm"], true);
 
     // The claimant now holds the contractor role.
     let me = claimant.get("/v1/me").await;
